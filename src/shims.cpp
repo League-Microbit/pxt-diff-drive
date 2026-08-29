@@ -990,6 +990,11 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
     // magnitude is otherwise ignored. Deliberately does not touch
     // estopLatch_ -- see clearStall()'s own comment above.
     case 17: if (v != 0.0f) k.clearStallLatch(); break;
+    // 18 (2026-08-29, OOP): pivot_overrun -- a thin forward to
+    // MotionEngine::setPivotOverrunMm(), which owns its own ">= 0, else
+    // keep the prior value" validation (motion_engine.h), same shape as
+    // case 16's rotational_slip forward above.
+    case 18: r.engine.setPivotOverrunMm(v); break;
     default: break;
   }
 }
@@ -1036,6 +1041,9 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
     // ordinal has no stored Config field at all; see clearStall()'s own
     // comment above and sprint 007's design/DESIGN.md §5 field table).
     case 17: v = r.kernel.output().stallHalted ? 1.0f : 0.0f; break;
+    // 18: pivot_overrun's GET side -- MotionEngine::pivotOverrunMm(),
+    // not a kernel Config field (same as case 16 above).
+    case 18: v = r.engine.pivotOverrunMm(); break;
     default: return 0;
   }
   return static_cast<int>(std::lround(v * 1000.0));

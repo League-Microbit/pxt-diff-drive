@@ -133,6 +133,13 @@ constexpr FieldEntry kFields[] = {
                                // shims.cpp's setKernelValue()/
                                // getConfigValue() case 17 and
                                // clearStall()'s own comment.
+    {"pivot_overrun", 18},     // ConfigField.PivotOverrun (2026-08-29,
+                               // OOP: per-wheel end-of-move overrun,
+                               // mm, subtracted from every rotation
+                               // target -- MotionEngine::
+                               // setPivotOverrunMm()/pivotOverrunMm(),
+                               // see motion_engine.h's own comment for
+                               // the measurement).
 };
 constexpr size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
 

@@ -215,6 +215,26 @@ class MotionEngine {
     if (slip > 0.0f) rotationalSlip_ = slip;
   }
 
+  // [mm] per-wheel END-OF-MOVE OVERRUN subtracted from every rotation
+  // target (startSegment()'s yawTarget). MEASURED vevov 2026-08-29,
+  // captures/vevov-square-20260829/runC.json + runC2.json, reports/
+  // vevov-tour-C-firmware-and-telemetry-20260829.md S4: thirteen MOVE_X
+  // pivots of 3..90 deg all landed a CONSTANT ~+2 deg past their
+  // command in the robot's OWN encoders (+3.2 -> +5.1, -2.6 -> -4.4,
+  // +87.3 -> +89.2 ...), camera agreeing; 2 deg at trackWidth 128 is
+  // 2.2 mm per wheel. Constant, not a scale -- a 2 % correction would
+  // have fixed the 90 deg corners and left a 3 deg pivot at 5 deg, so
+  // it lives here as a per-wheel distance, not on rotationalSlip_.
+  // Default 0 (no compensation) so no robot changes behaviour until
+  // it has been measured; make_deploy.py's geometry bake sets it per
+  // robot (radio-robot-lib config `firmware_bake.pivot_overrun_mm`),
+  // and wire `SET pivot_overrun <mm>` tunes it live. Mechanism
+  // UNVERIFIED: one kernel tick at the 70 mm/s speed floor is 2.3 mm.
+  float pivotOverrunMm() const { return pivotOverrunMm_; }
+  void setPivotOverrunMm(float mm) {
+    if (mm >= 0.0f) pivotOverrunMm_ = mm;
+  }
+
   // [counts/mm] 1 count == 0.1 shaft degree.
   float countsPerMm() const { return 10.0f / travelCalib_; }
 
@@ -520,6 +540,11 @@ class MotionEngine {
   // 1.005 across ten pivots, so the sensor was never the problem -- this
   // constant was.
   float rotationalSlip_ = 0.952f;
+
+  // [mm] per-wheel end-of-move overrun compensated out of every
+  // rotation target -- see pivotOverrunMm()'s own comment above for the
+  // measurement. 0 == uncompensated (fleet default; vevov bakes 2.2).
+  float pivotOverrunMm_ = 0.0f;
 
   // ---- move engine state ----
 

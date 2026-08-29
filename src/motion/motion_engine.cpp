@@ -122,6 +122,19 @@ void MotionEngine::startSegment(float distance, float rotation,
   move_.posRight0 = out.positionRight;
   move_.distTarget = distance * cpm;                              // [counts]
   move_.yawTarget = rotation * 0.5f * effectiveTrackWidth() * cpm;  // [counts]
+  // Subtract the measured per-wheel end-of-move overrun from the
+  // rotation target (pivotOverrunMm_, motion_engine.h): a constant the
+  // controller lands PAST every rotation, whatever its size, so it is
+  // taken off the target's magnitude, never scaled. Clamped at zero: a
+  // rotation smaller than the overrun itself becomes no rotation rather
+  // than one in the wrong direction.
+  if (move_.yawTarget != 0.0f && pivotOverrunMm_ > 0.0f) {
+    const float overrun = pivotOverrunMm_ * cpm;  // [counts]
+    const float mag = std::fabs(move_.yawTarget) - overrun;
+    move_.yawTarget = mag > 0.0f
+        ? (move_.yawTarget > 0.0f ? mag : -mag)
+        : 0.0f;
+  }
 
   // wheels_x's own reduction (motion-api.md S2): left = distance -
   // rotation*b/2, right = distance + rotation*b/2 -- restated here in

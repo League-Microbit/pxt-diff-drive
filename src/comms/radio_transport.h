@@ -126,31 +126,6 @@ class RadioTransport {
   // already-armed hardware has not been observed either way.
   void setGroup(uint8_t group);
 
-  // Set the radio channel (CODAL frequency band). Same store-then-apply
-  // contract as setGroup() just above: always stores into channel_, and
-  // ensureRadioReady() reads that field -- not the kChannel constant --
-  // when it lazily brings the radio up, so a call made BEFORE the radio
-  // is up brings it up already on the requested channel. That is the
-  // supported path, and the only one Protocol::setupRadio() uses.
-  //
-  // UNVERIFIED (2026-08-29): the already-up path, where this re-applies
-  // uBit.radio.setFrequencyBand(channel_) against live hardware, has
-  // never been observed either way -- exactly the open question
-  // clasi/issues/changing-the-radio-group-mid-run-is-unverified.md
-  // raises for setGroup(). The concern is stronger here, not weaker: a
-  // SOURCE READING of the vendored MicroBitRadio.cpp (not a
-  // measurement) shows setFrequencyBand() performing an explicit
-  // NVIC_DisableIRQ / TASKS_DISABLE / write / TASKS_RXEN restart cycle,
-  // commented "We need to restart the radio for the frequency change to
-  // take effect", where setGroup() only writes PREFIX0 and returns.
-  // What that restart does to an in-flight link is unknown.
-  //
-  // What would settle it: bring the radio up (any sendLine()), call
-  // this with a different channel, and check from a second board on the
-  // new channel whether traffic resumes -- capturing the result to a
-  // file this comment can then name.
-  void setChannel(uint8_t channel);
-
   // Event-driven RX internals (public only for the static MessageBus
   // trampoline): mirrors the reference driver's design -- datagram.recv()
   // is ONLY called inside the MICROBIT_RADIO_EVT_DATAGRAM handler, where
@@ -227,29 +202,16 @@ class RadioTransport {
 
   static constexpr int kFrameHeaderBytes = 3;  // [SEQ][FLAGS][LEN]
 
-  // Radio convention matching the fleet's RADIOBRIDGE relay: channel 4
-  // (vevov's fleet-assigned channel; the zavaz relay matches: !CG 4 10);
-  // transmit power 7 (matches the reference driver's own
-  // setTransmitPower(7)). kChannel is injected per-robot at DEPLOY time
+  // Fixed radio convention matching the fleet's RADIOBRIDGE relay:
+  // channel 4 (vevov's fleet-assigned channel; the zavaz relay matches:
+  // !CG 4 10); transmit power 7 (matches the reference driver's own
+  // setTransmitPower(7)). Channel is injected per-robot at DEPLOY time
   // into the SCRATCH COPY only (tools/make_deploy.py's
-  // _inject_radio_channel()); it is now the DEFAULT for channel_ below
-  // rather than the value the radio uses directly, because the "setup
-  // radio" block gives students a surface for it. Transmit power still
-  // has no settable surface, student-facing or per-robot.
-  //
-  // DO NOT reformat the kChannel line. tools/make_deploy.py's
-  // _K_CHANNEL_RE is `(static constexpr int kChannel = )\d+(;)` and the
-  // deploy raises if it stops matching -- loudly, but every per-robot
-  // build breaks until it is fixed.
+  // _inject_radio_channel()) -- still no student-facing surface for it,
+  // and none is planned. Transmit power has no settable surface either,
+  // student-facing or per-robot.
   static constexpr int kChannel = 4;
   static constexpr int kTransmitPower = 7;
-
-  // Radio channel actually used -- MUTABLE, defaulting to the
-  // deploy-injected kChannel just above, so a build with no setChannel()
-  // call behaves exactly as before. setChannel() (above) is the only way
-  // to change it, and ensureRadioReady() (radio_transport.cpp) reads
-  // this field, not the constant, when it lazily brings the radio up.
-  uint8_t channel_ = static_cast<uint8_t>(kChannel);
 
   // Radio group this robot listens/transmits on -- MUTABLE, unlike
   // kChannel/kTransmitPower just above. Defaults to 10 (the fleet's

@@ -8,6 +8,10 @@ name: MakeCode
 
 on:
   push:
+    # Branches only: a release tag points at a commit main has
+    # already built, so building it again would be a second identical
+    # cloud compile.
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
