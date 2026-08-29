@@ -1,0 +1,10 @@
+built/
+node_modules/
+pxt_modules/
+yotta_modules/
+yotta_targets/
+.pxt/
+*.hex
+*.uf2
+.vscode/
+.DS_Store

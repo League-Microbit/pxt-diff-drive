@@ -1,0 +1,35 @@
+# Build check for the published extension: compiles the TypeScript and
+# the native code (through MakeCode's cloud compile service, the same
+# path the web editor uses) the way a student project would.
+#
+# This repository is generated from League-Robotics/pxt-nezha-diffdrive
+# by its tools/publish_extension.py -- fix things there, not here.
+name: MakeCode
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install pxt and the micro:bit target
+        run: |
+          npm install -g pxt
+          pxt target microbit
+      - name: Build
+        env:
+          # micro:bit V2 only. pxt-microbit builds every variant by
+          # default and the V1 (mbdal) leg cannot carry this extension's
+          # native code; this switch builds the V2 (mbcodal) variant
+          # alone, the one the extension actually runs on.
+          PXT_COMPILE_SWITCHES: csv-mbcodal
+        run: |
+          pxt install
+          pxt build --cloudbuild

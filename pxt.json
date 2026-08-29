@@ -1,0 +1,58 @@
+{
+    "name": "nezha-diffdrive",
+    "version": "1.0.10",
+    "description": "Closed-loop differential drive for the Nezha brick: encoder-servoed wheel speeds, twist and distance moves, curved go-to, and pose from odometry. The wheel controller runs in its own fiber.",
+    "license": "MIT",
+    "public": true,
+    "dependencies": {
+        "core": "*",
+        "microphone": "*"
+    },
+    "files": [
+        "README.md",
+        "src/core/diffdrive.h",
+        "src/core/diffdrive.cpp",
+        "src/motion/motion_engine.h",
+        "src/motion/motion_engine.cpp",
+        "src/platform/platform_ports.h",
+        "src/core/heading_wrap.h",
+        "src/core/encoder_glitch_armor.h",
+        "src/platform/encoder_pose_source.h",
+        "src/platform/nezha_port.h",
+        "src/platform/nezha_port.cpp",
+        "src/platform/otos_port.h",
+        "src/platform/otos_port.cpp",
+        "src/comms/serial_transport.h",
+        "src/comms/serial_transport.cpp",
+        "src/comms/radio_transport.h",
+        "src/comms/radio_transport.cpp",
+        "src/comms/protocol.h",
+        "src/comms/protocol.cpp",
+        "src/comms/wire_handler.h",
+        "src/comms/wire_handler.cpp",
+        "src/comms/wire_adapter.h",
+        "src/comms/wire_adapter.cpp",
+        "src/shims.cpp",
+        "src/blocks/sim.ts",
+        "src/blocks/run.ts",
+        "src/blocks/pose.ts",
+        "src/blocks/stop.ts",
+        "src/blocks/world.ts",
+        "src/blocks/motion.ts"
+    ],
+    "testFiles": [
+        "test.ts"
+    ],
+    "supportedTargets": [
+        "microbit"
+    ],
+    "preferredEditor": "tsprj",
+    "yotta": {
+        "config": {
+            "microbit_radio_max_packet_size": 250
+        }
+    },
+    "disablesVariants": [
+        "mbdal"
+    ]
+}
