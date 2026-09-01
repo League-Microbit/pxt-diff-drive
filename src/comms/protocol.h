@@ -89,13 +89,29 @@ class Protocol {
   // dependency scan).
   int serialDropCount() const;
 
-  // Forwards into RadioTransport::setGroup() -- the ONE write path
-  // student blocks gain into RadioTransport's own configuration; see
-  // that method's own doc comment (radio_transport.h) for the
-  // idempotent-apply contract. Exists because radioTransport_ (below)
-  // is private to this class; the free-function shim beside
-  // startProtocol() (protocol.cpp) is this method's only caller.
-  void setRadioGroup(uint8_t group);
+  // Configure the radio AND bring the v6 radio link up -- the ONE write
+  // path student blocks gain into RadioTransport's own configuration.
+  // Exists because radioTransport_ (below) is private to this class; the
+  // free-function shim beside startProtocol() (protocol.cpp) is this
+  // method's only caller.
+  //
+  // Channel and group are applied BEFORE radioEnabled_ flips, so the
+  // radio comes up already on the requested channel/group the first time
+  // anything touches it -- the supported ordering (see
+  // RadioTransport::setChannel()'s own doc comment for why the
+  // already-up path is the unverified one).
+  void setupRadio(uint8_t channel, uint8_t group);
+
+  // Bring the v6 radio link up on whatever channel/group are already
+  // configured -- i.e. the per-robot channel tools/make_deploy.py
+  // injected into kChannel at deploy time, and group 10.
+  //
+  // This is what the on-robot test program (test/test.ts) calls. It
+  // deliberately does NOT take a channel: hardcoding one there would
+  // override the deploy injection and put every `--robot tovez` build on
+  // vevov's channel. Students get setupRadio() instead, where naming the
+  // channel is the point.
+  void enableRadio();
 
  private:
   static void fiberEntry(void* self);
@@ -210,6 +226,22 @@ class Protocol {
                       // instance now backs only handleRun()'s own dedupe
                       // timing and wireNowMs() itself (via protocol()).
   bool running_ = false;
+
+  // The v6 radio link is OPT-IN: false until setupRadio() flips it.
+  //
+  // This is what lets a student's program use MakeCode's own `radio.*`
+  // blocks (a joystick controller, say). RadioTransport frames raw
+  // RadioRelay fragments with NO PXT radio packet header, on a fixed
+  // band -- see radio_transport.h's top comment -- so the two cannot
+  // share the air. Whichever one comes up first owns the radio.
+  //
+  // Every path that would reach RadioTransport must be gated on this,
+  // not just the RX poll: RadioTransport lazily calls ensureRadioReady()
+  // from BOTH tryReceiveLine() and sendLine(), so an ungated emitLine()
+  // or telemetry emission would claim the radio just as surely as the
+  // poll does. run()'s radio poll, emitLine()'s radio write, and run()'s
+  // wireHandlerRadio_.emitTelemetry() are the three sites.
+  bool radioEnabled_ = false;
 
   // NSDMI, not a hand-written constructor: each member depends only on
   // members declared textually above it (transport_/radioTransport_ for

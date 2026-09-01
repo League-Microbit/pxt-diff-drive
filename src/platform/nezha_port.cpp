@@ -6,6 +6,110 @@
 
 namespace diffDrive {
 
+// ---- fault-context emergency stop -----------------------------------
+//
+// Writes "run at 0" to BOTH motor ports over I2C with no dependency on
+// any object, fiber, scheduler or kernel state -- so it is callable
+// from a fault handler, where none of those can be trusted.
+//
+// WHY THIS EXISTS. MEASURED tigez 2026-08-30 (pyOCD halt on the wedged
+// chip; full forensics in captures/tigez-cal-20260830/): a radio-path
+// memory corruption makes controlStep()
+// dereference a pointer holding the ASCII bytes "PING", taking a
+// precise bus error (CFSR 0x8200, BFAR 0x474E4988). The board then sits
+// in the DEFAULT weak HardFault_Handler -- an infinite loop in
+// codal-nrf52's gcc_startup_nrf52833.S:303 -- so nothing panics,
+// nothing reboots, and THE BRICK KEEPS ITS LAST MOTOR COMMAND. The
+// wheels run until someone reflashes the board. This function is what
+// makes that impossible.
+//
+// A plain reboot is NOT sufficient on its own: the Rig (and with it
+// DifferentialDrive::begin()'s boot zero-write) is created LAZILY on
+// the first motion command, so a rebooted board that nobody commands
+// would leave the brick driving.
+extern "C" void diffdrive_emergency_motor_stop() {
+  // Same frame shape as NezhaMotorPort::writeFrame(), inlined so this
+  // needs no instance: {0xFF, 0xF9, port, arg, reg, val, 0xF5, 0x00}.
+  for (uint8_t port = 1; port <= 2; ++port) {
+    uint8_t frame[8] = {0xFF, 0xF9, port, NezhaMotorPort::kDirCw,
+                        NezhaMotorPort::kRegMotorRun, 0x00, 0xF5, 0x00};
+#if MICROBIT_CODAL
+    uBit.i2c.write(NezhaMotorPort::kAddress << 1, frame, 8);
+#else
+    uBit.i2c.write(NezhaMotorPort::kAddress << 1,
+                   reinterpret_cast<char*>(frame), 8);
+#endif
+  }
+}
+
+// ---- fail-safe fault handlers ---------------------------------------
+//
+// These OVERRIDE the weak defaults in codal-nrf52's
+// gcc_startup_nrf52833.S, every one of which is an infinite loop. That
+// default is what turned a fault into a runaway robot: the CPU stopped,
+// the display stayed blank, every fiber died, and the brick held its
+// last motor command indefinitely (MEASURED tigez 2026-08-30 -- see
+// diffdrive_emergency_motor_stop() above for the full forensics).
+//
+// Order matters:
+//   1. STOP THE MOTORS -- before anything else can go wrong. A reset
+//      alone would leave the brick driving, because the Rig (and its
+//      boot zero-write) is only created on the first motion command.
+//   2. REPORT -- print the fault site so a wedge is diagnosable from a
+//      serial log instead of needing a debugger on the wedged chip.
+//   3. RESET -- the board comes back on its own.
+//
+// Nothing here allocates, takes a lock, or yields: a fault handler must
+// assume memory is already corrupt.
+extern "C" {
+
+// `frame` is the hardware-stacked exception frame:
+// {r0, r1, r2, r3, r12, LR, PC, xPSR}.
+void diffdriveFaultReport(uint32_t* frame) {
+  (void)frame;  // see DIFFDRIVE_FAULT_SPIN below for how to read it
+  diffdrive_emergency_motor_stop();
+
+  // NOTE: do NOT print here. uBit.serial.printf() is not fault-safe --
+  // it blocked forever inside the handler when tried (MEASURED tigez
+  // 2026-08-30: pyOCD showed IPSR=3, PC parked in the handler). The
+  // motors were already stopped by then, so it was safe, but the board
+  // no longer recovered. Forensics go through DIFFDRIVE_FAULT_SPIN.
+#ifdef DIFFDRIVE_FAULT_SPIN
+  // DEBUG BUILD: hold the fault state so pyOCD can halt and read the
+  // stacked frame (`b diffdriveFaultReport` keeps `frame` in r0).
+  // Safe to sit here: the motors are already stopped, above.
+  while (true) {
+  }
+#else
+  NVIC_SystemReset();  // never returns
+#endif
+}
+
+__attribute__((naked)) void HardFault_Handler() {
+  // Pick the stack the fault frame is actually on (EXC_RETURN bit 2).
+  __asm volatile(
+      "tst lr, #4\n"
+      "ite eq\n"
+      "mrseq r0, msp\n"
+      "mrsne r0, psp\n"
+      "b diffdriveFaultReport\n");
+}
+__attribute__((naked)) void MemoryManagement_Handler() {
+  __asm volatile("tst lr, #4\n ite eq\n mrseq r0, msp\n mrsne r0, psp\n"
+                 "b diffdriveFaultReport\n");
+}
+__attribute__((naked)) void BusFault_Handler() {
+  __asm volatile("tst lr, #4\n ite eq\n mrseq r0, msp\n mrsne r0, psp\n"
+                 "b diffdriveFaultReport\n");
+}
+__attribute__((naked)) void UsageFault_Handler() {
+  __asm volatile("tst lr, #4\n ite eq\n mrseq r0, msp\n mrsne r0, psp\n"
+                 "b diffdriveFaultReport\n");
+}
+
+}  // extern "C"
+
+
 namespace {
 float clampf(float value, float lo, float hi) {
   return value < lo ? lo : (value > hi ? hi : value);

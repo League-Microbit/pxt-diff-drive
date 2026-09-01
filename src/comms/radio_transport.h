@@ -126,6 +126,31 @@ class RadioTransport {
   // already-armed hardware has not been observed either way.
   void setGroup(uint8_t group);
 
+  // Set the radio channel (CODAL frequency band). Same store-then-apply
+  // contract as setGroup() just above: always stores into channel_, and
+  // ensureRadioReady() reads that field -- not the kChannel constant --
+  // when it lazily brings the radio up, so a call made BEFORE the radio
+  // is up brings it up already on the requested channel. That is the
+  // supported path, and the only one Protocol::setupRadio() uses.
+  //
+  // UNVERIFIED (2026-08-29): the already-up path, where this re-applies
+  // uBit.radio.setFrequencyBand(channel_) against live hardware, has
+  // never been observed either way -- exactly the open question
+  // clasi/issues/changing-the-radio-group-mid-run-is-unverified.md
+  // raises for setGroup(). The concern is stronger here, not weaker: a
+  // SOURCE READING of the vendored MicroBitRadio.cpp (not a
+  // measurement) shows setFrequencyBand() performing an explicit
+  // NVIC_DisableIRQ / TASKS_DISABLE / write / TASKS_RXEN restart cycle,
+  // commented "We need to restart the radio for the frequency change to
+  // take effect", where setGroup() only writes PREFIX0 and returns.
+  // What that restart does to an in-flight link is unknown.
+  //
+  // What would settle it: bring the radio up (any sendLine()), call
+  // this with a different channel, and check from a second board on the
+  // new channel whether traffic resumes -- capturing the result to a
+  // file this comment can then name.
+  void setChannel(uint8_t channel);
+
   // Event-driven RX internals (public only for the static MessageBus
   // trampoline): mirrors the reference driver's design -- datagram.recv()
   // is ONLY called inside the MICROBIT_RADIO_EVT_DATAGRAM handler, where
@@ -202,25 +227,82 @@ class RadioTransport {
 
   static constexpr int kFrameHeaderBytes = 3;  // [SEQ][FLAGS][LEN]
 
-  // Fixed radio convention matching the fleet's RADIOBRIDGE relay:
-  // channel 4 (vevov's fleet-assigned channel; the zavaz relay matches:
-  // !CG 4 10); transmit power 7 (matches the reference driver's own
-  // setTransmitPower(7)). Channel is injected per-robot at DEPLOY time
+  // Radio convention matching the fleet's RADIOBRIDGE relay: channel 4
+  // (vevov's fleet-assigned channel; the zavaz relay matches: !CG 4 10);
+  // transmit power 7 (matches the reference driver's own
+  // setTransmitPower(7)). kChannel is injected per-robot at DEPLOY time
   // into the SCRATCH COPY only (tools/make_deploy.py's
-  // _inject_radio_channel()) -- still no student-facing surface for it,
-  // and none is planned. Transmit power has no settable surface either,
-  // student-facing or per-robot.
+  // _inject_radio_channel()); it is now the DEFAULT for channel_ below
+  // rather than the value the radio uses directly, because the "setup
+  // radio" block gives students a surface for it. Transmit power still
+  // has no settable surface, student-facing or per-robot.
+  //
+  // DO NOT reformat the kChannel or kGroup lines. tools/make_deploy.py's
+  // _K_CHANNEL_RE / _K_GROUP_RE are
+  // `(static constexpr int kChannel = )\d+(;)` and
+  // `(static constexpr int kGroup = )\d+(;)`, and the deploy raises if
+  // either stops matching -- loudly, but every per-robot build breaks
+  // until it is fixed.
   static constexpr int kChannel = 4;
+
+  // WHERE A ROBOT'S (channel, group) COMES FROM -- read this before
+  // changing either constant or the config they are injected from.
+  //
+  // BY DEFAULT BOTH ARE DERIVED FROM THE BOARD'S NAME. A micro:bit's
+  // five-letter friendly name is NRF_FICR->DEVICEID[1] written in base
+  // 5, so the pair is CALCULABLE from the name alone, by anyone,
+  // offline, with no registry:
+  //
+  //     n = base5(name)                     // name[0] most significant
+  //     channel = 25 + 2 * (n % 25)         // odd, 25..73
+  //     group   = 1 + n / 25, +1 if >= 10   // 1..9, 11..126
+  //
+  // (`tools/make_deploy.py`'s `derive_radio_from_name()` is the
+  // implementation, and cites the normative spec.)
+  //
+  // BUT THE CONFIG IS AUTHORITATIVE, NOT THE DERIVATION. The robot does
+  // NOT compute this at boot: both values are read from the robot's
+  // radio-robot-lib config (`connection.radio_channel` /
+  // `connection.radio_group`) and baked in here at DEPLOY time. The
+  // derivation is how a pair is ASSIGNED to a name so the fleet stays
+  // collision-free and hand-picked numbers stop drifting -- it is not a
+  // runtime behaviour, and nothing on the robot re-derives it.
+  //
+  // The reason config wins is that a name is not guaranteed unique.
+  // The name is a base-5 view of DEVICEID[1], which is 32 bits reduced
+  // to 3125 values, so TWO BOARDS CAN SHARE A NAME. It is rare, but
+  // when it happens the two boards derive the SAME (channel, group) and
+  // would talk over each other with nothing to see. Config is the
+  // escape hatch: give one of them a different pair by hand, and the
+  // build honours it. A derivation with no override has no answer for
+  // that case at all.
+  //
+  // kGroup is currently 10 fleet-wide -- the RADIOBRIDGE relay's listen
+  // group, and the value radio-robot-elite's `robot_config.proto` still
+  // documents as fixed. Note the derived scheme above can NEVER emit
+  // group 10 (it is skipped, being the relay's `!C` button space), so
+  // the fleet's present group and the derived groups are disjoint by
+  // construction: migrating is a coordinated reflash of robots AND
+  // relay, never a per-robot edit. Until that happens, a config with no
+  // `radio_group` key keeps 10.
+  static constexpr int kGroup = 10;
   static constexpr int kTransmitPower = 7;
 
-  // Radio group this robot listens/transmits on -- MUTABLE, unlike
-  // kChannel/kTransmitPower just above. Defaults to 10 (the fleet's
-  // RADIOBRIDGE relay listen group), the same value the old `static
-  // constexpr uint8_t kGroup = 10` held; setGroup() (above) is the
-  // only way to change it, and ensureRadioReady() (radio_transport.cpp)
-  // reads this field, not a constant, when it lazily brings the radio
-  // up.
-  uint8_t group_ = 10;
+  // Radio channel actually used -- MUTABLE, defaulting to the
+  // deploy-injected kChannel just above, so a build with no setChannel()
+  // call behaves exactly as before. setChannel() (above) is the only way
+  // to change it, and ensureRadioReady() (radio_transport.cpp) reads
+  // this field, not the constant, when it lazily brings the radio up.
+  uint8_t channel_ = static_cast<uint8_t>(kChannel);
+
+  // Radio group this robot listens/transmits on -- MUTABLE, defaulting
+  // to the deploy-injected kGroup above exactly as channel_ defaults to
+  // kChannel, so a build whose config names no group is byte-identical
+  // to before (kGroup is 10, the value this field used to hold
+  // literally). setGroup() (above) is the only way to change it, and
+  // ensureRadioReady() (radio_transport.cpp) reads this field, not the
+  // constant, when it lazily brings the radio up.
+  uint8_t group_ = static_cast<uint8_t>(kGroup);
 
   // kMaxPayloadBytes itself is declared PUBLIC, above (sprint 008
   // ticket 002) -- moved out of this section rather than merely

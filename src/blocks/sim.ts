@@ -503,17 +503,28 @@ namespace diffDrive {
         simHeading = heading / 100 * Math.PI / 180
     }
 
-    // Recorded so the "set radio group" block (blocks/run.ts) is
-    // observable in the simulator; there is no radio in the browser,
-    // so this has no other in-sim effect to model. Real (if trivial)
-    // body, not a bare `{}` -- an empty body is emitted by pxt as
-    // native-only, and no pxsim implementation exists, which crashes
-    // the simulator at the call site (the exact defect fixed elsewhere
-    // in this file).
+    // Recorded so the "setup radio" block (blocks/run.ts) is observable
+    // in the simulator; there is no radio in the browser, so this has no
+    // other in-sim effect to model. Real (if trivial) body, not a bare
+    // `{}` -- an empty body is emitted by pxt as native-only, and no
+    // pxsim implementation exists, which crashes the simulator at the
+    // call site (the exact defect fixed elsewhere in this file).
+    let simRadioChannel = 4
     let simRadioGroup = 10
+    let simRadioEnabled = false
 
-    //% shim=diffDrive::setRadioGroup
-    export function _setRadioGroup(group: number): void {
+    // Params typed `number`, not `int32` -- see _goToR()'s comment
+    // above: an int32 param on a function with a TS body fails the
+    // JS->Blocks decompiler with TS9256. The native ABI is governed by
+    // the C++ signature, not this declaration.
+    //% shim=diffDrive::setupRadio
+    export function _setupRadio(channel: number, group: number): void {
+        simRadioChannel = channel
         simRadioGroup = group
+    }
+
+    //% shim=diffDrive::enableRadioLink
+    export function _enableRadioLink(): void {
+        simRadioEnabled = true
     }
 }

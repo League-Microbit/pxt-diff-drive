@@ -142,6 +142,12 @@ void Protocol::emitLine(const char* text) {
   // test's own recorded result, e.g. an OCAL: corner fix), so it gets
   // exactly one fiber_sleep(2)-and-retry -- not a loop -- before giving
   // up silently, per sprint.md's Design Rationale.
+  // Gate 2 of 3 (see radioEnabled_'s own comment, protocol.h): without
+  // this, the first debug line a student emits would call sendLine(),
+  // which lazily calls ensureRadioReady() and claims the radio out from
+  // under MakeCode's own radio blocks. Serial above is unconditional --
+  // serial is always v6.
+  if (!radioEnabled_) return;
   if (!radioTransport_.sendLine(reinterpret_cast<const uint8_t*>(text),
                                 len)) {
     fiber_sleep(2);
@@ -164,9 +170,19 @@ int Protocol::serialDropCount() const {
 // 006) -- same boundary reason as protocolEmitLine() above.
 int protocolSerialDropCount() { return protocol().serialDropCount(); }
 
-void Protocol::setRadioGroup(uint8_t group) {
+void Protocol::setupRadio(uint8_t channel, uint8_t group) {
+  // Order matters: configure, THEN enable. Both setters only store while
+  // the radio is down, and ensureRadioReady() reads the stored values
+  // when it later brings it up -- so doing it this way means the radio
+  // comes up already on the requested channel and group, and the
+  // mid-run re-apply path (unverified for the channel; see
+  // RadioTransport::setChannel()) is never exercised by this call.
+  radioTransport_.setChannel(channel);
   radioTransport_.setGroup(group);
+  radioEnabled_ = true;
 }
+
+void Protocol::enableRadio() { radioEnabled_ = true; }
 
 // ---- the old-style cleartext RUN MessageBus bridge, unchanged --------
 
@@ -324,8 +340,15 @@ void Protocol::run() {
     // (sprint.md's Out of Scope entry, code review R-27): a v6 line
     // whose encoding does not fit one fragment is not this ticket's
     // concern to fix.
+    // Gate 1 of 3 (see radioEnabled_'s own comment, protocol.h). This
+    // poll is what used to bring the radio up at boot, unconditionally,
+    // for every program -- which is exactly why a student's joystick
+    // program could never work. tryReceiveLine() calls
+    // ensureRadioReady() internally, so NOT calling it at all is what
+    // leaves the radio free for MakeCode's own radio blocks.
     size_t radioLen = 0;
-    if (radioTransport_.tryReceiveLine(rxLineBuf_, sizeof(rxLineBuf_),
+    if (radioEnabled_ &&
+        radioTransport_.tryReceiveLine(rxLineBuf_, sizeof(rxLineBuf_),
                                        &radioLen)) {
       if (radioLen >= kOldRunPrefixLen &&
           std::memcmp(rxLineBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
@@ -390,7 +413,13 @@ void Protocol::run() {
       if (wireAdapter_.telemetryEnabled()) {
         const Wire::Snapshot& snapshot = wireAdapter_.buildSnapshot();
         wireHandler_.emitTelemetry(snapshot);
-        wireHandlerRadio_.emitTelemetry(snapshot);
+        // Gate 3 of 3 (see radioEnabled_'s own comment, protocol.h):
+        // wireHandlerRadio_ sinks through radioSink_ into
+        // RadioTransport::sendLine(), which lazily enables the radio.
+        // Serial telemetry just above is unconditional.
+        if (radioEnabled_) {
+          wireHandlerRadio_.emitTelemetry(snapshot);
+        }
       }
       lastEmitMs = nowMs;
     }
@@ -434,18 +463,27 @@ Protocol& protocol() {
 //%
 void startProtocol() { protocol(); }
 
-// Free-function entry point for the "set radio group" block's shim
-// (`_setRadioGroup`, `blocks/sim.ts`): same lazy-singleton Protocol&
+// Free-function entry point for the "setup radio" block's shim
+// (`_setupRadio`, `blocks/sim.ts`): same lazy-singleton Protocol&
 // access pattern as startProtocol() just above -- protocol()'s own
 // guard makes this call safe (and idempotent) regardless of whether
-// the protocol fiber has started yet. Forwards into
-// Protocol::setRadioGroup(), which forwards again into
-// RadioTransport::setGroup() -- see that method's own doc comment
-// (radio_transport.h) for the idempotent-apply contract this block
-// ultimately relies on.
+// the protocol fiber has started yet.
+//
+// This is the ONLY thing that turns the v6 radio link on. Until a
+// program calls it, the radio is never enabled at all and MakeCode's
+// own `radio.*` blocks own the air -- see radioEnabled_'s comment in
+// protocol.h.
 //%
-void setRadioGroup(int group) {
-  protocol().setRadioGroup(static_cast<uint8_t>(group));
+void setupRadio(int channel, int group) {
+  protocol().setupRadio(static_cast<uint8_t>(channel),
+                        static_cast<uint8_t>(group));
 }
+
+// Free-function entry point for `_enableRadioLink` (blocks/sim.ts), the
+// hidden block test/test.ts uses to bring the radio up on its
+// deploy-injected channel. See Protocol::enableRadio() for why this is
+// separate from setupRadio() rather than a defaulted argument.
+//%
+void enableRadioLink() { protocol().enableRadio(); }
 
 }  // namespace diffDrive

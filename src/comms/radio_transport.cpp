@@ -36,7 +36,10 @@ void RadioTransport::ensureRadioReady() {
   // it must be set explicitly, or a robot and the relay could sit on
   // different frequencies and never hear each other.
   uBit.radio.enable();
-  uBit.radio.setFrequencyBand(kChannel);
+  // channel_, not kChannel: the constant is only the default this field
+  // was initialised from (see its declaration), so a setChannel() call
+  // made before the radio came up is honoured here.
+  uBit.radio.setFrequencyBand(channel_);
   uBit.radio.setGroup(group_);
   uBit.radio.setTransmitPower(kTransmitPower);
   // Reference-style RX: listen for the datagram event and recv() only
@@ -44,6 +47,18 @@ void RadioTransport::ensureRadioReady() {
   gRadioRx = this;
   uBit.messageBus.listen(MICROBIT_ID_RADIO, MICROBIT_RADIO_EVT_DATAGRAM,
                          radioDatagramTrampoline);
+}
+
+void RadioTransport::setChannel(uint8_t channel) {
+  channel_ = channel;
+  if (radioReady_) {
+    // Radio already up. UNVERIFIED whether this actually re-tunes live
+    // hardware -- see this method's own doc comment (radio_transport.h)
+    // for the source reading behind the doubt and what would settle it.
+    // Protocol::setupRadio() never reaches this branch: it configures
+    // before enabling.
+    uBit.radio.setFrequencyBand(channel_);
+  }
 }
 
 void RadioTransport::setGroup(uint8_t group) {

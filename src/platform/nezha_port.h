@@ -59,11 +59,16 @@ class NezhaMotorPort final : public DiffDrive::Motor {
                         float slewRate, float writeThrottle);
                         // [-1,1] [ms] [pct/tick] [us]
 
- private:
+  // PUBLIC so the fault-context emergency stop
+  // (diffdrive_emergency_motor_stop(), nezha_port.cpp) can build the
+  // same wire frame without an instance -- see its own comment for why
+  // that path cannot use any object state. Values unchanged.
   static constexpr uint8_t kAddress = 0x10;      // 7-bit I2C address
   static constexpr uint8_t kRegMotorRun = 0x60;
-  static constexpr uint8_t kRegEncoder = 0x46;
   static constexpr uint8_t kDirCw = 1;
+
+ private:
+  static constexpr uint8_t kRegEncoder = 0x46;
   static constexpr uint8_t kDirCcw = 2;
   static constexpr int8_t kNeverWritten = -128;  // first-write sentinel
   static constexpr float kStopConfirmVelocity = 102.0f;  // [counts/s]

@@ -56,11 +56,11 @@ namespace diffDrive {
         })
     }
 
-    // Remote group: remote dispatch is not a move, so it gets its own
-    // group rather than sharing Move's weight range. Weights on this
-    // group's three blocks (onRun, onRunCommand, and setRadioGroup
-    // below) are spaced 10 apart so a future fourth block can slot in
-    // without renumbering the existing three.
+    // Remote dispatch is not a move, so it gets its own group rather
+    // than sharing Move's weight range. Group, subcategory and weight on
+    // every block below are GENERATED from
+    // reports/blocks-toolbox.csv by tools/blocks_toolbox.py
+    // (`just blocks-apply`) -- edit the CSV, not the annotations.
 
     /**
      * Run code when the named command arrives over the wire protocol --
@@ -75,7 +75,7 @@ namespace diffDrive {
      */
     //% block="on run %name $arg"
     //% draggableParameters="reporter"
-    //% group="Remote" weight=20
+    //% group="Remote" weight=40
     //% subcategory="Extra"
     export function onRun(name: string, handler: (arg: number) => void): void {
         ensureRunState()
@@ -91,7 +91,7 @@ namespace diffDrive {
      */
     //% block="on run command $name $arg"
     //% draggableParameters="reporter"
-    //% group="Remote" weight=10
+    //% group="Remote" weight=30
     //% subcategory="Extra"
     export function onRunCommand(
         handler: (name: string, arg: number) => void): void {
@@ -101,19 +101,80 @@ namespace diffDrive {
     }
 
     /**
-     * The robot listens for RUN commands from the radio relay on this
-     * group. Safe to call any time -- before the radio has come up
-     * (typically from on start) or after: applied immediately if the
-     * radio is already up, picked up automatically the first time it
-     * comes up otherwise. Does not affect the fleet radio channel,
-     * which stays fixed per-robot.
+     * Turn on the v6 wire protocol over the radio, on this channel and
+     * group, so a bench host or relay can drive the robot remotely.
+     *
+     * OFF until you call this. That is deliberate: while it is off, the
+     * radio belongs to MakeCode's own `radio` blocks, so a joystick
+     * controller works normally. Calling this takes the radio over --
+     * `radio send`/`on radio received` STOP WORKING in the same program.
+     * It cannot be undone without restarting the robot.
+     *
+     * Call it from `on start`, before anything else touches the radio.
+     *
+     * The channel must match the relay you are talking to; each robot in
+     * the fleet has its own, and changing it will take the robot off the
+     * relay it is assigned to. The group defaults to 10, the relay's
+     * listen group.
+     * @param channel radio channel, eg: 4
      * @param group radio group, eg: 10
      */
-    //% block="set radio group %group"
-    //% group="Setup" weight=70
+    //% block="setup radio channel %channel group %group"
+    //% group="Setup" weight=90
     //% subcategory="Setup"
-    export function setRadioGroup(group: number = 10): void {
-        _setRadioGroup(Math.round(group))
+    export function setupRadio(channel: number, group: number = 10): void {
+        _setupRadio(Math.round(channel), Math.round(group))
+    }
+
+    /**
+     * Bring the v6 radio link up on the channel this firmware was built
+     * for -- the per-robot value tools/make_deploy.py injects at deploy
+     * time -- and group 10.
+     *
+     * For the on-robot test program and advanced JavaScript users. It is
+     * deliberately NOT a block and takes no channel: naming a channel
+     * here would override the deploy injection and put every robot on
+     * one channel. Students use `setup radio` instead.
+     */
+    //% blockHidden=true
+    export function enableRadioLink(): void {
+        _enableRadioLink()
+    }
+
+    /**
+     * Send a line of text back to the computer, tagged as debug output.
+     * It shows up in the console as `DBG:` followed by your text.
+     *
+     * Use `send value` instead for a number you want to graph -- the
+     * `DBG:` tag stops the console graphing it.
+     *
+     * Always goes out over the USB cable. It also goes out over the
+     * radio once `setup radio` has been called, which is how an
+     * untethered robot reports back.
+     * @param text the text to send, eg: "hello"
+     */
+    //% block="send string %text"
+    //% group="Debug" weight=20
+    //% subcategory="Extra"
+    export function sendString(text: string): void {
+        emitLine("DBG:" + text)
+    }
+
+    /**
+     * Send a named number back to the computer, in the form
+     * `name:value` -- the format the MakeCode console plots on its
+     * graph. Send the same name repeatedly to draw a line.
+     *
+     * Same wires as `send string`: always USB, plus radio once
+     * `setup radio` has been called.
+     * @param name what to call the value, eg: "x"
+     * @param value the number to send, eg: 0
+     */
+    //% block="send value %name = %value"
+    //% group="Debug" weight=10
+    //% subcategory="Extra"
+    export function sendValue(name: string, value: number): void {
+        emitLine(name + ":" + value)
     }
 
     /**
