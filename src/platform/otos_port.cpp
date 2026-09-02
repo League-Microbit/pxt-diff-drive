@@ -2,13 +2,15 @@
 // Hardware::RealOtos onto uBit.i2c, minus the lever-arm transform.
 #include "otos_port.h"
 
+#include "vfp_guard.h"
+
 #include <cmath>
 
 #include "../core/heading_wrap.h"
 
 namespace diffDrive {
 
-void OtosPort::busGap() { fiber_sleep(kBusClearanceMs); }
+void OtosPort::busGap() { vfpSafeSleep(kBusClearanceMs); }
 
 namespace {
 // codal-microbit-v2 (V2) I2C takes uint8_t*; classic DAL (V1) takes
@@ -106,7 +108,7 @@ bool OtosPort::begin() {
     uint8_t remaining = 0;
     if (!readReg8(kRegImuCalibration, &remaining)) break;
     if (remaining == 0) break;
-    fiber_sleep(10);
+    vfpSafeSleep(10);
   }
   return true;
 }

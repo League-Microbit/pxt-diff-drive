@@ -476,6 +476,13 @@ namespace diffDrive {
      * reaches the cable only, and the cable only reaches the bench
      * stand where the wheels are off the ground.
      *
+     * Student code inside an event handler (a button press, a radio
+     * receive) MUST call diffDrive.emitLine here, never PXT's own
+     * serial.writeLine/serial.writeString: those go straight to the
+     * device's serial port from whatever fiber calls them, and this
+     * extension has no way to route that path through its own queue
+     * from the inside.
+     *
      * (Do not write the word r-a-d-i-o followed by a full stop in this
      * file: PXT scans the TypeScript for `<name>.` to auto-add package
      * dependencies, and a prose mention makes it demand a `radio`

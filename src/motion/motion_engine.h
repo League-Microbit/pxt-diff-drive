@@ -244,6 +244,39 @@ class MotionEngine {
   // though it had been measured.
   float effectiveTrackWidth() const { return trackWidth_ / rotationalSlip_; }
 
+  // [mm/s] SUC-003: the distance-chosen default cruise speed --
+  // v_default(D) = min(vMaxMmS_, sqrt(2 * aDecelMmS2_ * brakeFrac_ *
+  // D)) -- for the moveX()/goToR()/goToW() family's `cruise == 0` "use
+  // the default" wire sentinel. Same "derived, never cached" pattern as
+  // effectiveTrackWidth() above: computed fresh, every call, from the
+  // SAME aDecelMmS2_/vMaxMmS_/brakeFrac_ fields (see their own comments
+  // below) the taper's own braking-speed solve already reads, so the
+  // two can never drift apart. This method carries no legacy branch of
+  // its own -- WHETHER to call it at all (vs. the flat legacy default)
+  // is a wire-layer decision the caller makes by checking aDecelMmS2_
+  // first; with aDecelMmS2_ == 0.0f this simply returns 0.0f, which the
+  // wire layer's existing non-positive-cruise refusal already treats
+  // the same way it treats an explicit `cruise <= 0`. `distanceMm` is
+  // clamped to >= 0 before the square root so a negative or degenerate
+  // leg length can never produce NaN.
+  float defaultCruiseForDistance(float distanceMm) const;
+
+  // [mm] SUC-003 input helper for defaultCruiseForDistance() above: the
+  // dominant-axis wheel-travel magnitude moveX()'s own wheels_x-style
+  // reduction would produce for (distanceMm, rotationRad) -- the same
+  // `dominant` quantity startSegment() computes (motion_engine.cpp),
+  // restated here in mm rather than counts so a PURE PIVOT
+  // (distanceMm == 0, rotationRad != 0) still has a real, nonzero D
+  // instead of always resolving to 0 -- a pivot's wheels genuinely
+  // travel `|rotationRad| * effectiveTrackWidth() / 2` mm each, even
+  // though the chassis itself does not translate. Approximates the
+  // exact `max(|distance - rotation*b/2|, |distance + rotation*b/2|)`
+  // split as `max(|distanceMm|, |rotationRad|*b/2)` -- cheaper, and
+  // never LARGER than the exact split (same-signed terms only add), so
+  // a blended move's resolved default cruise is never more optimistic
+  // than the exact reduction would allow.
+  float dominantAxisTravelMm(float distanceMm, float rotationRad) const;
+
   // ---- the two primitives (motion-api.md S3.1/S3.2) ----
 
   // wheels_v(left, right, duration): hold each wheel at a commanded
@@ -374,12 +407,113 @@ class MotionEngine {
   void settleToRest();
 
   // ---- end-of-move shaping knobs (settable per tour). See this class's
-  // own field comments (below) for what each trades off. --
+  // own field comments (below) for what each trades off. Getters added
+  // below for read-back (these five previously had setters only). --
+  float distTaper() const { return distTaper_; }
   void setDistTaper(float counts) { distTaper_ = counts; }
+  float yawTaper() const { return yawTaper_; }
   void setYawTaper(float counts) { yawTaper_ = counts; }
+  float distFloor() const { return distFloor_; }
   void setDistFloor(float fraction) { distFloor_ = fraction; }
+  float turnFloor() const { return turnFloor_; }
   void setTurnFloor(float fraction) { turnFloor_ = fraction; }
+  float rampMs() const { return rampMs_; }
   void setRampMs(float ms) { rampMs_ = ms; }
+
+  // ---- constant-a acceleration/deceleration shaping. See this class's
+  // own field comments (below, next to each default) for the measured
+  // defect each constant replaces and the value behind each default.
+  // All four default to values that select LEGACY MODE
+  // (aAccelMmS2_ == 0.0f && aDecelMmS2_ == 0.0f): startSegment()/
+  // serviceMove() run their original formulas bit-for-bit -- see
+  // motion_engine.cpp's own comments at both call sites -- until a
+  // caller sets a nonzero accel/decel. Validation mirrors
+  // setPivotOverrunMm()/setRotationalSlip() above: an invalid input
+  // silently keeps the prior value rather than erroring, so a bad
+  // external write cannot corrupt engine state.
+  float aAccelMmS2() const { return aAccelMmS2_; }
+  void setAAccelMmS2(float mmS2) {
+    if (mmS2 > 0.0f) aAccelMmS2_ = mmS2;
+  }
+  float aDecelMmS2() const { return aDecelMmS2_; }
+  void setADecelMmS2(float mmS2) {
+    if (mmS2 > 0.0f) aDecelMmS2_ = mmS2;
+  }
+  float vMaxMmS() const { return vMaxMmS_; }
+  void setVMaxMmS(float mmS) {
+    if (mmS > 0.0f) vMaxMmS_ = mmS;
+  }
+  float brakeFrac() const { return brakeFrac_; }
+  void setBrakeFrac(float frac) {
+    if (frac > 0.0f && frac <= 1.0f) brakeFrac_ = frac;
+  }
+
+  // Jerk bound, plateau demand and turn-rate cap. Same
+  // invalid-input-keeps-prior-value validation as the four above, and
+  // the same legacy-selecting default of 0: with jerkMmS3_ == 0 the
+  // shaper stays first-order (bounded acceleration, stepped), and with
+  // plateauMinS_ == 0 no cruise derate is applied.
+  float jerkMmS3() const { return jerkMmS3_; }
+  void setJerkMmS3(float mmS3) {
+    if (mmS3 > 0.0f) jerkMmS3_ = mmS3;
+  }
+  float plateauMinS() const { return plateauMinS_; }
+  void setPlateauMinS(float sec) {
+    if (sec >= 0.0f) plateauMinS_ = sec;
+  }
+  float maxYawRateDegS() const { return maxYawRateDegS_; }
+  void setMaxYawRateDegS(float degS) {
+    if (degS > 0.0f) maxYawRateDegS_ = degS;
+  }
+
+  // [mm/s] PROFILE-COMPLETION EXIT. A move normally ends only when the
+  // encoders land inside a fixed position margin -- 10 counts (0.79 mm)
+  // on the distance axis, 4 counts (0.16 deg) on a pure turn. The
+  // velocity profile is a separate thing: it decays toward zero at the
+  // target, and then the taper FLOOR (distFloor_/turnFloor_) holds the
+  // command up so the move can still close that last fraction of a
+  // millimetre. Those two halves are why a shaped move still arrives
+  // hot and then hunts -- the profile is overridden exactly where it
+  // was supposed to land.
+  //
+  // Set this above 0 (and aDecelMmS2_ > 0) to end the move when the
+  // PROFILE is done instead: the taper floor is bypassed so the command
+  // genuinely decays, and the move terminates once the dominant axis's
+  // commanded speed falls to this value. The residual position error is
+  // accepted rather than chased.
+  //
+  // Why accepting it is reasonable: that 0.79 mm is in ENCODER COUNTS,
+  // not in the world. Legs run 0.3-0.7% long, so a 600 mm leg is
+  // already 2-4 mm out however precisely the counts land -- the crawl
+  // buys precision in believed position only. A sensible value is just
+  // above the drivetrain's stiction speed, since below that the command
+  // cannot move the robot anyway and the move would otherwise stall out
+  // to its deadline.
+  //
+  // 0 (the default) keeps the legacy positional exit exactly as it was.
+  float profileExitMmS() const { return profileExitMmS_; }
+  void setProfileExitMmS(float mmS) {
+    if (mmS >= 0.0f) profileExitMmS_ = mmS;
+  }
+
+  // [mm/s] Largest cruise whose trapezoid still holds a plateau of
+  // plateauMinS_ seconds over `distanceMm`, solving
+  //   (1/2)(1/aAccel + 1/aDecel) v^2 + T v - D = 0
+  // for the positive root. A move commanded above this reaches its
+  // peak for a single control tick and is a triangle with a corner at
+  // the apex -- MEASURED gopiv 2026-09-01,
+  // captures/gopiv-profile-sweep-20260901/square120.json: every 90 deg
+  // pivot of that tour held its peak for exactly one telemetry sample.
+  // Returns 0 when the shaping constants are not set, which callers
+  // read as "no opinion".
+  float plateauCruiseMmS(float distanceMm) const;
+
+  // [mm/s] Wheel speed equivalent to maxYawRateDegS_ for a pure turn:
+  // omega * trackWidth/2. The wire's cruise argument is linear mm/s,
+  // so without this a pivot inherits the straight-line speed and turns
+  // far faster than intended -- MEASURED gopiv 2026-09-01 (same
+  // capture): cruise 300 mm/s produced 254-285 deg/s.
+  float yawRateCapMmS() const;
 
  private:
   // |rotation| at/above this is NOT one blended segment -- pivot to the
@@ -422,6 +556,24 @@ class MotionEngine {
     uint32_t startMs = 0;     // [ms] for the acceleration ramp
     float cmdScale = 1.0f;    // last commanded rate scale (ramp/taper)
     uint32_t deadline = 0;    // [ms] the caller's timeout backstop
+
+    // ---- constant-a shaping's own per-segment state, read only when
+    // aAccelMmS2_/aDecelMmS2_ > 0. ----
+    float cruiseMmS = 0.0f;   // [mm/s] the raw `cruise` startSegment()
+                              // was called with -- the accel
+                              // integrator's own reference speed (see
+                              // serviceMove()'s ramp block). Unused in
+                              // legacy mode.
+    uint32_t lastTickMs = 0;  // [ms] the PREVIOUS serviceMove() call's
+                              // nowMs(), for the accel integrator's own
+                              // `dt`. Set to startMs at segment start.
+                              // Unused in legacy mode.
+    float accelScalePerS = 0.0f;  // [scale/s] the jerk limiter's own
+                                  // state: currently commanded
+                                  // acceleration, expressed in the same
+                                  // cruise-fraction units as cmdScale so
+                                  // the two integrate together. Read
+                                  // only when jerkMmS3_ > 0.
   };
 
   // [ms] this engine's own notion of "now" -- see the constructor
@@ -565,6 +717,91 @@ class MotionEngine {
   float distFloor_ = 0.25f;   // [1] slowest fraction of commanded
   float turnFloor_ = 0.12f;   // [1] pure turns crawl slower
   float rampMs_ = 400.0f;     // [ms] acceleration ramp
+
+  // ---- constant-a shaping constants ----
+
+  // [mm/s^2] UNVERIFIED pending a bench sweep -- no robot has run this
+  // yet. 0.0 selects LEGACY MODE (paired with aDecelMmS2_ == 0.0):
+  // startSegment()/serviceMove() keep the original `elapsed/rampMs_`
+  // ramp, including the 0.25f first-tick literal, completely unchanged.
+  // A nonzero value switches on a velocity-slew integrator instead
+  // (`v_cmd <= v_prev + aAccelMmS2_*dt`) -- see startSegment()'s and
+  // serviceMove()'s own comments in motion_engine.cpp. This replaces a
+  // ramp whose effective rate MEASURED from the compiled engine
+  // (captures/motion-profile-probe-20260901/profile_probe.py) scales
+  // with whatever cruise is commanded instead of being a fixed mm/s^2
+  // rate: 184/368/551/720/924 mm/s^2 at cruise 100/200/300/400/600 --
+  // i.e. ~1.875*cruise, not a real acceleration at all.
+  float aAccelMmS2_ = 0.0f;
+
+  // [mm/s^2] UNVERIFIED pending a bench sweep. 0.0 selects LEGACY MODE
+  // (paired with aAccelMmS2_ == 0.0): serviceMove()'s deceleration
+  // axis-scale stays the original `remain/distTaper_` fixed-window
+  // formula, unchanged. A nonzero value switches on the constant-a
+  // braking-speed solve (`v_allow = sqrt(2*aDecelMmS2_*remain_mm)`)
+  // instead. On the dist axis this is gated by the kinematics
+  // themselves (`v_cmd^2/(2*aDecelMmS2_)`, motion_engine.cpp's
+  // constantDecelWindowMm()) rather than by distTaper_: a fixed-counts
+  // window is smaller than that kinematic one at any meaningful cruise
+  // and left this solve unreachable above roughly 200 mm/s (see that
+  // function's own comment for the measured before/after). The
+  // pure-turn yaw axis is unaffected by that change and still gates on
+  // the fixed yawTaper_ counts window (see serviceMove()'s own
+  // comment). This replaces a fixed-window taper whose demanded
+  // deceleration MEASURED from the compiled engine (same capture as
+  // above) grows as v^2: 105 mm/s^2 at cruise 100 rising to
+  // 5081 mm/s^2 at cruise 600, collapsing the decel phase from 26
+  // control ticks to 2 -- a demand no real robot can satisfy at the
+  // higher cruise values.
+  float aDecelMmS2_ = 0.0f;
+
+  // [mm/s] global speed ceiling for a future distance-chosen
+  // default-cruise resolver (`v_default(D) = min(vMaxMmS_, ...)`) that
+  // will read this field. UNVERIFIED pending a bench sweep -- this is
+  // a documented PLACEHOLDER, not a fit constant: informed by, not
+  // measured as, a field-tour result MEASURED 2026-08-31,
+  // captures/fleet-tours-speed-20260831.json -- 200 mm/s gave this
+  // rig's best recorded closure (tigez) on the orange-dot tour while
+  // 400 mm/s doubled the mean leg miss (2.0-2.1 cm vs 3.6-4.1 cm).
+  // Must never be 0: that resolver's min() depends on this being a
+  // real, positive ceiling unconditionally, even before aDecelMmS2_ is
+  // ever set nonzero.
+  float vMaxMmS_ = 250.0f;
+
+  // [1] fraction of a default-speed move's own leg length a future
+  // `v_default(D) = min(vMaxMmS_, sqrt(2*aDecelMmS2_*brakeFrac_*D))`
+  // resolver will allot to braking. UNVERIFIED pending a bench sweep --
+  // placeholder within an accuracy-first recommended range (0.35-0.4).
+  // Not consulted by anything yet; that future resolver is its first
+  // reader.
+  float brakeFrac_ = 0.375f;
+
+  // [mm/s^3] jerk bound for the second-order shaper. 0 selects the
+  // first-order behaviour (bounded acceleration only), where the
+  // commanded acceleration steps discontinuously at the accel->decel
+  // handover. UNVERIFIED pending a bench sweep; simulated at 4000 in
+  // captures/gopiv-profile-sweep-20260901/. Note a jerk phase lasts
+  // aAccel/jerk seconds, so at the kernel's 24 ms tick a value much
+  // above ~10000 rounds nothing a control cycle can resolve.
+  float jerkMmS3_ = 0.0f;
+
+  // [s] minimum cruise plateau plateauCruiseMmS() solves for. 0
+  // disables the derate. Wants to be at least twice a jerk transition
+  // (2*aAccel/jerk) so the accel and decel roundings cannot meet and
+  // eat the plateau they were sized to protect.
+  float plateauMinS_ = 0.0f;
+
+  // [deg/s] ceiling on pure-turn angular rate. 0 disables the cap and
+  // is the shipping default: a pivot then inherits the linear cruise
+  // exactly as before. Defaulting this ACTIVE was tried and reverted --
+  // it silently rescaled every legacy pure turn and broke the pinned
+  // yaw-taper regression, which is precisely the behaviour that test
+  // exists to protect. A caller opts in with SET max_yaw_rate 90.
+  float maxYawRateDegS_ = 0.0f;
+
+  // [mm/s] see setProfileExitMmS(). 0 selects the legacy positional
+  // exit; paired with aDecelMmS2_ > 0 it selects profile completion.
+  float profileExitMmS_ = 0.0f;
 };
 
 }  // namespace diffDrive

@@ -401,6 +401,33 @@ float engineDefaultCruiseMmS() {
   return ensure().defaultCruiseMmS_;
 }
 
+// SUC-003: same same-package forward-declaration convention as
+// engineDefaultCruiseMmS() immediately above -- WireAdapter has no
+// reference of its own to this Rig's `engine`. engineADecelMmS2() lets
+// the wire layer decide, per call, whether a `cruise == 0` sentinel
+// should resolve from the flat legacy default above or from the
+// call's own leg distance below; engineDefaultCruiseForDistanceMmS()
+// is that distance-aware resolve itself, forwarding straight onto
+// MotionEngine::defaultCruiseForDistance() (motion_engine.h). Neither
+// is read by engineWheelsX()'s own wire path -- WHEELS_X/WHEELS_V keep
+// the flat sentinel unconditionally.
+float engineADecelMmS2() {
+  return ensure().engine.aDecelMmS2();
+}
+
+float engineDefaultCruiseForDistanceMmS(float distanceMm) {
+  return ensure().engine.defaultCruiseForDistance(distanceMm);
+}
+
+// SUC-003: MOVE_X's own D input for the resolver above -- a pure pivot
+// (distance == 0) still has a real wheel-travel distance, so onMoveX()
+// (wire_adapter.cpp) reaches this instead of taking |distance| alone.
+// Forwards onto MotionEngine::dominantAxisTravelMm() (motion_engine.h),
+// the same `dominant` quantity startSegment() itself reduces to.
+float engineDominantAxisTravelMm(float distanceMm, float rotationRad) {
+  return ensure().engine.dominantAxisTravelMm(distanceMm, rotationRad);
+}
+
 // Sprint 005 ticket 004 (closing wire-motion-completion-signal.md/R-23):
 // the ONE genuinely new read WireAdapter's own motion-completion
 // resolution needs (wire_adapter.cpp's forward declaration, its own
@@ -840,6 +867,8 @@ bool isStalled() { return ensure().kernel.output().stallHalted; }
 // convention protocolEmitLine/protocolRunText already use further down
 // this file.
 int protocolSerialDropCount();
+int protocolRunDropCount();
+int protocolEmitDropCount();
 
 // Kernel Output accessor, one int per field: booleans 0/1, duty percent
 // x100 (10000 == full duty -- Output.appliedDutyLeft/Right already
@@ -895,6 +924,19 @@ int diagValue(int what) {
     case 27:
       return static_cast<int>(ensure().left.rebaselineCount_ +
                               ensure().right.rebaselineCount_);
+    // 28: cleartext RUN payloads refused because every ring slot
+    // was still in flight. The predecessor to that ring silently
+    // overwrote unread payload instead, so a handler could run a
+    // command nobody sent; this counter is what makes the
+    // refusal visible. Should read 0 unless a host out-runs the
+    // robot.
+    case 28: return protocolRunDropCount();
+    // 29: emitLine() calls refused because the outbound emit ring was
+    // already full -- see comms/emit_queue.h and Protocol::emitLine()
+    // for the ring this counts. Should read 0 across a normal session;
+    // a nonzero value means a caller queued lines faster than this
+    // fiber's own loop could drain them onto the wire.
+    case 29: return protocolEmitDropCount();
     default: return 0;
   }
 }
@@ -995,6 +1037,24 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
     // keep the prior value" validation (motion_engine.h), same shape as
     // case 16's rotational_slip forward above.
     case 18: r.engine.setPivotOverrunMm(v); break;
+    // 19-27: constant-a shaping plus the five pre-existing end-of-move
+    // shaping knobs, all thin forwards to MotionEngine setters that
+    // already own their own validation (motion_engine.h) -- same
+    // shape as case 16/18's forwards above, no inline check needed
+    // here.
+    case 19: r.engine.setAAccelMmS2(v); break;
+    case 20: r.engine.setADecelMmS2(v); break;
+    case 21: r.engine.setVMaxMmS(v); break;
+    case 22: r.engine.setBrakeFrac(v); break;
+    case 23: r.engine.setDistTaper(v); break;
+    case 24: r.engine.setYawTaper(v); break;
+    case 25: r.engine.setDistFloor(v); break;
+    case 26: r.engine.setTurnFloor(v); break;
+    case 27: r.engine.setRampMs(v); break;
+    case 28: r.engine.setJerkMmS3(v); break;
+    case 29: r.engine.setPlateauMinS(v); break;
+    case 30: r.engine.setMaxYawRateDegS(v); break;
+    case 31: r.engine.setProfileExitMmS(v); break;
     default: break;
   }
 }
@@ -1044,6 +1104,21 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
     // 18: pivot_overrun's GET side -- MotionEngine::pivotOverrunMm(),
     // not a kernel Config field (same as case 16 above).
     case 18: v = r.engine.pivotOverrunMm(); break;
+    // 19-27: GET side of the setKernelValue() forwards above, same
+    // "not a kernel Config field" shape as case 16/18.
+    case 19: v = r.engine.aAccelMmS2(); break;
+    case 20: v = r.engine.aDecelMmS2(); break;
+    case 21: v = r.engine.vMaxMmS(); break;
+    case 22: v = r.engine.brakeFrac(); break;
+    case 23: v = r.engine.distTaper(); break;
+    case 24: v = r.engine.yawTaper(); break;
+    case 25: v = r.engine.distFloor(); break;
+    case 26: v = r.engine.turnFloor(); break;
+    case 27: v = r.engine.rampMs(); break;
+    case 28: v = r.engine.jerkMmS3(); break;
+    case 29: v = r.engine.plateauMinS(); break;
+    case 30: v = r.engine.maxYawRateDegS(); break;
+    case 31: v = r.engine.profileExitMmS(); break;
     default: return 0;
   }
   return static_cast<int>(std::lround(v * 1000.0));
@@ -1157,6 +1232,28 @@ bool engineGoToW(float x, float y, float speed, float arrive,
   PoseSource& pose = selectPoseSource(otos.connected(), otos, r.encoderPose);
   r.engine.goToW(pose, x, y, speed, arrive, timeoutMs);
   return true;
+}
+
+// SUC-003: GO_TO_W's own D input for
+// engineDefaultCruiseForDistanceMmS() above -- the TRUE body-frame
+// chord from the robot's CURRENT pose to this call's WORLD-frame
+// (worldX, worldY) target, not the target's distance from the world
+// origin (hypot(worldX, worldY) alone, which is wrong whenever the
+// robot is not sitting at the origin). Reuses the exact SAME
+// PoseSource selection engineGoToW() above applies -- OtosPort when
+// connected(), the Rig-owned encoderPose otherwise -- so this resolves
+// against the pose the move will actually run from. Both PoseSource
+// implementations (OtosPort, EncoderPoseSource) are plain read-only
+// accessors over already-cached state (otos_port.h/
+// encoder_pose_source.h) -- reading x()/y() here, a second time before
+// engineGoToW() reads them again for the real dispatch, mutates
+// nothing and cannot observe a different value than that dispatch
+// will.
+float engineGoToWChordMm(float worldX, float worldY) {
+  OtosPort& otos = otosRef();
+  Rig& r = ensure();
+  PoseSource& pose = selectPoseSource(otos.connected(), otos, r.encoderPose);
+  return std::hypot(worldX - pose.x(), worldY - pose.y());
 }
 
 // Set end-of-move shaping. Larger tapers and lower floors buy accuracy

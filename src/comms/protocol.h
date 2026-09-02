@@ -6,7 +6,7 @@
 //
 // One exception, preserved deliberately: the OLD cleartext
 // "RUN:<name>[:<arg>...]" MessageBus bridge (handleRun()/runText()/the
-// runSlots_ ring below) coexists with v6 on the same wire -- detected
+// runQueue_ ring below) coexists with v6 on the same wire -- detected
 // directly by its literal "RUN:" prefix before a line ever reaches the
 // v6 stack (no verb registry involved -- see run()'s own comment). It
 // is the ONLY path that feeds the MessageBus test-trigger bridge
@@ -22,8 +22,11 @@
 // cleartext RUN: carve-out above is preserved on radio too, as a
 // fallback, unchanged -- see run()'s own radio-polling block.
 // `emitLine()` below -- the free function shims.cpp's test-result
-// reporting already uses -- still writes to both transports unchanged,
-// so an untethered bench run's results still reach a listening host.
+// reporting already uses -- queues onto a Protocol-owned ring rather
+// than writing to either transport directly; this fiber's own loop
+// drains it every pass. An untethered bench run's results still reach
+// a listening host, just through one more level of indirection than
+// before, and only ever written by this fiber.
 //
 // This project's own telemetry is real and shipped on the v6 wire
 // stack: WireHandler::emitTelemetry(Snapshot) (see its own doc comment
@@ -41,6 +44,8 @@
 #include "radio_transport.h"  // radio transport -- now a full v6 sink too
 #include "serial_transport.h"
 #include "wire_adapter.h"
+#include "run_queue.h"
+#include "emit_queue.h"
 #include "wire_handler.h"
 
 namespace diffDrive {
@@ -53,23 +58,28 @@ class Protocol {
   // DifferentialDrive::start()'s own idempotent guard.
   void start();
 
-  // Emit one caller-supplied text line on BOTH transports -- this
-  // consolidates what used to be two separate single-transport emitters
-  // into the one path anything wanting both wires mirrored now uses.
-  // Exists because the test programs' result lines (tour fixes,
+  // Queue one caller-supplied text line for emission on BOTH transports
+  // -- this consolidates what used to be two separate single-transport
+  // emitters into the one path anything wanting both wires mirrored now
+  // uses. Exists because the test programs' result lines (tour fixes,
   // calibration data, timings) were written with TypeScript's
   // `serial.writeLine`, which reaches the USB cable only -- and the USB
   // cable only reaches the bench stand, where the wheels are off the
   // ground. Every test that needs the robot to actually move therefore
   // runs untethered, and its results have to come back over the radio.
   //
-  // Called from the TS layer (shims.cpp's emitLine), NOT from this
-  // object's own fiber; SerialTransport::writeLine blocks the caller
-  // until the bytes are out, and RadioTransport::sendLine is a single
-  // datagram, so a caller between moves pays a bounded cost -- plus,
-  // as of ticket 002, at most one extra fiber_sleep(2) if
-  // sendLine()'s re-entrancy guard fires against the protocol fiber's
-  // own concurrent RadioSink::write() and this call retries once.
+  // Called from the TS layer (shims.cpp's emitLine), on whatever fiber
+  // that call happens to run on -- NOT this object's own fiber. This
+  // clips the line and copies it into emitQueue_, then returns: it no
+  // longer touches transport_/radioTransport_ itself. Only this
+  // object's own fiber (Protocol::run(), via drainEmitQueue()) ever
+  // writes either transport, so two fibers can never race the same
+  // underlying serial write again. The tradeoff: a caller can no longer
+  // assume the line is physically on the wire by the time this call
+  // returns, only that it is queued for the next drain pass (at most
+  // one poll interval later); and a full ring drops the newest line
+  // rather than blocking the caller, counted rather than silent (see
+  // emitLineNow()'s own comment for where the actual writes happen).
   void emitLine(const char* text);
 
   // Text of the RUN command that raised MessageBus event value `slot`
@@ -78,6 +88,17 @@ class Protocol {
   // Called from the TS layer (shims.cpp's runCommandText), on the event
   // handler's fiber rather than this object's own.
   const char* runText(int slot) const;
+
+  // Cleartext RUN payloads refused because every slot was still
+  // in flight. Saturates rather than wrapping -- a drop count
+  // that rolls to zero reads as "nothing was lost".
+  uint32_t runDropCount() const;
+
+  // emitLine() calls refused because emitQueue_ was already full,
+  // surfaced for shims.cpp's diagValue(29)/probe(29). Same saturating
+  // convention as runDropCount() above: should stay 0 across a normal
+  // session.
+  uint32_t emitDropCount() const;
 
   // SerialTransport::writeLine()'s drop counter (ticket 006), surfaced
   // for shims.cpp's diagValue(26)/probe(26). Same same-package
@@ -117,6 +138,38 @@ class Protocol {
   static void fiberEntry(void* self);
   void run();
 
+  // ---- the outbound emit path: single producer, one caller each ------
+  // emitLine() (public, above) no longer writes a transport itself -- it
+  // clips and enqueues onto emitQueue_ below and returns. These two
+  // private methods are the split: emitLineNow() is the actual write
+  // (the old emitLine() body, unchanged), and drainEmitQueue() is its
+  // only caller, itself called once per pass of run()'s own loop, on
+  // this object's own fiber. That makes this fiber the only caller that
+  // can ever reach either transport's underlying write for this path,
+  // regardless of which fiber called emitLine().
+  //
+  // Copies `len` bytes from `text` to serial, then (if the radio link
+  // is up) mirrors the same bytes to radio with one retry -- see the
+  // definition (protocol.cpp) for the retry's own reasoning. Only ever
+  // called from drainEmitQueue(), so `text` always points at a local
+  // buffer that outlives any yield this performs.
+  void emitLineNow(const char* text, size_t len);
+
+  // Drains every currently-queued line out of emitQueue_, in FIFO
+  // order, into emitLineNow() -- called once at the top of run()'s loop,
+  // before either transport's own RX poll, so a line any fiber queued
+  // reaches the wire within one poll interval (kPollIntervalMs).
+  void drainEmitQueue();
+
+  // emitQueue_'s slot text bytes: RadioTransport::kMaxPayloadBytes (the
+  // cap emitLine() already clips to) plus one for the NUL this ring
+  // adds itself -- a clipped line always fits. Slot count matches
+  // runQueue_'s own: generous enough for a burst of result lines
+  // between drain passes without becoming a large static allocation.
+  static constexpr size_t kEmitTextBytes = RadioTransport::kMaxPayloadBytes + 1;
+  static constexpr int kEmitSlots = 8;
+  EmitQueue<kEmitSlots, static_cast<int>(kEmitTextBytes)> emitQueue_;
+
   // ---- the old-style cleartext RUN MessageBus bridge, preserved
   // unchanged from before this cutover (see this file's own top-of-file
   // comment for why it survives the v5 retirement) -----------------------
@@ -140,15 +193,30 @@ class Protocol {
   // overwrite the text the queued handler has not read yet. Four slots
   // covers any burst a host can plausibly send inside one handler.
   static constexpr size_t kRunTextBytes = 48;  // name + args + NUL
-  static constexpr int kRunSlots = 4;
-  char runSlots_[kRunSlots][kRunTextBytes] = {};
-  int nextRunSlot_ = 0;      // round-robin write cursor, 0-based
+  static constexpr int kRunSlots = 8;
+  // A real ring with occupancy, not a bare write cursor: a slot stays
+  // in flight from enqueue until runText() reads it back, so a burst
+  // arriving during a long handler can no longer overwrite payload
+  // that handler has not consumed. Overflow is counted and readable
+  // (diagValue ordinal 30) instead of silent. Mutable because reading
+  // a slot IS the release -- the MessageBus consumer never says
+  // "done", so the read is the only honest place to close occupancy,
+  // and runText() is const to its callers.
+  mutable RunQueue<kRunSlots, static_cast<int>(kRunTextBytes)> runQueue_;
 
   // RUN repeat suppression -- see handleRun's own comment. Hosts repeat
   // commands to survive the single-slot inbound buffer, and without
   // this a repeated RUN runs the test once per copy. Compared on the
   // whole payload, so RUN:pivot:180 does not suppress RUN:pivot:-180.
-  static constexpr int32_t kRunDedupeMs = 3000;
+  // Suppress a host's own RETRANSMITS, not deliberate repeats. The
+  // queue below fixes loss; this fixes duplicate EXECUTION, which is a
+  // different failure -- a host repeating a command over a lossy radio
+  // would otherwise run the tour once per copy. 3000 ms was far wider
+  // than any retransmit burst and made sending one command twice in a
+  // row impossible, which is exactly the shape a parameter sweep
+  // sends. 400 ms still swallows a burst and gives deliberate repeats
+  // back.
+  static constexpr int32_t kRunDedupeMs = 400;
   char lastRunText_[kRunTextBytes] = {};
   uint32_t lastRunMs_ = 0;   // [ms] arrival time of the last accepted RUN
 

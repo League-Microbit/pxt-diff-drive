@@ -51,7 +51,32 @@ enum ConfigField {
     //% block="clear stall latch"
     StallClear = 17,
     //% block="pivot overrun mm"
-    PivotOverrun = 18
+    PivotOverrun = 18,
+    //% block="acceleration mm/s2"
+    Accel = 19,
+    //% block="deceleration mm/s2"
+    Decel = 20,
+    //% block="max speed mm/s"
+    VMax = 21,
+    //% block="brake fraction"
+    BrakeFrac = 22,
+    //% block="distance taper counts"
+    DistTaper = 23,
+    //% block="yaw taper counts"
+    YawTaper = 24,
+    //% block="distance floor"
+    DistFloor = 25,
+    //% block="turn floor"
+    TurnFloor = 26,
+    //% block="ramp ms"
+    RampMs = 27,
+    //% block="jerk"
+    Jerk = 28,
+    //% block="plateau min s"
+    PlateauMinS = 29,
+    //% block="max yaw rate"
+    MaxYawRate = 30,
+    ProfileExit = 31
 }
 
 //% color=#0f9c5a icon="" block="DiffDrive"

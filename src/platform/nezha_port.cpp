@@ -2,6 +2,8 @@
 // nezha_motor.cpp; the shaping-stage ORDER is load-bearing.
 #include "nezha_port.h"
 
+#include "vfp_guard.h"
+
 #include <cmath>
 
 namespace diffDrive {
@@ -22,6 +24,30 @@ namespace diffDrive {
 // nothing reboots, and THE BRICK KEEPS ITS LAST MOTOR COMMAND. The
 // wheels run until someone reflashes the board. This function is what
 // makes that impossible.
+//
+// UPDATE 2026-09-01 -- the "memory corruption" above is probably not
+// heap corruption. A second fault with the IDENTICAL CFSR 0x8200 was
+// root-caused on gopiv that day: CODAL's context switch saves no VFP
+// registers, GCC parks pointers in the callee-saved bank s16-s31, and a
+// fiber switch destroys them. A pointer restored from a clobbered FPU
+// register explains a dereference of "PING"-looking bytes with no heap
+// corruption at all. Anyone reading a fault here should suspect that
+// first: decode BFAR as a float and as ASCII before calling it garbage.
+// See the yield-discipline invariant in this package's design notes.
+//
+// UPDATE 2026-09-02 -- RESOLVED. The VFP-register-clobber theory above
+// was confirmed by retest: the radio-during-motion fault this whole
+// comment describes no longer reproduces. MEASURED tigez 2026-09-02
+// (28 radio-hammer trials -- PING hammered continuously over the radio
+// relay while MOVE_X pivots ran over USB, 14 trials on each of two
+// builds -- plus 6 radio-silent negative-control trials, 0 reset
+// signatures across all of them, full per-trial transcripts in
+// captures/tigez-radio-retest-20260902/): the guarded yield fix that
+// closes the register-clobber window (this file's vfp_guard.h) holds
+// even on the build that predates the emit-queue work, i.e. the guard
+// alone is what stops the fault, not anything downstream of it. This
+// function and the handlers below stay regardless -- a fault handler
+// that fails safe is correct even against a fault that no longer fires.
 //
 // A plain reboot is NOT sufficient on its own: the Rig (and with it
 // DifferentialDrive::begin()'s boot zero-write) is created LAZILY on
@@ -198,7 +224,7 @@ void NezhaMotorPort::begin() {
                                                         // don't multiply a
                                                         // wedged-bus delay
                                                         // by trying more
-    fiber_sleep(4);  // [ms] select -> read settle
+    vfpSafeSleep(4);  // [ms] select -> read settle
     int32_t raw = 0;
     if (!readEncoderRaw(&raw)) break;  // same reasoning
     samples[good++] = raw;
