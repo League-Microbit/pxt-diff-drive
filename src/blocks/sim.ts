@@ -548,4 +548,10 @@ namespace diffDrive {
     export function _enableRadioLink(): void {
         simRadioEnabled = true
     }
+
+    //% shim=diffDrive::enableWifiLink
+    export function _enableWifiLink(): void {
+        // No simulator model of the WiFi module: a no-op here, exactly
+        // as the radio link is a flag with no behaviour behind it.
+    }
 }

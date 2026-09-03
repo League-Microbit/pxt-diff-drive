@@ -100,6 +100,32 @@ constexpr const char* kProfile = "unbaked";
 constexpr const char* kVersion = "unbaked";  // injected by make_deploy.py;
                                               // see the note above
 
+// WiFi credentials, injected into the SCRATCH COPY ONLY by
+// tools/make_deploy.py's _inject_wifi_secrets() from the gitignored
+// config/wifi_secrets.json -- the same scratch-copy substitution kProfile
+// and kVersion use. The checked-in literals are EMPTY on purpose: an
+// empty SSID is WifiLink's own "disabled" sentinel, so a build made
+// outside make_deploy.py (or with no secrets file) never opens UARTE1
+// at all. Never put a real SSID or passphrase here.
+//
+// DO NOT reformat these two lines: _inject_wifi_secrets()'s regexes are
+// `(constexpr const char\* kWifiSsid = ")[^"]*(";)` and the same for
+// kWifiPassword, and the deploy raises if either stops matching.
+constexpr const char* kWifiSsid = "";
+constexpr const char* kWifiPassword = "";
+
+// The robot's UDP protocol port and the host's fixed port
+// (radio-robot-lib's wifi-link design note, section 2: the robot's planes
+// share 7654 by design; the host binds 7655 so a host restart needs no
+// re-discovery).
+constexpr uint16_t kWifiPort = 7654;
+constexpr uint16_t kWifiHostPort = 7655;
+
+// How often the `DBG:wifi` line repeats while the link is NOT ready, on
+// top of the one-per-state-change emission -- a bench operator watching
+// USB during a slow join (6-170 s, measured) should see it still alive.
+constexpr uint32_t kWifiDebugPeriodMs = 10000;
+
 // The old-style cleartext RUN carve-out (see protocol.h's own top-of-file
 // comment): detected directly by its literal prefix now that the v5
 // verb registry that used to recognize it is gone.
@@ -167,6 +193,13 @@ void Protocol::emitLine(const char* text) {
 // this split makes this fiber the emit path's single producer.
 void Protocol::emitLineNow(const char* text, size_t len) {
   transport_.writeLine(reinterpret_cast<const uint8_t*>(text), len);
+  // WiFi mirror: a test's own result lines reach a WiFi host too.
+  // sendLine() drops (never blocks) when the link is down or no host
+  // is known, and this fiber is the only WifiLink caller, so no guard
+  // or retry is needed here.
+  if (wifiEnabled_) {
+    (void)wifiLink_.sendLine(reinterpret_cast<const uint8_t*>(text), len);
+  }
   // RadioTransport::sendLine() now guards its shared scratch buffers
   // against the protocol fiber's own RadioSink::write() calls (ticket
   // 002); false means the guard fired and this line was dropped
@@ -235,6 +268,88 @@ void Protocol::setupRadio(uint8_t channel, uint8_t group) {
 }
 
 void Protocol::enableRadio() { radioEnabled_ = true; }
+
+void Protocol::enableWifi() { wifiEnabled_ = true; }
+
+void Protocol::emitWifiDebug() {
+  // One line, cleartext `DBG:` prefix (the same convention the TS
+  // layer's debug output uses), through emitLine() so it reaches
+  // serial, radio AND -- once up -- the WiFi host itself.
+  snprintf(wifiDbgBuf_, sizeof(wifiDbgBuf_),
+           "DBG:wifi state=%d ip=%s peer=%s:%u tcp=%u/%d to=%d restarts=%lu "
+           "sent=%lu rx=%lu drop=%lu mdns=%lu/%d cmd=%s reply=%s",
+           static_cast<int>(wifiLink_.state()),
+           wifiLink_.ownIp()[0] ? wifiLink_.ownIp() : "-",
+           wifiLink_.peerIp()[0] ? wifiLink_.peerIp() : "-",
+           static_cast<unsigned>(wifiLink_.peerPort()),
+           static_cast<unsigned>(wifiLink_.tcpOpenMask()),
+           wifiLink_.tcpServerOpen() ? 1 : 0, wifiLink_.replyLink(),
+           static_cast<unsigned long>(wifiLink_.restartCount()),
+           static_cast<unsigned long>(wifiLink_.sentCount()),
+           static_cast<unsigned long>(wifiLink_.receivedCount()),
+           static_cast<unsigned long>(wifiLink_.dropCount()),
+           static_cast<unsigned long>(wifiLink_.mdnsAnnounceCount()),
+           wifiLink_.mdnsSocketOpen() ? 1 : 0,
+           wifiLink_.lastCommand(), wifiLink_.lastReply());
+  emitLine(wifiDbgBuf_);
+}
+
+void Protocol::serviceWifi() {
+  if (!wifiBegun_) {
+    wifiBegun_ = true;
+    WifiLink::Config config;
+    config.ssid = kWifiSsid;
+    config.password = kWifiPassword;
+    // The mDNS host label is the board's own silicon-derived name --
+    // the same authoritative identity ID's `name` field reports -- so
+    // `tovez.local` / "tovez robot link" can never be a stale bake.
+    config.hostname = microbit_friendly_name();
+    config.port = kWifiPort;
+    config.hostPort = kWifiHostPort;
+    wifiLink_.begin(config);
+    lastWifiDbgMs_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+    emitWifiDebug();
+  }
+
+  wifiLink_.service();
+
+  const uint32_t nowMs = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+  if (wifiLink_.pollStateChanged() ||
+      (!wifiLink_.ready() &&
+       static_cast<int32_t>(nowMs - (lastWifiDbgMs_ + kWifiDebugPeriodMs)) >= 0)) {
+    lastWifiDbgMs_ = nowMs;
+    emitWifiDebug();
+  }
+
+  // A NEW host just spoke to us for the first time: greet it with the
+  // boot banner, exactly what a USB host sees at connect
+  // (the wifi-link note, section 6.1's READY-on-new-peer edge).
+  if (wifiLink_.pollNewPeerEdge()) {
+    wireHandlerWifi_.sendBanner();
+    emitWifiDebug();
+  }
+  // Likewise a TCP client that just connected -- it is the current
+  // reply target from its CONNECT line onward, so the banner reaches
+  // it, exactly what a USB host sees at connect.
+  if (wifiLink_.pollNewClientEdge()) {
+    wireHandlerWifi_.sendBanner();
+    emitWifiDebug();
+  }
+
+  // Inbound: one datagram is one line. Bounded per pass so a host
+  // blasting lines cannot starve the rest of serviceOnce().
+  for (int i = 0; i < WifiLink::kRxSlots; ++i) {
+    size_t len = 0;
+    if (!wifiLink_.tryReceiveLine(wifiRxBuf_, WifiLink::kMaxLineBytes, &len)) break;
+    if (len >= kOldRunPrefixLen &&
+        std::memcmp(wifiRxBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
+      handleRun(wifiRxBuf_ + kOldRunPrefixLen, len - kOldRunPrefixLen);
+    } else {
+      wireHandlerWifi_.feed(reinterpret_cast<const char*>(wifiRxBuf_), len);
+      wireHandlerWifi_.feed("\n", 1);
+    }
+  }
+}
 
 // ---- the old-style cleartext RUN bridge ------------------------------
 
@@ -477,6 +592,11 @@ void Protocol::serviceOnce() {
     }
   }
 
+  // The WiFi transport, gated exactly like the radio: nothing touches
+  // UARTE1 until enableWifi() -- see serviceWifi() for what one pass
+  // does.
+  if (wifiEnabled_) serviceWifi();
+
   // The reliability layer's per-line ack/nack (WireHandler::dispatch(),
   // wire_handler.cpp) is the ENTIRE reliability plane, full stop: it
   // fires once per inbound line, driven from feed()/onLineComplete()
@@ -509,6 +629,16 @@ void Protocol::serviceOnce() {
       // Serial telemetry just above is unconditional.
       if (radioEnabled_) {
         wireHandlerRadio_.emitTelemetry(snapshot);
+      }
+      // WiFi frames are additionally gated by the link's own throttle
+      // (the wifi-link note, section 7.1: >= 50 ms between periodic
+      // pushes AND room in the bounded send queue) -- the measured
+      // heap-exhaustion wedge of the unthrottled reference. Replies and
+      // acks never pass through this gate.
+      if (wifiEnabled_ && wifiLink_.telemetryAllowed()) {
+        wifiLink_.markTelemetry(true);   // tag the frame's lines purgeable
+        wireHandlerWifi_.emitTelemetry(snapshot);
+        wifiLink_.markTelemetry(false);
       }
     }
     lastEmitMs_ = nowMs;
@@ -616,5 +746,10 @@ void setupRadio(int channel, int group) {
 // separate from setupRadio() rather than a defaulted argument.
 //%
 void enableRadioLink() { protocol().enableRadio(); }
+
+// Free-function entry point for `_enableWifiLink` (blocks/sim.ts) --
+// the WiFi twin of enableRadioLink() just above.
+//%
+void enableWifiLink() { protocol().enableWifi(); }
 
 }  // namespace diffDrive

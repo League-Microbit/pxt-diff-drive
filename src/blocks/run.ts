@@ -144,6 +144,25 @@ namespace diffDrive {
     }
 
     /**
+     * Bring the v6 wire up over the Planet X WiFi module (Ai-WB2-12F on
+     * RJ11 jack J1), joining the network whose credentials
+     * tools/make_deploy.py baked into this build. The robot then answers
+     * the same protocol on UDP port 7654 that it answers on USB and
+     * radio, learns the host from the first datagram it receives, and
+     * advertises itself over mDNS as `<name> robot link` on
+     * `_robotlink._udp.local`.
+     *
+     * OFF until you call this, so a program with no module fitted pays
+     * nothing. A build with no credentials baked leaves it off even when
+     * called. For the on-robot test program and advanced JavaScript
+     * users -- not a block.
+     */
+    //% blockHidden=true
+    export function enableWifiLink(): void {
+        _enableWifiLink()
+    }
+
+    /**
      * Send a line of text back to the computer, tagged as debug output.
      * It shows up in the console as `DBG:` followed by your text.
      *

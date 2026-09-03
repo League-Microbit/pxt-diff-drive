@@ -43,6 +43,8 @@
 #include "../platform/platform_ports.h"  // CodalFiberLauncher, CodalClock (reused, not reimplemented)
 #include "radio_transport.h"  // radio transport -- now a full v6 sink too
 #include "serial_transport.h"
+#include "wifi_link.h"        // WiFi transport (host-portable AT state machine)
+#include "wifi_uart.h"        // ...over NRF_UARTE1 (CODAL-free header)
 #include "wire_adapter.h"
 #include "run_queue.h"
 #include "emit_queue.h"
@@ -139,9 +141,27 @@ class Protocol {
   // channel is the point.
   void enableRadio();
 
+  // Bring the v6 WiFi link up (Planet X Ai-WB2-12F on RJ11 J1 -- see
+  // wifi_link.h). OPT-IN exactly like the radio: nothing touches
+  // UARTE1 until a program calls this, and a build with no SSID baked
+  // (tools/make_deploy.py's _inject_wifi_secrets()) stays disabled even
+  // then. The actual begin() happens on this object's own fiber, in
+  // serviceWifi(), because the mDNS hostname is the board's friendly
+  // name, which is only safe to read there (see buildIdentity()).
+  void enableWifi();
+
  private:
   static void fiberEntry(void* self);
   void run();
+
+  // One pass of the WiFi transport's own servicing, called from
+  // serviceOnce() when wifiEnabled_: lazily begin()s the link, pumps
+  // its AT state machine, greets a newly-learned host with the banner,
+  // polls its inbound lines into wireHandlerWifi_ (with the same
+  // cleartext RUN: carve-out serial and radio get), and emits one
+  // `DBG:wifi ...` diagnostic line per state change.
+  void serviceWifi();
+  void emitWifiDebug();
 
   // ---- single executor -- motionOwner_ arbitration -------------------
   // Exactly one execution model remains for engine-facing motion: this
@@ -373,8 +393,27 @@ class Protocol {
     RadioTransport& transport_;
   };
 
+  // The Sink wireHandlerWifi_ writes every v6 reply line through --
+  // mirrors RadioSink, including the trailing-'\n' strip (WifiLink::
+  // sendLine() frames the datagram with its own '\n'). A line dropped
+  // because the link is down, no host is known, or the bounded send
+  // queue is full is dropped silently here, by the same reasoning
+  // RadioSink gives: it self-heals through the host's own retransmit.
+  class WifiSink : public Wire::Sink {
+   public:
+    explicit WifiSink(WifiLink& link) : link_(link) {}
+    void write(const char* data, size_t length) override {
+      const size_t contentLen = length > 0 ? length - 1 : 0;
+      (void)link_.sendLine(reinterpret_cast<const uint8_t*>(data), contentLen);
+    }
+
+   private:
+    WifiLink& link_;
+  };
+
   RadioTransport radioTransport_;
   SerialTransport transport_;
+  WifiUartCodal wifiUart_;
   CodalFiberLauncher launcher_;
   CodalClock clock_;  // PING's t=<ms> equivalent is now wireNowMs(); this
                       // instance now backs only handleRun()'s own dedupe
@@ -397,6 +436,13 @@ class Protocol {
   // wireHandlerRadio_.emitTelemetry() are the three sites.
   bool radioEnabled_ = false;
 
+  // The WiFi link is OPT-IN the same way (enableWifi()); wifiBegun_
+  // records that serviceWifi() has already handed wifiLink_ its config
+  // on this fiber.
+  bool wifiEnabled_ = false;
+  bool wifiBegun_ = false;
+  uint32_t lastWifiDbgMs_ = 0;
+
   // NSDMI, not a hand-written constructor: each member depends only on
   // members declared textually above it (transport_/radioTransport_ for
   // the sinks; wireNowMs() for wireAdapter_; wireAdapter_ + the sinks
@@ -414,6 +460,20 @@ class Protocol {
   WireAdapter wireAdapter_{Wire::Identity(), &Protocol::wireNowMs};
   Wire::WireHandler wireHandler_{wireAdapter_, serialSink_};
   Wire::WireHandler wireHandlerRadio_{wireAdapter_, radioSink_};
+
+  // The WiFi transport and ITS OWN WireHandler over the same shared
+  // wireAdapter_ -- a third handler, not a third adapter, for the same
+  // reason the radio got a second one (see this file's top comment):
+  // each transport keeps its own expectedNext_, so a sequence gap on
+  // WiFi can never nack serial's or radio's next command.
+  WifiLink wifiLink_{wifiUart_, &Protocol::wireNowMs};
+  WifiSink wifiSink_{wifiLink_};
+  Wire::WireHandler wireHandlerWifi_{wireAdapter_, wifiSink_};
+  uint8_t wifiRxBuf_[WifiLink::kMaxLineBytes + 1];
+  // Sized for the worst-case `DBG:wifi ...` line: fixed text plus two
+  // 15-char addresses, six counters, a 47-char command and a 71-char
+  // reply trace (emitLine() clips to the wire cap anyway).
+  char wifiDbgBuf_[320];
 
   // Radio RX scratch -- every line the radio's own poll receives lands
   // here first, whether it turns out to be the old-style cleartext RUN
