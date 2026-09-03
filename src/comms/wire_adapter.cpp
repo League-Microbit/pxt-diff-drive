@@ -116,6 +116,12 @@ struct FieldEntry {
   int ordinal;        // shims.cpp's setKernelValue()/getConfigValue() field
 };
 
+// Named so the busy-refusal check in onSet() and the GET refusal in
+// onGet() (both below) don't repeat the bare integers the kFields[]
+// rows below also carry.
+constexpr int kOrdinalRebase = 32;
+constexpr int kOrdinalEstopClear = 33;
+
 constexpr FieldEntry kFields[] = {
     {"max_duty", 0},           // ConfigField.MaxDuty
     {"full_duty_velocity", 1}, // ConfigField.FullDutyVelocity
@@ -196,6 +202,33 @@ constexpr FieldEntry kFields[] = {
     {"profile_exit", 31},  // ConfigField.ProfileExit
                                // forward to MotionEngine::
                                // setRampMs()/rampMs().
+    {"rebase", kOrdinalRebase},        // zero the odometry frame -- a
+                               // write-triggered action wearing a
+                               // config-field's clothes, the same shape
+                               // the stall latch's own clear field
+                               // above already established. Backed by
+                               // shims.cpp's setKernelValue() calling
+                               // kernel.rebasePosition() plus the
+                               // encoder-frame zero and OTOS reseed
+                               // that keep both pose sources agreed at
+                               // the new zero -- see that file's own
+                               // case for the full sequence. Refused
+                               // (kBusy) while a motion is live (see
+                               // onSet() below) and refused on GET (see
+                               // onGet() below) -- deliberately absent
+                               // from the trailing ConfigField.<Name>
+                               // comment convention every other row
+                               // above carries: this field is wire-only,
+                               // not exposed through the block layer's
+                               // generic config dropdown.
+    {"estop_clear", kOrdinalEstopClear}, // sequenced e-stop clear,
+                               // same write-triggered shape as rebase
+                               // immediately above -- backed by
+                               // kernel.estopClear(). GET reads back the
+                               // live estop flag, a convenience readback
+                               // exactly like the stall latch's own
+                               // clear field's GET. Also wire-only, same
+                               // reason as rebase above.
 };
 constexpr size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
 
@@ -336,6 +369,8 @@ void WireAdapter::setIdentity(const Wire::Identity& identity) {
   identity_ = identity;
 }
 
+void WireAdapter::setJobOwnsMotion(bool owns) { jobOwnsMotion_ = owns; }
+
 uint32_t WireAdapter::now() const {
   // See this file's own header comment: nowMs_ is supplied at
   // composition time by a CODAL-facing caller (protocol.cpp); every
@@ -393,6 +428,11 @@ void WireAdapter::status(Wire::StatusFields& out) const {
 
 Wire::Result WireAdapter::onWheelsV(float left, float right,
                                     uint32_t duration, uint32_t id) {
+  // A dispatched RUN job owns the drivetrain -- refuse outright (kBusy)
+  // rather than silently overwrite or race its move. Checked first,
+  // before any other validation, on all six motion verbs identically --
+  // see setJobOwnsMotion()'s own doc comment (wire_adapter.h).
+  if (jobOwnsMotion_) return Wire::Result::kBusy;
   if (duration > kWheelsVDurationCeiling) return Wire::Result::kRange;
   // WIRE-08 (code review 2026-08-23): refuse BEFORE the cast below runs
   // at all -- see kWireBoundaryCastCeiling's own doc comment
@@ -433,6 +473,8 @@ Wire::Result WireAdapter::onWheelsV(float left, float right,
 
 Wire::Result WireAdapter::onWheelsX(float left, float right, float cruise,
                                     uint32_t timeout, uint32_t id) {
+  // See onWheelsV()'s identical check above.
+  if (jobOwnsMotion_) return Wire::Result::kBusy;
   // A speed ceiling has no sign -- refuse outright rather than take its
   // magnitude, or fall into wheelsX()'s own non-positive-cruise no-op
   // (motion_engine.h), which would silently accept this as "nothing to
@@ -465,6 +507,8 @@ Wire::Result WireAdapter::onWheelsX(float left, float right, float cruise,
 Wire::Result WireAdapter::onMoveX(float distance, float rotation,
                                   float cruise, uint32_t timeout,
                                   uint32_t id) {
+  // See onWheelsV()'s identical check above.
+  if (jobOwnsMotion_) return Wire::Result::kBusy;
   // Same cruise <0 handling as onWheelsX() above; the ==0 substitution
   // itself now goes through resolveDefaultCruiseMmS() (SUC-003) instead
   // of the flat engineDefaultCruiseMmS() directly. D is
@@ -505,6 +549,8 @@ Wire::Result WireAdapter::onMoveX(float distance, float rotation,
 
 Wire::Result WireAdapter::onMoveV(float v_x, float omega, uint32_t duration,
                                   uint32_t id) {
+  // See onWheelsV()'s identical check above.
+  if (jobOwnsMotion_) return Wire::Result::kBusy;
   // Shares WHEELS_V's own ceiling and "duration is the lease" rationale
   // -- see kWheelsVDurationCeiling's own doc comment (wire_adapter.h).
   if (duration > kWheelsVDurationCeiling) return Wire::Result::kRange;
@@ -528,6 +574,8 @@ Wire::Result WireAdapter::onMoveV(float v_x, float omega, uint32_t duration,
 
 Wire::Result WireAdapter::onGoToR(float x, float y, float speed, float arrive,
                                   uint32_t timeout, uint32_t id) {
+  // See onWheelsV()'s identical check above.
+  if (jobOwnsMotion_) return Wire::Result::kBusy;
   // `speed`'s <0 handling mirrors onWheelsX()/onMoveX() above -- see
   // this method's own doc comment (wire_adapter.h) for why (`speed`
   // plays `cruise`'s role for the underlying moveX() call). The ==0
@@ -557,6 +605,8 @@ Wire::Result WireAdapter::onGoToR(float x, float y, float speed, float arrive,
 
 Wire::Result WireAdapter::onGoToW(float x, float y, float speed, float arrive,
                                   uint32_t timeout, uint32_t id) {
+  // See onWheelsV()'s identical check above.
+  if (jobOwnsMotion_) return Wire::Result::kBusy;
   // Same speed <0 handling as onGoToR() above, and the same
   // resolveDefaultCruiseMmS() substitution on ==0 (SUC-003) -- but
   // UNLIKE onGoToR()'s (x, y) (already body-frame, i.e. already the
@@ -794,6 +844,14 @@ Wire::DoneReason WireAdapter::lastDoneReason() const {
 bool WireAdapter::onGet(const char* name, float& out) const {
   const FieldEntry* entry = findField(name);
   if (entry == nullptr) return false;
+  // rebase has no stored value and no boolean latch worth reading back
+  // (unlike estop_clear immediately below, whose GET mirrors the live
+  // estop flag the same convenience-readback way the stall latch's own
+  // clear field already does) -- refuse outright (the same `false`
+  // this method already returns for an unrecognized name entirely, wire
+  // err 1) rather than manufacture a reading that would always answer 0
+  // with no information in it.
+  if (entry->ordinal == kOrdinalRebase) return false;
   // config values cross the shim boundary as x1000-scaled ints
   // (shims.cpp convention).
   out = static_cast<float>(getConfigValue(entry->ordinal)) * 0.001f;
@@ -804,6 +862,27 @@ Wire::Result WireAdapter::onSet(const char* name, float value, uint32_t id) {
   (void)id;
   const FieldEntry* entry = findField(name);
   if (entry == nullptr) return Wire::Result::kUnknown;
+  // rebase/estop_clear both touch state an already-in-flight motion is
+  // relying on: rebase changes what the position-error math a live move
+  // is measuring against is even zeroed to, and estop_clear can drop
+  // the exact latch a live move depends on staying set. Refuse outright
+  // (kBusy) rather than let either land mid-move -- the same
+  // commandable-state concern the six motion verbs' own supersede
+  // handling protects, applied here for the first time to a SET field.
+  // hasLiveMotionObligation() is this class's own wire-motion-lease
+  // bookkeeping (armed by the six motion verbs); engineMoveActive()
+  // reads the SAME MotionEngine singleton a job-issued move (the block
+  // layer's own move()/goTo() family, reached through the legacy RUN
+  // bridge rather than this class) also drives, so a job-issued
+  // reduction move is caught despite this class having no direct
+  // visibility into RUN dispatch. Not caught by either: a job driving
+  // wheel speed directly, bypassing the move engine's own active-move
+  // state entirely -- closing that needs this class to know which
+  // fiber currently owns motion, a larger change than this one.
+  if ((entry->ordinal == kOrdinalRebase || entry->ordinal == kOrdinalEstopClear) &&
+      (hasLiveMotionObligation() || engineMoveActive())) {
+    return Wire::Result::kBusy;
+  }
   // WIRE-08 (code review 2026-08-23): `value` arrives with no ceiling
   // of its own (parseFloatField, wire_handler.cpp, accepts any finite
   // float) -- setKernelValue()'s own x1000 scaling convention can turn

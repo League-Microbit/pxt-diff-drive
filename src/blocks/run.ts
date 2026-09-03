@@ -27,22 +27,24 @@ namespace diffDrive {
 
     // ================= remote test trigger (RUN verb) =================
 
-    // MessageBus source id for the wire protocol's RUN verb -- must
-    // match kRunEventSource in protocol.cpp. An event value cannot
-    // carry text, so the C++ handler parks the command's payload in a
-    // slot and sends the SLOT as the event value; the dispatcher below
-    // reads the text back through runCommandText() and routes it by
-    // NAME. The wire therefore reads as what it does -- RUN:pivot:180,
-    // not RUN:4 -- and arguments ride along as text instead of being
-    // encoded into numeric offsets.
-    const RUN_EVENT_SOURCE = 0x2001
-
-
+    // The dispatcher below is invoked DIRECTLY by the firmware's own
+    // protocol fiber (via _registerRunDispatch(), sim.ts) once per
+    // dequeued RUN command -- not raised as a MessageBus event for a
+    // second, forked fiber to pick up. That is what makes an abort sent
+    // while a job is mid-tour land immediately rather than waiting
+    // behind it: the fiber that would otherwise be forked to run this
+    // callback IS the same fiber servicing the wire, so there is no
+    // second fiber to wait for. runCommandText() (no argument -- the
+    // firmware tracks "whichever command is current" itself, unlike the
+    // old event-value-as-slot-number scheme) reads the text back; the
+    // by-name lookup and dispatch logic below is unchanged. The wire
+    // therefore still reads as what it does -- RUN:pivot:180, not a
+    // magic number -- and arguments still ride along as text.
     function wireRunDispatch(): void {
         if (runWired) return
         runWired = true
-        control.onEvent(RUN_EVENT_SOURCE, 0, function () {
-            const text = runCommandText(control.eventValue())
+        _registerRunDispatch(function () {
+            const text = runCommandText()
             if (text.length == 0) return
             ensureRunState()
             runParts = text.split(":")

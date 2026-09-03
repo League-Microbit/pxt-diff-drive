@@ -494,12 +494,26 @@ namespace diffDrive {
         serial.writeLine(text)
     }
 
-    // Text of the RUN command a run event refers to (the event value is
-    // the slot protocol.cpp parked it in). The simulator has no wire, so
-    // no run event ever fires there and this body is never reached.
+    // Text of whichever RUN command is currently being dispatched. The
+    // simulator has no wire, so nothing ever calls the dispatch callback
+    // registered below and this body is never reached.
     //% shim=diffDrive::runCommandText
-    export function runCommandText(slot: number): string {
+    export function runCommandText(): string {
         return ""
+    }
+
+    // Registers the callback protocol.cpp's dispatchJob() invokes
+    // directly once per dequeued RUN command (replacing the old
+    // control.onEvent()-based MessageBus registration). The simulator
+    // has no wire and never dequeues a RUN command, so this has nothing
+    // to model -- a real (if trivial) body, not a bare `{}`, for the
+    // same reason every other shim-only stub in this file has one: an
+    // empty body is emitted by pxt as native-only, and no pxsim
+    // implementation exists, which crashes the simulator at the call
+    // site.
+    //% shim=diffDrive::registerRunDispatch
+    export function _registerRunDispatch(cb: () => void): void {
+        return
     }
 
     //% shim=diffDrive::seedPose

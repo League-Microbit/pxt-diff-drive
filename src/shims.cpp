@@ -107,6 +107,10 @@ struct Rig {
   float x = 0.0f, y = 0.0f, heading = 0.0f;
   float odomPosLeft = 0.0f, odomPosRight = 0.0f;  // [counts]
   bool odomPrimed = false;
+  // Last-seen Output.positionEpochLeft/Right -- lets odomUpdate() (below)
+  // tell a rebase's intentional position discontinuity apart from
+  // ordinary wheel motion; see that function's own comment.
+  uint32_t odomPositionEpochLeft = 0, odomPositionEpochRight = 0;
 
   // GO_TO_W's encoder-odometry fallback PoseSource (sprint 006 ticket
   // 007, encoder_pose_source.h): binds to x/y/heading ABOVE by const
@@ -139,6 +143,19 @@ struct Rig {
                                   // Distinct from the kernel's own
                                   // cycleOverrunCount_, which only its
                                   // unused run() ever increments.
+
+  // Plain, no-capture function pointer the protocol fiber registers
+  // (registerTickServiceHook(), below) once it starts. tickDrive() calls
+  // it, if set, once per call -- see that function's own comment for the
+  // exact point (after this tick's own kernel.step()/settle work is
+  // done, before the pacing sleep) and why: this is what lets a
+  // dispatched RUN job's own `while (driveTick())` tick loop carry the
+  // protocol fiber's other duties (wire/radio poll, telemetry, dispatch)
+  // along with it, one tick at a time, instead of needing a second fiber
+  // to service them concurrently. A plain function pointer, not
+  // std::function, for the same reason NezhaMotorPort/OtosPort avoid
+  // anything heap-allocating in this file's own composition.
+  void (*serviceHook)() = nullptr;
 
   // The wire's OWN "0 = use the configured default" convenience field,
   // deliberately SEPARATE from kernel.config().fullDutyVelocity. Those
@@ -247,9 +264,23 @@ static Rig& ensure() {
 
 static void odomUpdate(Rig& r) {
   const DiffDrive::DifferentialDrive::Output out = r.kernel.output();
-  if (!r.odomPrimed) {
+  // A rebase request (setKernelValue() case 32 below) re-anchors
+  // positionLeft/positionRight to a new software zero at the kernel's
+  // own NEXT step() -- an intentional discontinuity, not drift.
+  // positionEpochLeft/Right (diffdrive.h) change only alongside that
+  // re-anchor, so a change on either wheel since the last call means
+  // this sample cannot be diffed against the last one -- the same
+  // handling the very first call (`!r.odomPrimed`) already gets, for
+  // the same reason (there is no prior sample this one can be a
+  // continuation of).
+  const bool rebased = r.odomPrimed &&
+      (out.positionEpochLeft != r.odomPositionEpochLeft ||
+       out.positionEpochRight != r.odomPositionEpochRight);
+  if (!r.odomPrimed || rebased) {
     r.odomPosLeft = out.positionLeft;
     r.odomPosRight = out.positionRight;
+    r.odomPositionEpochLeft = out.positionEpochLeft;
+    r.odomPositionEpochRight = out.positionEpochRight;
     r.odomPrimed = true;
     return;
   }
@@ -258,6 +289,8 @@ static void odomUpdate(Rig& r) {
   const float dRight = (out.positionRight - r.odomPosRight) / cpm; // [mm]
   r.odomPosLeft = out.positionLeft;
   r.odomPosRight = out.positionRight;
+  r.odomPositionEpochLeft = out.positionEpochLeft;
+  r.odomPositionEpochRight = out.positionEpochRight;
   const float dCenter = 0.5f * (dLeft + dRight);          // [mm]
   const float dHeading =
       (dRight - dLeft) / r.engine.effectiveTrackWidth();  // [rad]
@@ -669,6 +702,18 @@ bool tickDrive() {
   }
   r.stepBusy = false;
 
+  // Service hook: fires exactly here on EVERY call -- after this tick's
+  // own kernel.step()/settle work is done (stepBusy just cleared above)
+  // and before the pacing sleep below -- and NEVER inside the stepBusy
+  // window: step() already yields twice in there for its own encoder
+  // select-to-read settle, and landing arbitrary wire/radio/dispatch
+  // work in that window would break bus discipline. Null whenever
+  // nothing has registered one (a host test, or before the protocol
+  // fiber starts); see Rig::serviceHook's own comment for what the
+  // registered callback actually does and why it is itself a no-op for
+  // most callers of this function.
+  if (r.serviceHook) r.serviceHook();
+
   // Absolute-deadline self-pacing, lifted from DifferentialDrive::run()
   // (diffdrive.cpp:290-306): read the cadence from the kernel's own
   // config (still 24 ms per sprint.md's Design Rationale) rather than
@@ -864,8 +909,8 @@ bool isStalled() { return ensure().kernel.output().stallHalted; }
 // declaration rather than by including protocol.h: that header pulls
 // in radio_transport.h, and PXT's per-file dependency scan then decides
 // this file needs the `radio` package and fails the build -- same
-// convention protocolEmitLine/protocolRunText already use further down
-// this file.
+// convention protocolEmitLine/protocolCurrentRunText already use further
+// down this file.
 int protocolSerialDropCount();
 int protocolRunDropCount();
 int protocolEmitDropCount();
@@ -983,6 +1028,13 @@ void setGeometry(int trackWidth, int calib) {  // [0.1 mm] [1e-4 mm/deg]
   if (calib > 0) r.engine.setTravelCalib(static_cast<float>(calib) * 1e-4f);
 }
 
+// Defined further down (the OTOS section) -- forward-declared here so
+// case 32 below can re-seed it. Same same-translation-unit
+// forward-declaration convention seedPose() and protocolCurrentRunText()
+// each already use in this file, just internal to this one file instead
+// of crossing to protocol.cpp.
+static OtosPort& otosRef();
+
 //%
 void setKernelValue(int field, int value) {  // [x1000 scaled]
   Rig& r = ensure();
@@ -1055,6 +1107,37 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
     case 29: r.engine.setPlateauMinS(v); break;
     case 30: r.engine.setMaxYawRateDegS(v); break;
     case 31: r.engine.setProfileExitMmS(v); break;
+    // 32: rebase -- zero the odometry frame, a write-triggered action
+    // wearing a config-field's clothes (same shape as stall_clear's
+    // case 17 above). Writes BOTH pose sources, mirroring seedPose()'s
+    // own "write both" contract below: the encoder-integrated x/y/
+    // heading this file tracks AND the OTOS position register, so the
+    // two stay agreed at the new zero instead of OTOS silently keeping
+    // its old absolute reading. kernel.rebasePosition() itself is a
+    // DEFERRED request (diffdrive.h) -- it re-anchors the kernel's own
+    // position tracking only at its NEXT step(), not synchronously
+    // here; odomUpdate()'s own positionEpochLeft/Right check above is
+    // what keeps that later, legitimate discontinuity from being
+    // mis-read as a spurious jump the next time pose is read.
+    case 32:
+      if (v != 0.0f) {
+        odomUpdate(r);        // consume pending deltas before the zero
+        k.rebasePosition();
+        r.x = 0.0f;
+        r.y = 0.0f;
+        r.heading = 0.0f;
+        otosRef().setPose(0.0f, 0.0f, 0.0f);
+      }
+      break;
+    // 33: estop_clear -- a write-triggered ACTION wearing a
+    // config-field's clothes, identical shape to stall_clear's case 17
+    // above, just calling kernel.estopClear() instead of
+    // clearStallLatch(). Deliberately calls the kernel method directly
+    // rather than routing through this file's own standalone
+    // estopClear() wrapper above -- same "call the kernel method
+    // inline" convention case 17 already uses for clearStallLatch()
+    // instead of going through clearStall().
+    case 33: if (v != 0.0f) k.estopClear(); break;
     default: break;
   }
 }
@@ -1119,6 +1202,13 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
     case 29: v = r.engine.plateauMinS(); break;
     case 30: v = r.engine.maxYawRateDegS(); break;
     case 31: v = r.engine.profileExitMmS(); break;
+    // 33: estop_clear's GET side -- a convenience readback of
+    // Output.estopped, same "not a stored Config field" shape as the
+    // stall latch's own clear field's GET (case 17 above). 32 (rebase)
+    // has no case here on purpose: wire_adapter.cpp's onGet() refuses
+    // it before this function is ever reached, since a rebase has
+    // nothing meaningful to read back.
+    case 33: v = r.kernel.output().estopped ? 1.0f : 0.0f; break;
     default: return 0;
   }
   return static_cast<int>(std::lround(v * 1000.0));
@@ -1365,19 +1455,54 @@ void emitLine(String text) {
   protocolEmitLine(ms.toCharArray());
 }
 
-// Read back the text of the RUN command a run event refers to (`slot`
-// is the event value; protocol.cpp parks the payload and sends only the
-// slot, because an event value is a uint16 and cannot carry a name).
+// Read back the text of whichever RUN command is CURRENTLY being
+// dispatched -- valid only during the registered dispatch callback's own
+// call, on this same fiber (registerRunDispatch()/runDispatch(), below).
 // Same forward-declaration convention as protocolEmitLine above.
-const char* protocolRunText(int slot);
+const char* protocolCurrentRunText();
 
 //%
-String runCommandText(int slot) {
-  const char* text = protocolRunText(slot);
+String runCommandText() {
+  const char* text = protocolCurrentRunText();
   size_t len = 0;
   while (text[len] != '\0') ++len;
   return mkString(text, static_cast<int>(len));
 }
+
+// ---- RUN dispatch: the single TS callback protocol.cpp invokes -------
+// run.ts's wireRunDispatch() registers ONE Action here, the first time
+// any onRun()/onRunCommand() handler is bound -- the by-name lookup and
+// dispatch logic inside that callback (matching the dequeued command's
+// name against every registered handler) is unchanged from before;
+// only what TRIGGERS the callback changes, from a MessageBus event
+// fired at a second, forked fiber to a direct call from
+// protocol.cpp's own dispatchJob()/handleRun() bypass, on the protocol
+// fiber itself.
+static Action gRunDispatchAction = nullptr;
+
+//%
+void registerRunDispatch(Action cb) {
+  if (gRunDispatchAction) decr(gRunDispatchAction);
+  gRunDispatchAction = cb;
+  incr(gRunDispatchAction);
+}
+
+// Invokes the registered callback, if one exists, on the CALLER's own
+// fiber -- protocol.cpp reaches this via the same same-package
+// forward-declaration convention as tickDrive(). Returns false with
+// nothing registered yet (no onRun()/onRunCommand() call has ever run),
+// a silent no-op, matching the old event path's own behavior when
+// nothing had subscribed.
+bool runDispatch() {
+  if (!gRunDispatchAction) return false;
+  runAction0(gRunDispatchAction);
+  return true;
+}
+
+// Registers tickDrive()'s own service hook (see Rig::serviceHook's and
+// tickDrive()'s own comments above) -- a plain C++-to-C++ seam, never
+// called from TS, so deliberately NOT `//%`-annotated.
+void registerTickServiceHook(void (*hook)()) { ensure().serviceHook = hook; }
 
 //%
 void otosSetOffset(int x, int y, int yaw) {  // [0.1 mm] [0.1 mm] [cdeg]

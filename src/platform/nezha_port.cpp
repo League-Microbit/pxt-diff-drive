@@ -372,15 +372,19 @@ void NezhaMotorPort::collect(uint64_t nowUs) {
   int32_t raw = 0;
   if (readEncoderRaw(&raw)) {
     // Glitch/discontinuity plausibility decision, extracted to
-    // encoder_glitch_armor.h (sprint 006 ticket 005 -- see that header
-    // for the kMaxDeltaCounts derivation and code review R-07/KERN-07).
-    // Ported from the reference driver (see radio-robot
-    // docs/design/encoder-refresh-characterization.md Phase F: a sample
-    // destroyed by interposed bus traffic reads as raw 0; other
-    // corruption shows as a physically impossible jump). Bench capture
-    // 2026-08-20: one such read produced a phantom -22 m odometry
-    // teleport and a 3.5 M counts/s velocity spike that instantly
-    // mis-terminated the tour's last leg.
+    // encoder_glitch_armor.h -- see that header for the
+    // kMaxDeltaCounts derivation. Ported from the reference driver
+    // (see radio-robot docs/design/encoder-refresh-characterization.md
+    // Phase F: a sample destroyed by interposed bus traffic reads as
+    // raw 0; other corruption shows as a physically impossible jump).
+    // Bench capture 2026-08-20: one such read produced a phantom -22 m
+    // odometry teleport and a 3.5 M counts/s velocity spike that
+    // instantly mis-terminated the tour's last leg.
+    //
+    // Captured BEFORE evaluate() mutates it -- the raw value this
+    // armor last accepted as truth, i.e. what THIS tick's raw is about
+    // to be compared against below.
+    const int32_t previousGoodRaw = glitchArmor_.lastGoodRaw();
     const EncoderGlitchArmor::Decision decision = glitchArmor_.evaluate(raw);
     if (decision == EncoderGlitchArmor::Decision::kRejectPending) {
       // First implausible reading: held, awaiting a second consistent
@@ -389,25 +393,84 @@ void NezhaMotorPort::collect(uint64_t nowUs) {
       return;  // discarded: position/velocity/sampleTime all HOLD
     }
     if (decision == EncoderGlitchArmor::Decision::kAcceptAsRebaseline) {
-      // Second consecutive self-consistent implausible reading: R-07's
-      // fix. The pre-extraction code accepted this as a real ~4 m jump
-      // (the "hand-rotation re-sync" path); this is now a THIRD outcome
-      // instead -- treat it as the counter having restarted (e.g. a
-      // brick MCU reset), not the wheel having moved. Re-anchor
-      // encOffset_ so THIS raw value maps to the position already held
-      // (continuity) rather than to zero -- the same offset technique
-      // rebaseline() below uses, generalized from "map to 0" to "map to
-      // the current position." Falls through to the shared accept-path
-      // computation below, using the freshly re-anchored offset; since
-      // pos comes out equal to lastPosition_ by construction, velocity_
-      // for this tick correctly reads ~0 rather than the multi-m/s
-      // spike the old behavior produced.
+      // Second consecutive self-consistent implausible reading: treat
+      // it as the counter having restarted (e.g. a brick MCU reset),
+      // not the wheel having moved. Re-anchor encOffset_ so THIS raw
+      // value maps to the position already held (continuity) rather
+      // than to zero -- the same offset technique rebaseline() below
+      // uses, generalized from "map to 0" to "map to the current
+      // position."
+      //
+      // Hold sampleTimeUs_ here instead of falling through to the
+      // shared accept-path advance. MEASURED gopiv 2026-09-02,
+      // captures/gopiv-frozen-encoder-fix-20260902/notes.md: hardware
+      // acceptance of this ticket's OTHER guard below (raw ==
+      // previousGoodRaw) still reproduced the exact symptom it exists
+      // to eliminate -- i2cf incrementing together with a wire-
+      // reported velocity of exactly 0 and commanded duty stepping
+      // toward the rail -- five times in six tours on gopiv, every one
+      // traced to THIS branch, not the raw-unchanged one. The
+      // pre-existing reasoning here ("pos comes out equal to
+      // lastPosition_ by construction, so velocity_ correctly reads
+      // ~0") is the same "honestly-derived-but-wrong zero" shape this
+      // ticket's Description names for the raw-unchanged case: a
+      // confidently-fresh, honestly-computed zero sample is exactly
+      // what DifferentialDrive::refreshSample() (the vendored kernel)
+      // feeds straight to the velocity PID, and the PID cannot tell
+      // "this sample says 0 because the wheel stopped" apart from
+      // "this sample says 0 because we just discarded an untrustworthy
+      // raw delta." This tick's true velocity is unknown -- the armor
+      // rejected the raw delta as implausible precisely because it
+      // cannot be trusted as motion -- so withhold sampleTimeUs_
+      // exactly as the raw-unchanged guard below and the outright
+      // read-failure branch already do, holding the prior known-good
+      // velocity instead of manufacturing a zero. The position
+      // re-anchor above (encOffset_) is unchanged and still prevents
+      // the multi-m/s reintegration spike a genuine counter restart
+      // would otherwise cause on the FOLLOWING tick; only the "also
+      // mint a fresh zero-velocity sample this same tick" side effect
+      // is removed. i2cFaultCount_ (core/diffdrive.cpp) still
+      // increments for this tick via the same sampleTime-unchanged
+      // condition, so the event stays visible in telemetry.
       encOffset_ = raw - static_cast<int32_t>(lastPosition_) * fwdSign_;
       ++rebaselineCount_;
+      connected_ = true;
+      lastPosition_ = static_cast<float>(raw - encOffset_) *
+                       static_cast<float>(fwdSign_);  // == prior lastPosition_
+      hasLastTick_ = true;
+      return;  // sampleTimeUs_ HOLDS -- velocity_ holds its prior value
     }
     connected_ = true;
     const float pos =
         static_cast<float>(raw - encOffset_) * static_cast<float>(fwdSign_);
+
+    // A *successful* read whose raw counts are byte-identical to the
+    // previous accepted sample while the wheel is under active drive
+    // (appliedDuty() nonzero) is stale-but-acked data, not a real
+    // stop -- one documented cause is an instant H-bridge sign flip
+    // latching the 0x46 readback (the "encoder wedge" this class'
+    // wedge detector below also watches for, at a slower multi-tick
+    // threshold). MEASURED gopiv 2026-09-01,
+    // captures/gopiv-profile-sweep-20260901/tour_tight.json frames
+    // 185-191: posr frozen for one tick while driven, i2cf unmoved,
+    // vr reported 0, duty stepped 3300->4500, wheel overshot to
+    // 420 mm/s. Withhold the fresh sampleTimeUs_ stamp exactly as the
+    // read-failure branch below already does, so
+    // DifferentialDrive::refreshSample()'s existing
+    // sampleTime-unchanged gate holds the previously-derived velocity
+    // instead of computing an honestly-derived-but-wrong zero from
+    // stale data -- and, as a side effect, i2cFaultCount_
+    // (core/diffdrive.cpp) now counts this tick too, since it
+    // increments on that same sampleTime-unchanged condition. Gated on
+    // the RAW value (not the offset-adjusted pos) and hasLastTick_ so
+    // it can never fire on the very first sample this port ever takes.
+    if (decision == EncoderGlitchArmor::Decision::kAccept && hasLastTick_ &&
+        raw == previousGoodRaw &&
+        std::fabs(appliedDuty()) > kMotionThreshold) {
+      lastPosition_ = pos;  // already equal to lastPosition_ by construction
+      return;  // sampleTimeUs_ HOLDS -- velocity_ holds its prior value
+    }
+
     if (hasLastTick_) {
       const float dt =
           static_cast<float>(nowUs - sampleTimeUs_) / 1e6f;  // [s]

@@ -5,11 +5,11 @@
 // that lives behind wireHandler_/wireHandlerRadio_/wireAdapter_.
 //
 // One exception, preserved deliberately: the OLD cleartext
-// "RUN:<name>[:<arg>...]" MessageBus bridge (handleRun()/runText()/the
+// "RUN:<name>[:<arg>...]" bridge (handleRun()/dispatchJob()/the
 // runQueue_ ring below) coexists with v6 on the same wire -- detected
 // directly by its literal "RUN:" prefix before a line ever reaches the
 // v6 stack (no verb registry involved -- see run()'s own comment). It
-// is the ONLY path that feeds the MessageBus test-trigger bridge
+// is the ONLY path that feeds the by-name test-trigger dispatch
 // test.ts actually uses: v6's own RUN verb (wire_adapter.cpp's
 // WireAdapter::onRun()) is kUnknown.
 //
@@ -82,12 +82,17 @@ class Protocol {
   // emitLineNow()'s own comment for where the actual writes happen).
   void emitLine(const char* text);
 
-  // Text of the RUN command that raised MessageBus event value `slot`
-  // (1..kRunSlots) -- the whole payload after `RUN:`, e.g.
-  // "pivot:180". Returns "" for an out-of-range or never-written slot.
-  // Called from the TS layer (shims.cpp's runCommandText), on the event
-  // handler's fiber rather than this object's own.
-  const char* runText(int slot) const;
+  // The text of whichever RUN command is CURRENTLY being dispatched --
+  // the whole payload after `RUN:`, e.g. "pivot:180". Valid only while
+  // dispatchJob()'s (or the abort/clearestop bypass's) own call into the
+  // registered RUN dispatch callback is executing, on THIS fiber -- see
+  // invokeRunDispatch()'s own comment for why a nested reentrant
+  // dispatch (abort arriving mid-job) can never corrupt an outer job's
+  // already-consumed text. Called from the TS layer (shims.cpp's
+  // now-zero-argument runCommandText() -- the old
+  // MessageBus-event-carries-a-slot-number indirection this used to
+  // read through is gone).
+  const char* currentRunText() const;
 
   // Cleartext RUN payloads refused because every slot was still
   // in flight. Saturates rather than wrapping -- a drop count
@@ -102,7 +107,7 @@ class Protocol {
 
   // SerialTransport::writeLine()'s drop counter (ticket 006), surfaced
   // for shims.cpp's diagValue(26)/probe(26). Same same-package
-  // forward-declaration boundary as emitLine()/runText() above:
+  // forward-declaration boundary as emitLine()/currentRunText() above:
   // shims.cpp reaches this via a free-function wrapper
   // (protocolSerialDropCount(), protocol.cpp) rather than including
   // this header directly, so it never pulls in radio_transport.h (see
@@ -138,6 +143,92 @@ class Protocol {
   static void fiberEntry(void* self);
   void run();
 
+  // ---- single executor -- motionOwner_ arbitration -------------------
+  // Exactly one execution model remains for engine-facing motion: this
+  // fiber. motionOwner_ arbitrates which caller currently holds the
+  // drivetrain -- kNone (idle), kWire (a live wire motion obligation,
+  // set/cleared by run()'s own loop around its tickDrive() call), or
+  // kJob (a dispatched RUN job, set/cleared by dispatchJob() around its
+  // call into the TS handler). Lives HERE, not on WireAdapter or the RUN
+  // queue, because this class is the only one that can see both a wire
+  // request and a dispatched job.
+  enum class MotionOwner : uint8_t { kNone, kWire, kJob };
+  MotionOwner motionOwner_ = MotionOwner::kNone;
+
+  // Dequeues and dispatches ONE queued RUN job, if one is waiting and
+  // motionOwner_ is kNone (nothing else owns the drivetrain right now --
+  // covers both a live wire motion and, defensively, a job already
+  // dispatching via a reentrant call, though the latter cannot actually
+  // happen: see the note below). Sets motionOwner_ = kJob and tells
+  // wireAdapter_ so a wire motion verb arriving while this job runs is
+  // refused (kBusy) rather than silently overwriting or racing its move
+  // -- both cleared again once the dispatched call returns.
+  //
+  // Called once per pass of run()'s own loop, after drainEmitQueue() and
+  // before the wire/radio poll (serviceOnce(), below) -- but the
+  // dispatched call itself can run for a long time (a whole tour), during
+  // which THIS SAME fiber re-enters serviceOnce() repeatedly through
+  // tickDrive()'s own service hook (see serviceHookEntry() below), which
+  // calls dispatchJob() again on every re-entry. That nested call always
+  // finds motionOwner_ == kJob already and returns immediately -- a job
+  // is dispatched exactly once per queued command, never re-entered.
+  void dispatchJob();
+
+  // Copies `text` into currentRunText_ and invokes the one registered
+  // RUN dispatch callback (shims.cpp's runDispatch(), which runs
+  // whichever `onRun()`/`onRunCommand()` handler test.ts bound to this
+  // command's name) -- the single path both dispatchJob() (a queued job,
+  // gated on motionOwner_) and handleRun()'s abort/clearestop bypass
+  // (ungated, see that method's own comment) funnel through. Safe to
+  // call reentrantly (an abort dispatched from inside a running job's own
+  // tick loop): the callback reads currentRunText_ back via
+  // runCommandText() at its OWN entry, before doing anything else, so a
+  // nested call's overwrite can never corrupt an outer, still-running
+  // job's own already-consumed text -- every onRun() handler in this
+  // package reads its arguments only at entry (test/test.ts), never
+  // later during a long-running tick loop.
+  void invokeRunDispatch(const char* text);
+
+  // Copies `text` into currentRunText_, bounded to kRunTextBytes and
+  // always NUL-terminated. The one place that buffer is written.
+  void setCurrentRunText(const char* text);
+
+  // One pass of this fiber's OWN servicing: drains emitQueue_, dispatches
+  // one queued RUN job if the drivetrain is free, polls serial and radio
+  // for new lines (the old-style cleartext RUN: bridge or the v6
+  // grammar), and emits a telemetry frame if one is due. This is run()'s
+  // own former per-pass loop body (minus the final tick-or-sleep step),
+  // extracted so it can ALSO run as tickDrive()'s service hook
+  // (serviceHookEntry(), below): a dispatched job's own
+  // `while (driveTick())` tick loop nests back into this same servicing
+  // once per tick, which is what lets an abort, a new queued command, or
+  // ordinary telemetry keep flowing without waiting for that job to
+  // return -- inverting the pump (this fiber's own servicing rides
+  // inside the job's tick loop) rather than adding a second fiber to
+  // drive the job. Never calls tickDrive() itself and never
+  // sleeps -- run()'s own loop (below) does both of those, once per pass,
+  // strictly AFTER this returns; the ONE nested call site (tickDrive()
+  // itself) is already mid-tick when this fires, so doing either here
+  // would be reentrant and wrong.
+  void serviceOnce();
+
+  // tickDrive()'s (shims.cpp) service hook, registered once via
+  // registerTickServiceHook() when run() starts -- a plain
+  // no-capture function pointer (same reason wireNowMs() below is a
+  // plain static member function, not a lambda: a bare C function
+  // pointer cannot capture `this`), so it reaches this specific
+  // Protocol instance through the protocol() singleton accessor, safe
+  // for the same reason wireNowMs() is. Deliberately a NO-OP unless
+  // motionOwner_ == kJob: tickDrive() is also called (a) from run()'s
+  // own loop for a live WIRE motion obligation, which already gets its
+  // own servicing once per pass via run()'s own loop calling
+  // serviceOnce() directly, and (b) from a student's own program driving
+  // continuous-mode motion on THAT program's own fiber (the third,
+  // deliberately unchanged execution model) -- neither call site needs
+  // or wants this hook's extra work, and (b)
+  // must never run serviceOnce() on a fiber other than this one.
+  static void serviceHookEntry();
+
   // ---- the outbound emit path: single producer, one caller each ------
   // emitLine() (public, above) no longer writes a transport itself -- it
   // clips and enqueues onto emitQueue_ below and returns. These two
@@ -170,39 +261,34 @@ class Protocol {
   static constexpr int kEmitSlots = 8;
   EmitQueue<kEmitSlots, static_cast<int>(kEmitTextBytes)> emitQueue_;
 
-  // ---- the old-style cleartext RUN MessageBus bridge, preserved
-  // unchanged from before this cutover (see this file's own top-of-file
-  // comment for why it survives the v5 retirement) -----------------------
-  // RUN:<name>[:<arg>...] (cleartext, e.g. "RUN:pivot:180") parks the
-  // payload text in a slot and raises a MessageBus event carrying that
-  // slot as the event value. `blocks/run.ts`'s run dispatcher registers a
-  // TS handler against the same source id, reads the text back through the
-  // runCommandText shim, and calls whichever handler test.ts bound to
-  // that NAME -- so a wire command reads as the test it runs, not as a
-  // magic number, and its arguments ride along as text instead of being
-  // encoded into numeric offsets. The event fires handlers on their own
-  // fiber (MessageBus default), so a long-running test (a full square
-  // tour ticking the kernel) does not block this protocol fiber.
+  // ---- the old-style cleartext RUN bridge, preserved unchanged from
+  // before the v5 retirement (see this file's own top-of-file comment)
+  // except for HOW a dequeued command reaches TypeScript: not a
+  // MessageBus event to a second, forked fiber (deleted) but
+  // dispatchJob() dequeuing and calling invokeRunDispatch() directly, on
+  // THIS fiber. -----------------------
+  // RUN:<name>[:<arg>...] (cleartext, e.g. "RUN:pivot:180") normally
+  // parks the payload text in runQueue_ below for dispatchJob() to drain
+  // in arrival order. "abort"/"clearestop" bypass that queue entirely --
+  // see this method's own definition (protocol.cpp) for why: a queued
+  // abort would sit behind the very job it is meant to stop.
   void handleRun(const uint8_t* data, size_t dataLen);
 
-  // RUN payload storage. The event value is a uint16 and cannot carry
-  // text, so the payload is parked here and the event carries only the
-  // slot it landed in (1-based; 0 is MICROBIT_EVT_ANY). A RING of slots,
-  // not one buffer: MessageBus events queue and a test handler can run
-  // for a minute, so a second RUN arriving mid-test would otherwise
-  // overwrite the text the queued handler has not read yet. Four slots
-  // covers any burst a host can plausibly send inside one handler.
+  // RUN payload storage: a real ring with occupancy (run_queue.h), not a
+  // bare write cursor -- a slot stays in flight from enqueue() until
+  // dispatchJob() reads and releases it, so a burst arriving during a
+  // long job's dispatch can no longer overwrite payload not yet
+  // consumed. Overflow is counted and readable (diagValue ordinal 30)
+  // instead of silent.
   static constexpr size_t kRunTextBytes = 48;  // name + args + NUL
   static constexpr int kRunSlots = 8;
-  // A real ring with occupancy, not a bare write cursor: a slot stays
-  // in flight from enqueue until runText() reads it back, so a burst
-  // arriving during a long handler can no longer overwrite payload
-  // that handler has not consumed. Overflow is counted and readable
-  // (diagValue ordinal 30) instead of silent. Mutable because reading
-  // a slot IS the release -- the MessageBus consumer never says
-  // "done", so the read is the only honest place to close occupancy,
-  // and runText() is const to its callers.
-  mutable RunQueue<kRunSlots, static_cast<int>(kRunTextBytes)> runQueue_;
+  RunQueue<kRunSlots, static_cast<int>(kRunTextBytes)> runQueue_;
+
+  // The text of whichever RUN command dispatchJob()/invokeRunDispatch()
+  // most recently copied in, for currentRunText() (public, above) to
+  // return. The one buffer both call sites write, always through
+  // setCurrentRunText().
+  char currentRunText_[kRunTextBytes] = {};
 
   // RUN repeat suppression -- see handleRun's own comment. Hosts repeat
   // commands to survive the single-slot inbound buffer, and without
@@ -335,6 +421,22 @@ class Protocol {
   // radio-polling block); reused every poll, serial branch is done with
   // its own buffer by the time this runs each iteration.
   uint8_t rxLineBuf_[64];
+
+  // Serial RX scratch, the serial-side twin of rxLineBuf_ above --
+  // moved from a run()-local to a member so serviceOnce() (below) can
+  // read into it from ANY nesting depth (run()'s own top-level pass, or
+  // a re-entrant call arriving through tickDrive()'s service hook while
+  // a job's own tick loop runs) without needing to thread a buffer
+  // pointer down through that reentrant call chain. Safe to share: each
+  // level fully reads and dispatches whatever landed here before any
+  // deeper call could touch it again, and a shallower level never reads
+  // it again once it has already handed off to handleRun()/feed().
+  uint8_t lineBuf_[kMaxLineBytes];
+
+  // serviceOnce()'s own telemetry-cadence clock, the same reason
+  // lineBuf_ above became a member -- shared safely across reentrant
+  // calls for the same reason.
+  uint32_t lastEmitMs_ = 0;
 };
 
 // Lazy singleton, mirroring shims.cpp's Rig/ensure() pattern:

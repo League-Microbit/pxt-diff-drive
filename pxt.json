@@ -53,7 +53,10 @@
     "preferredEditor": "tsprj",
     "yotta": {
         "config": {
-            "microbit_radio_max_packet_size": 250
+            "microbit_radio_max_packet_size": 250,
+            "device": {
+                "stack_size": 4096
+            }
         }
     },
     "disablesVariants": [

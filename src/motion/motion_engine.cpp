@@ -225,6 +225,8 @@ void MotionEngine::startSegment(float distance, float rotation,
   const DiffDrive::DifferentialDrive::Output out = kernel_.output();
   move_.posLeft0 = out.positionLeft;
   move_.posRight0 = out.positionRight;
+  move_.epochLeft0 = out.positionEpochLeft;
+  move_.epochRight0 = out.positionEpochRight;
   move_.distTarget = distance * cpm;                              // [counts]
   move_.yawTarget = rotation * 0.5f * effectiveTrackWidth() * cpm;  // [counts]
   // Subtract the measured per-wheel end-of-move overrun from the
@@ -520,6 +522,46 @@ bool MotionEngine::serviceMove() {
   }
 
   const DiffDrive::DifferentialDrive::Output out = kernel_.output();
+
+  // REBASE RACE (sprint 028 ticket 002, MEASURED gopiv 2026-09-02,
+  // captures/gopiv-acceptance-028-20260902/step_e_transcript.txt): a
+  // `SET rebase 1` defers kernel.rebasePosition() to the kernel's own
+  // NEXT step() (diffdrive.cpp's rebaseReq_/seenRebaseReq_ check runs
+  // before that step()'s own command processing). When a MOVE_X is
+  // issued immediately after a SUCCESSFUL rebase (no motion active in
+  // between, so the busy gate never fires), this move's own
+  // startSegment() captures posLeft0/posRight0 from the kernel's
+  // STILL-OLD, pre-rebase Output -- and the very step() that first
+  // drives this move (tickDrive(), triggered by this move going active)
+  // is also the step() that finally honours the deferred rebase,
+  // zeroing positionLeft/positionRight (and sampleLeft_/sampleRight_
+  // wholesale) out from under that snapshot. Diffing the fresh,
+  // near-zero post-rebase position against the stale pre-rebase
+  // baseline below produces a huge signed delta that satisfies the
+  // completion margin on literally this move's first serviced tick --
+  // measured: `MOVE_X 0 -900 60 3000` delivered 11 of ~5160 commanded
+  // centidegrees and reported itself complete.
+  //
+  // positionEpochLeft/Right (diffdrive.h) change ONLY alongside that
+  // re-anchor -- the same signal shims.cpp's odomUpdate() already reads
+  // to catch the equivalent discontinuity in the Rig-level x/y/heading
+  // odometry it owns. A change since startSegment()'s own snapshot means
+  // the wheel has not actually moved relative to the new zero (the
+  // rebase and this move's own first tick land in the same real
+  // instant, never further apart -- rebase is refused with err 10 while
+  // any motion obligation is live, so it can only ever land at a move's
+  // very start, never mid-flight) -- so re-anchoring the baseline to the
+  // fresh position is the correct fix, not a workaround: distTarget/
+  // yawTarget stay untouched RELATIVE displacements, only the reference
+  // point they are measured from moves.
+  if (out.positionEpochLeft != move_.epochLeft0 ||
+      out.positionEpochRight != move_.epochRight0) {
+    move_.posLeft0 = out.positionLeft;
+    move_.posRight0 = out.positionRight;
+    move_.epochLeft0 = out.positionEpochLeft;
+    move_.epochRight0 = out.positionEpochRight;
+  }
+
   const float dLeft = out.positionLeft - move_.posLeft0;    // [counts]
   const float dRight = out.positionRight - move_.posRight0;  // [counts]
   const float meanProgress = 0.5f * (dLeft + dRight);
@@ -841,8 +883,20 @@ void MotionEngine::settleToRest() {
 int MotionEngine::progress() const {
   if (!move_.active) return 1000;
   const DiffDrive::DifferentialDrive::Output out = kernel_.output();
-  const float dLeft = out.positionLeft - move_.posLeft0;
-  const float dRight = out.positionRight - move_.posRight0;
+  // Same rebase-race guard as serviceMove()'s own comment at its
+  // equivalent read site: a query landing in the single-tick window
+  // between a move's startSegment() snapshot and the deferred rebase's
+  // step()-time re-anchor would otherwise diff a fresh position against
+  // a stale pre-rebase baseline. This method is const -- it cannot
+  // perform the real re-anchor serviceMove() does -- so it reports "no
+  // progress yet" for that one tick instead of a bogus huge delta;
+  // serviceMove() itself re-anchors move_ on its own next call.
+  const bool rebasedSinceStart = out.positionEpochLeft != move_.epochLeft0 ||
+      out.positionEpochRight != move_.epochRight0;
+  const float dLeft =
+      rebasedSinceStart ? 0.0f : out.positionLeft - move_.posLeft0;
+  const float dRight =
+      rebasedSinceStart ? 0.0f : out.positionRight - move_.posRight0;
   float fraction = 1.0f;
   if (move_.distTarget != 0.0f) {
     const float f = std::fabs(0.5f * (dLeft + dRight)) /

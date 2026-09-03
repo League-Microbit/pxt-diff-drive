@@ -11,7 +11,7 @@
 
 namespace diffDrive {
 
-// ---- shims.cpp entry point this file still needs directly ---------------
+// ---- shims.cpp entry points this file needs directly ---------------------
 // tickDrive() runs one kernel.step() + serviceMove() -- the caller-
 // driven replacement for the kernel's own unwired fiber. This fiber
 // calls it directly while a wire motion obligation is live (see run()'s
@@ -19,6 +19,21 @@ namespace diffDrive {
 // call). Reached by same-package forward declaration -- shims.cpp has
 // no header of its own; keep signatures compatible.
 bool tickDrive();
+
+// Runs the ONE registered RUN dispatch action (test.ts's onRun()/
+// onRunCommand() handlers all share it), on the caller's own fiber --
+// see invokeRunDispatch() below. Returns false with nothing registered
+// yet (no onRun() handler has ever been called), a silent no-op.
+bool runDispatch();
+
+// Registers a plain, no-capture function pointer to be called from
+// inside tickDrive() itself, once per call, after its own kernel.step()/
+// settle work is done and before its pacing sleep -- see
+// serviceHookEntry()'s own comment (protocol.h) for why this fiber needs
+// that. Kept OUT of shims.cpp's own `//%`-annotated, TS-facing surface:
+// this is a plain C++-to-C++ seam, never called from a block or from
+// TypeScript.
+void registerTickServiceHook(void (*hook)());
 
 namespace {
 
@@ -100,18 +115,20 @@ constexpr size_t kOldRunPrefixLen = 4;
 constexpr uint32_t kTelemetryEmitPeriodMs = 50;
 constexpr uint32_t kPollIntervalMs = 5;
 
-// Custom MessageBus source id for the old-style RUN bridge -- must match
-// RUN_EVENT_SOURCE in `blocks/run.ts`. Chosen well above the MICROBIT_ID_*
-// range. Carried over unchanged from before this cutover. Sprint 008 ticket
-// 002 (WIRE-01-adjacent minor, R-21/MOD-05): this literal and
-// `blocks/run.ts`'s own RUN_EVENT_SOURCE are two independently hand-typed
-// copies of the same
-// MessageBus event id, with nothing but this comment keeping them
-// aligned -- pinned by tests/host/test_wire_constants_drift.py, which
-// reads both source files as text and fails if the two literals
-// diverge (no shared-constant mechanism crosses the TS/C++ boundary in
-// this project today, so a drift test is the fix, not single-sourcing).
-constexpr int kRunEventSource = 0x2001;
+// Bypass names for handleRun() below: these two skip runQueue_ entirely
+// and dispatch immediately, regardless of what else is running -- see
+// handleRun()'s own comment. `name` is the payload up to (not including)
+// its first ':', or the whole payload if there is none, matching how
+// the TS dispatcher itself splits a command into name + arguments.
+bool isBypassRunName(const char* text) {
+  size_t nameLen = 0;
+  while (text[nameLen] != '\0' && text[nameLen] != ':') ++nameLen;
+  auto matches = [&](const char* name) {
+    return std::strlen(name) == nameLen &&
+           std::memcmp(text, name, nameLen) == 0;
+  };
+  return matches("abort") || matches("clearestop");
+}
 
 }  // namespace
 
@@ -219,7 +236,7 @@ void Protocol::setupRadio(uint8_t channel, uint8_t group) {
 
 void Protocol::enableRadio() { radioEnabled_ = true; }
 
-// ---- the old-style cleartext RUN MessageBus bridge, unchanged --------
+// ---- the old-style cleartext RUN bridge ------------------------------
 
 void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
   if (data == nullptr || dataLen == 0) return;
@@ -242,11 +259,10 @@ void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
 
   // Dedupe repeats of the SAME command. The robot's inbound wireless
   // path is a single-slot buffer, so hosts repeat commands to survive
-  // loss -- but MessageBus events queue and are delivered one at a
-  // time, each after the previous handler returns. A repeated RUN
-  // therefore does not hit the test programs' own re-entry guard
-  // (which has already cleared by then): measured on vevov, one
-  // 3x-repeated RUN:4 ran three consecutive 180 deg pivots.
+  // loss -- a repeated RUN does not hit the test programs' own re-entry
+  // guard (which has already cleared by the time a retransmit lands):
+  // measured on vevov, one 3x-repeated RUN:4 ran three consecutive
+  // 180 deg pivots.
   //
   // Suppression is by (text, arrival time) here at the point of
   // arrival, NOT at handling time, which is what makes it immune to
@@ -263,8 +279,23 @@ void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
   std::memcpy(lastRunText_, text, dataLen + 1);
   lastRunMs_ = nowMs;
 
-  const int slot = runQueue_.enqueue(text, static_cast<int>(dataLen));
-  if (slot < 0) {
+  // Abort/clearestop bypass runQueue_ entirely and dispatch RIGHT NOW,
+  // on whatever fiber called handleRun() -- run()'s own loop normally,
+  // but (crucially) also the service hook nested inside a running job's
+  // own tick loop, which is the ONLY way an abort sent while a job is
+  // mid-tour can ever be noticed: dispatchJob() refuses to start a
+  // SECOND job while motionOwner_ is not kNone, so if abort went through
+  // the same queued path as everything else it would sit behind the
+  // very job it is meant to stop. Ungated on motionOwner_ deliberately
+  // -- both handlers this dispatches to (test.ts's "abort"/"clearestop")
+  // are trivial, non-blocking, and safe to invoke reentrant from inside
+  // a job's own call chain.
+  if (isBypassRunName(text)) {
+    invokeRunDispatch(text);
+    return;
+  }
+
+  if (runQueue_.enqueue(text, static_cast<int>(dataLen)) < 0) {
     // Every slot is still in flight. Refusing is the point: the old
     // cursor would have overwritten one, and the handler holding it
     // would then have run a command nobody sent. The refusal is
@@ -272,26 +303,53 @@ void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
     // out-runs the robot can find out.
     return;
   }
-  MicroBitEvent(kRunEventSource, static_cast<uint16_t>(slot + 1));
+  // dispatchJob() drains runQueue_ itself, in arrival order -- nothing
+  // else to do here once the enqueue above has accepted the command.
 }
 
-const char* Protocol::runText(int slot) const {
-  if (slot < 1 || slot > kRunSlots) return "";
-  // Reading a slot releases it. The MessageBus consumer never reports
-  // completion, so this is the only place occupancy can honestly be
-  // closed; the text is copied out by the caller before the next
-  // enqueue can reach this slot, because both run on this same fiber.
-  const char* text = runQueue_.at(slot - 1);
-  runQueue_.release(slot - 1);
-  return text;
+void Protocol::dispatchJob() {
+  if (motionOwner_ != MotionOwner::kNone) return;
+  const int slot = runQueue_.peek();
+  if (slot < 0) return;  // nothing queued
+
+  // Copy the text out and release the slot BEFORE dispatching -- the
+  // call below can run for as long as the job itself does (a whole
+  // tour), and releasing first frees runQueue_'s capacity for a burst
+  // arriving during that whole span instead of holding one slot hostage
+  // for it.
+  setCurrentRunText(runQueue_.at(slot));
+  runQueue_.release(slot);
+
+  motionOwner_ = MotionOwner::kJob;
+  wireAdapter_.setJobOwnsMotion(true);
+  runDispatch();
+  wireAdapter_.setJobOwnsMotion(false);
+  motionOwner_ = MotionOwner::kNone;
+}
+
+void Protocol::invokeRunDispatch(const char* text) {
+  setCurrentRunText(text);
+  runDispatch();
+}
+
+void Protocol::setCurrentRunText(const char* text) {
+  std::strncpy(currentRunText_, text, kRunTextBytes - 1);
+  currentRunText_[kRunTextBytes - 1] = '\0';
+}
+
+const char* Protocol::currentRunText() const { return currentRunText_; }
+
+void Protocol::serviceHookEntry() {
+  if (protocol().motionOwner_ != MotionOwner::kJob) return;
+  protocol().serviceOnce();
 }
 
 uint32_t Protocol::runDropCount() const { return runQueue_.dropped(); }
 uint32_t Protocol::emitDropCount() const { return emitQueue_.dropped(); }
 
 // Same boundary, opposite direction: shims.cpp's runCommandText shim
-// reads back the RUN payload a MessageBus event value refers to.
-const char* protocolRunText(int slot) { return protocol().runText(slot); }
+// reads back whichever RUN command is currently being dispatched.
+const char* protocolCurrentRunText() { return protocol().currentRunText(); }
 
 // ---- ticket 005: identity, assembled once the fiber actually runs ----
 
@@ -335,6 +393,128 @@ void Protocol::fiberEntry(void* self) {
   static_cast<Protocol*>(self)->run();
 }
 
+void Protocol::serviceOnce() {
+  // Drain every line any fiber queued via emitLine() since the last
+  // pass, first -- before either transport's own RX poll below, so a
+  // queued line does not wait behind a receive that happens to be
+  // pending. This is also the ONLY place emitQueue_ is ever drained;
+  // this method itself runs only on this object's own fiber (run()'s
+  // own loop, or, nested, tickDrive()'s service hook -- see
+  // serviceHookEntry()'s own comment, protocol.h, for why that nesting
+  // is still this same fiber), which is what makes this fiber the emit
+  // path's single producer (see protocol.h's own comment on
+  // emitLine()/emitLineNow()).
+  drainEmitQueue();
+
+  // Dequeue and dispatch one queued RUN job, if the drivetrain is free
+  // -- see dispatchJob()'s own comment (protocol.h) for the full
+  // arbitration and why this can safely run nested, from inside a job
+  // that is already dispatching.
+  dispatchJob();
+
+  size_t len = 0;
+  if (transport_.tryReadLine(lineBuf_, sizeof(lineBuf_), &len)) {
+    if (len >= kOldRunPrefixLen &&
+        std::memcmp(lineBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
+      // Old-style cleartext RUN, preserved unchanged -- see this
+      // file's own top-of-file comment (protocol.h) for why it's
+      // detected here by literal prefix rather than through a verb
+      // registry (the v5 registry that used to do this is gone).
+      handleRun(lineBuf_ + kOldRunPrefixLen, len - kOldRunPrefixLen);
+    } else {
+      // Every other line -- including the v6 grammar's own
+      // space-separated "RUN <name> ... #<id>" verb -- goes to the
+      // v6 wire stack. feed() reassembles regardless of chunking; the
+      // trailing '\n' it needs to recognize the line as complete is
+      // fed as a second, separate call.
+      wireHandler_.feed(reinterpret_cast<const char*>(lineBuf_), len);
+      wireHandler_.feed("\n", 1);
+    }
+  }
+
+  // Radio command plane (single-fragment RX): mirrors the serial
+  // branch's own dual-path logic above exactly. Radio speaks the full
+  // v6 grammar (ack/nack, TLM, STATUS, the motion verbs, etc.) through
+  // its OWN WireHandler (wireHandlerRadio_), with the old-style literal
+  // "RUN:" prefix preserved as a fallback, unchanged, exactly as
+  // protocol.h's own top-of-file comment describes. This call also
+  // lazily brings the radio up on its first invocation
+  // (RadioTransport::tryReceiveLine() calls ensureRadioReady()
+  // internally) -- the same "unconditionally from this fiber's boot
+  // path" cost the old banner/TLM radio mirror used to pay, just via
+  // the receive side now that there is no v6 reply mirror to pay it
+  // instead. Radio's RX path stays a single 64-byte fragment slot with
+  // no multi-fragment reassembly: a v6 line whose encoding does not fit
+  // one fragment is out of scope here.
+  // Gate 1 of 3 (see radioEnabled_'s own comment, protocol.h). This
+  // poll is what used to bring the radio up at boot, unconditionally,
+  // for every program -- which is exactly why a student's joystick
+  // program could never work. tryReceiveLine() calls
+  // ensureRadioReady() internally, so NOT calling it at all is what
+  // leaves the radio free for MakeCode's own radio blocks.
+  size_t radioLen = 0;
+  if (radioEnabled_ &&
+      radioTransport_.tryReceiveLine(rxLineBuf_, sizeof(rxLineBuf_),
+                                     &radioLen)) {
+    if (radioLen >= kOldRunPrefixLen &&
+        std::memcmp(rxLineBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
+      // Old-style cleartext RUN, preserved unchanged as a fallback --
+      // see protocol.h's own top-of-file comment for why it's
+      // detected here by literal prefix rather than through the v6
+      // grammar's own verb lookup.
+      handleRun(rxLineBuf_ + kOldRunPrefixLen,
+               radioLen - kOldRunPrefixLen);
+    } else {
+      // Every other line -- including the v6 grammar's own
+      // space-separated "RUN <name> ... #<id>" verb -- goes to
+      // radio's own v6 wire stack. wireHandlerRadio_ keeps its own
+      // independent expectedNext_ (wifi-link.md:373),
+      // so a gap on this transport can never nack wireHandler_'s
+      // (serial's) next command, or vice versa.
+      wireHandlerRadio_.feed(reinterpret_cast<const char*>(rxLineBuf_),
+                             radioLen);
+      wireHandlerRadio_.feed("\n", 1);
+    }
+  }
+
+  // The reliability layer's per-line ack/nack (WireHandler::dispatch(),
+  // wire_handler.cpp) is the ENTIRE reliability plane, full stop: it
+  // fires once per inbound line, driven from feed()/onLineComplete()
+  // above, completely independent of this timing gate. This gate
+  // exists ONLY to pace telemetry FRAMES for a subscribed host: when a
+  // host has subscribed (wireAdapter_.telemetryEnabled()),
+  // buildSnapshot() is called ONCE per tick and the SAME Snapshot
+  // reference is handed to BOTH handlers' emitTelemetry() -- not once
+  // per handler (buildSnapshot() mutates odometry and advances seq_, so
+  // building it twice would double both for no benefit, and would
+  // report different seq/now values to serial vs radio for what should
+  // read as "the same instant").
+  //
+  // NO unsolicited ack/nack of any kind exists on any path (an ack or a
+  // nack is only ever a response to a message, never a beacon). A lost
+  // ack/nack heals via the host's own retransmit (tools/robotlink.py's
+  // send_until()) or poll, one round trip later. A future reader must
+  // NOT "restore" a periodic, rate-limited, gap-gated, or
+  // telemetry-carried re-emission here -- that would reintroduce a
+  // free-running beacon this design deliberately has none of.
+  const uint32_t nowMs = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+  if (static_cast<int32_t>(nowMs - lastEmitMs_) >=
+      static_cast<int32_t>(kTelemetryEmitPeriodMs)) {
+    if (wireAdapter_.telemetryEnabled()) {
+      const Wire::Snapshot& snapshot = wireAdapter_.buildSnapshot();
+      wireHandler_.emitTelemetry(snapshot);
+      // Gate 3 of 3 (see radioEnabled_'s own comment, protocol.h):
+      // wireHandlerRadio_ sinks through radioSink_ into
+      // RadioTransport::sendLine(), which lazily enables the radio.
+      // Serial telemetry just above is unconditional.
+      if (radioEnabled_) {
+        wireHandlerRadio_.emitTelemetry(snapshot);
+      }
+    }
+    lastEmitMs_ = nowMs;
+  }
+}
+
 void Protocol::run() {
   // Real identity, read now that this fiber is actually executing --
   // see buildIdentity()'s own comment (protocol.h) for why this is
@@ -346,153 +526,37 @@ void Protocol::run() {
   // Boot banner: byte-identical to HELLO's own reply
   // (wire_handler.cpp's sendBanner()), sent here before this loop ever
   // blocks on a read, so it goes out unsolicited the moment this fiber
-  // starts -- SUC-001's "without any host request." HELLO re-sends the
-  // identical banner on request via wireHandler_'s own dispatch.
+  // starts. HELLO re-sends the identical banner on request via
+  // wireHandler_'s own dispatch.
   wireHandler_.sendBanner();
 
-  uint8_t lineBuf[kMaxLineBytes];
-  uint32_t lastEmitMs = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+  lastEmitMs_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+
+  // Register this fiber's own servicing as tickDrive()'s service hook --
+  // see serviceHookEntry()'s own comment (protocol.h) for what it does
+  // and why it is a deliberate no-op outside a dispatched job's own
+  // call span.
+  registerTickServiceHook(&Protocol::serviceHookEntry);
+
   while (true) {
-    // Drain every line any fiber queued via emitLine() since the last
-    // pass, first -- before either transport's own RX poll below, so a
-    // queued line does not wait behind a receive that happens to be
-    // pending. This is also the ONLY place emitQueue_ is ever drained,
-    // and this loop runs on this object's own fiber alone, which is
-    // what makes this fiber the emit path's single producer (see
-    // protocol.h's own comment on emitLine()/emitLineNow()).
-    drainEmitQueue();
+    serviceOnce();
 
-    size_t len = 0;
-    if (transport_.tryReadLine(lineBuf, sizeof(lineBuf), &len)) {
-      if (len >= kOldRunPrefixLen &&
-          std::memcmp(lineBuf, kOldRunPrefix, kOldRunPrefixLen) == 0) {
-        // Old-style cleartext RUN, preserved unchanged -- see this
-        // file's own top-of-file comment (protocol.h) for why it's
-        // detected here by literal prefix rather than through a verb
-        // registry (the v5 registry that used to do this is gone).
-        handleRun(lineBuf + kOldRunPrefixLen, len - kOldRunPrefixLen);
-      } else {
-        // Every other line -- including the v6 grammar's own
-        // space-separated "RUN <name> ... #<id>" verb -- goes to the
-        // v6 wire stack. feed() reassembles regardless of chunking; the
-        // trailing '\n' it needs to recognize the line as complete is
-        // fed as a second, separate call.
-        wireHandler_.feed(reinterpret_cast<const char*>(lineBuf), len);
-        wireHandler_.feed("\n", 1);
-      }
-    }
-
-    // Radio command plane (single-fragment RX): mirrors the serial
-    // branch's own dual-path logic above exactly, closing sprint 003's
-    // own Open Question 4 -- radio now speaks the full v6 grammar
-    // (ack/nack, TLM, STATUS, the motion verbs, etc.) through its OWN
-    // WireHandler (wireHandlerRadio_), with the old-style literal
-    // "RUN:" prefix preserved as a fallback, unchanged, exactly as
-    // protocol.h's own top-of-file comment describes. This call also
-    // lazily brings the radio up on its first invocation
-    // (RadioTransport::tryReceiveLine() calls ensureRadioReady()
-    // internally) -- the same "unconditionally from this fiber's boot
-    // path" cost the old banner/TLM radio mirror used to pay, just via
-    // the receive side now that there is no v6 reply mirror to pay it
-    // instead. Radio's RX path stays a single 64-byte fragment slot
-    // with no multi-fragment reassembly -- unchanged by this ticket
-    // (sprint.md's Out of Scope entry, code review R-27): a v6 line
-    // whose encoding does not fit one fragment is not this ticket's
-    // concern to fix.
-    // Gate 1 of 3 (see radioEnabled_'s own comment, protocol.h). This
-    // poll is what used to bring the radio up at boot, unconditionally,
-    // for every program -- which is exactly why a student's joystick
-    // program could never work. tryReceiveLine() calls
-    // ensureRadioReady() internally, so NOT calling it at all is what
-    // leaves the radio free for MakeCode's own radio blocks.
-    size_t radioLen = 0;
-    if (radioEnabled_ &&
-        radioTransport_.tryReceiveLine(rxLineBuf_, sizeof(rxLineBuf_),
-                                       &radioLen)) {
-      if (radioLen >= kOldRunPrefixLen &&
-          std::memcmp(rxLineBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
-        // Old-style cleartext RUN, preserved unchanged as a fallback --
-        // see protocol.h's own top-of-file comment for why it's
-        // detected here by literal prefix rather than through the v6
-        // grammar's own verb lookup.
-        handleRun(rxLineBuf_ + kOldRunPrefixLen,
-                 radioLen - kOldRunPrefixLen);
-      } else {
-        // Every other line -- including the v6 grammar's own
-        // space-separated "RUN <name> ... #<id>" verb -- goes to
-        // radio's own v6 wire stack. wireHandlerRadio_ keeps its own
-        // independent expectedNext_ (wifi-link.md:373),
-        // so a gap on this transport can never nack wireHandler_'s
-        // (serial's) next command, or vice versa.
-        wireHandlerRadio_.feed(reinterpret_cast<const char*>(rxLineBuf_),
-                               radioLen);
-        wireHandlerRadio_.feed("\n", 1);
-      }
-    }
-
-    // The reliability layer's per-line ack/nack (WireHandler::dispatch(),
-    // wire_handler.cpp) is the ENTIRE reliability plane, full stop
-    // (2026-08-26): it fires once per inbound line, driven from
-    // feed()/onLineComplete() above, completely independent of this
-    // timing gate. This gate exists ONLY to pace telemetry FRAMES for a
-    // subscribed host: when a host has subscribed
-    // (wireAdapter_.telemetryEnabled()), buildSnapshot() is called ONCE
-    // per tick and the SAME Snapshot reference is handed to BOTH
-    // handlers' emitTelemetry() -- not once per handler (buildSnapshot()
-    // mutates odometry and advances seq_, so building it twice would
-    // double both for no benefit, and would report different seq/now
-    // values to serial vs radio for what should read as "the same
-    // instant").
-    //
-    // History of the ack barrage, in two deletions. Sprint 024 ticket
-    // 001 deleted the unconditional `else` this `if` used to have,
-    // which called emitReliability() on both handlers alone, every
-    // tick, regardless of subscription -- a free-running 20 Hz beacon
-    // on an idle transport, addressed to nobody (see clasi/issues/
-    // reliability-line-free-runs-at-20-hz-on-the-radio-with-no-host.md).
-    // That left ONE unsolicited path: emitTelemetry() still appended the
-    // reliability line to every frame for a TLM-subscribed host -- and a
-    // STALE subscription (TLM survives disconnect by design) plus the
-    // radio path's own frame throttle produced an ack-only barrage on an
-    // idle bridge connection anyway. 2026-08-26, stakeholder direction
-    // ("an ack or a nack is only a response to a message, not a
-    // beacon"): emitReliability() is deleted outright (wire_handler.h) --
-    // emitTelemetry() emits frames only, and NO unsolicited ack/nack of
-    // any kind exists on any path. A lost ack/nack heals via the HOST's
-    // own retransmit (tools/robotlink.py's send_until()) or poll, one
-    // round trip later. A future reader must NOT "restore" a periodic,
-    // rate-limited, gap-gated, or telemetry-carried re-emission here as
-    // a fix for a perceived regression -- the self-heal path changed
-    // shape, it did not disappear, and restoring any form of unsolicited
-    // emission would reintroduce exactly the barrage these two deletions
-    // removed.
-    const uint32_t nowMs = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
-    if (static_cast<int32_t>(nowMs - lastEmitMs) >=
-        static_cast<int32_t>(kTelemetryEmitPeriodMs)) {
-      if (wireAdapter_.telemetryEnabled()) {
-        const Wire::Snapshot& snapshot = wireAdapter_.buildSnapshot();
-        wireHandler_.emitTelemetry(snapshot);
-        // Gate 3 of 3 (see radioEnabled_'s own comment, protocol.h):
-        // wireHandlerRadio_ sinks through radioSink_ into
-        // RadioTransport::sendLine(), which lazily enables the radio.
-        // Serial telemetry just above is unconditional.
-        if (radioEnabled_) {
-          wireHandlerRadio_.emitTelemetry(snapshot);
-        }
-      }
-      lastEmitMs = nowMs;
-    }
-
-    // Sprint 002's motion-obligation tracking, carried onto the new
-    // dispatch path (see wire_adapter.h's own comment on
-    // hasLiveMotionObligation()): with the kernel's own background
+    // Wire-issued motion tracking: with the kernel's own background
     // fiber removed (shims.cpp), a wire-issued WHEELS_V has no student
     // loop left to keep ticking it. This fiber still owns the actual
     // tickDrive() call -- a CODAL-fiber concern wireAdapter_ must never
     // touch -- driven by wireAdapter_'s own tracked deadline.
+    // motionOwner_ tracks kWire for as long as the obligation stays
+    // live (spanning many passes of this loop, not just one tick), and
+    // drops back to kNone the first pass it clears -- see this field's
+    // own comment (protocol.h).
     if (wireAdapter_.hasLiveMotionObligation()) {
+      motionOwner_ = MotionOwner::kWire;
       tickDrive();
     } else {
+      if (motionOwner_ == MotionOwner::kWire) {
+        motionOwner_ = MotionOwner::kNone;
+      }
       // Cooperative yield -- lets the kernel's own fiber (and any
       // other) run between polls; never spins.
       //

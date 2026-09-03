@@ -117,6 +117,20 @@ class WireAdapter : public Wire::Adapter {
   // fiber body). Same borrowed-pointer contract as the constructor.
   void setIdentity(const Wire::Identity& identity);
 
+  // True for the whole span a dispatched RUN job owns the drivetrain,
+  // per protocol.cpp's own
+  // `motionOwner_ == kJob`. That field deliberately lives in Protocol,
+  // not here (only Protocol can see both a wire request and a
+  // dispatched job) -- this setter is the one seam Protocol uses to
+  // tell this class about it, so the six motion verb handlers below can
+  // refuse (kBusy) a wire motion arriving while a job is running instead
+  // of silently overwriting or racing its move. Plain bool, not part of
+  // Wire::Adapter's own interface -- called only from protocol.cpp's
+  // dispatchJob(), the same "protocol.cpp calls a concrete-class method
+  // directly" convention setIdentity() above and buildSnapshot()/
+  // telemetryEnabled() below already use.
+  void setJobOwnsMotion(bool owns);
+
   // ---- Wire::Adapter: motion ----
 
   // WHEELS_V: forwards to setWheelsTimed() (velocity=(l+r)/2,
@@ -315,6 +329,13 @@ class WireAdapter : public Wire::Adapter {
  private:
   Wire::Identity identity_;
   Wire::TlmMode mode_ = Wire::TlmMode::kOff;
+
+  // Set only via setJobOwnsMotion() above -- see that method's own
+  // comment for why this class holds a plain bool rather than
+  // protocol.cpp's own three-state motionOwner_ (this class only ever
+  // needs to know "is a job in the way right now", never which of the
+  // other two states applies).
+  bool jobOwnsMotion_ = false;
 
   // ---- real clock + motion-obligation state ----
   NowMsFn nowMs_ = nullptr;

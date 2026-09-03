@@ -549,6 +549,16 @@ class MotionEngine {
     // serviceMove() call" rather than a step the engine could take itself.
     bool awaitingHandoffNeutral = false;
     float posLeft0 = 0.0f, posRight0 = 0.0f;  // [counts]
+    // Output.positionEpochLeft/Right (diffdrive.h) as of the posLeft0/
+    // posRight0 snapshot above -- lets serviceMove()/progress() tell a
+    // rebase's intentional position discontinuity (kernel.rebasePosition()
+    // is DEFERRED to the kernel's own next step(), diffdrive.cpp) apart
+    // from ordinary wheel motion, the same signal shims.cpp's odomUpdate()
+    // already uses for the Rig-level x/y/heading equivalent of this same
+    // problem. See serviceMove()'s own comment at its read site for the
+    // race this guards (a move started immediately after a successful
+    // `SET rebase 1`, sprint 028 ticket 002's own MEASURED gopiv defect).
+    uint32_t epochLeft0 = 0, epochRight0 = 0;
     float distTarget = 0.0f;  // [counts] mean-axis target (signed)
     float yawTarget = 0.0f;   // [counts] half-differential target (signed)
     float velCmd = 0.0f;      // [counts/s] full-rate velocity command
