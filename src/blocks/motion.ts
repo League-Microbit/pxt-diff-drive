@@ -166,6 +166,15 @@ namespace diffDrive {
      * while it is still running re-aims the existing loop rather than
      * stacking a second fiber.
      *
+     * This loop also owns the world sensor: it samples `read world
+     * position()` itself every few ticks while it runs. This is the
+     * ONE background fiber this block creates, so while it is live, do
+     * not also call `read world position`/`set world pose`/
+     * `calibrate world sensor` from another fiber (e.g. a `forever`
+     * loop) -- see those blocks' own doc comments in world.ts. They are
+     * live I2C bus transactions, and this loop is already the one
+     * fiber responsible for sampling the sensor.
+     *
      * UNVERIFIED on hardware (added 2026-08-29): the background fiber
      * is new. tickDrive() is documented safe against a second fiber
      * calling it (shims.cpp's check-and-set guard is atomic on CODAL's
@@ -183,7 +192,21 @@ namespace diffDrive {
         if (driveLoopRunning) return
         driveLoopRunning = true
         control.inBackground(() => {
-            while (_tickDrive());
+            // Samples the world sensor every OTOS_SAMPLE_TICKS ticks --
+            // see this function's own doc comment above. Local to this
+            // loop (not a module-level counter like test.ts's
+            // tickToCompletion() uses) because this is the only tick
+            // loop in this file, and it must reset cleanly each time
+            // the loop is (re)started.
+            const OTOS_SAMPLE_TICKS = 4
+            let otosSampleTickCount = 0
+            while (_tickDrive()) {
+                otosSampleTickCount += 1
+                if (otosSampleTickCount >= OTOS_SAMPLE_TICKS) {
+                    otosSampleTickCount = 0
+                    readWorld()
+                }
+            }
             driveLoopRunning = false
         })
     }

@@ -47,6 +47,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "../core/motion_owner.h"
 #include "wire_handler.h"
 
 namespace diffDrive {
@@ -117,19 +118,20 @@ class WireAdapter : public Wire::Adapter {
   // fiber body). Same borrowed-pointer contract as the constructor.
   void setIdentity(const Wire::Identity& identity);
 
-  // True for the whole span a dispatched RUN job owns the drivetrain,
-  // per protocol.cpp's own
-  // `motionOwner_ == kJob`. That field deliberately lives in Protocol,
-  // not here (only Protocol can see both a wire request and a
-  // dispatched job) -- this setter is the one seam Protocol uses to
-  // tell this class about it, so the six motion verb handlers below can
-  // refuse (kBusy) a wire motion arriving while a job is running instead
-  // of silently overwriting or racing its move. Plain bool, not part of
-  // Wire::Adapter's own interface -- called only from protocol.cpp's
-  // dispatchJob(), the same "protocol.cpp calls a concrete-class method
-  // directly" convention setIdentity() above and buildSnapshot()/
-  // telemetryEnabled() below already use.
-  void setJobOwnsMotion(bool owns);
+  // Mirrors Protocol's own single MotionOwner value: kNone (idle),
+  // kWire (this adapter's own live motion obligation), kJob (a
+  // dispatched RUN job), or kBlock (the block program's own fiber
+  // holding a move directly). That field deliberately lives in
+  // Protocol, not here (only Protocol can see a wire request, a
+  // dispatched job, AND a block-motion call, all three) -- this setter
+  // is the one seam Protocol uses to mirror it here, so the six motion
+  // verb handlers below can refuse (kBusy) a wire motion arriving while
+  // anything but kWire/kNone holds the drivetrain, instead of silently
+  // overwriting or racing its move. Not part of Wire::Adapter's own
+  // interface -- called only from protocol.cpp, the same "calls a
+  // concrete-class method directly" convention setIdentity() above and
+  // buildSnapshot()/telemetryEnabled() below already use.
+  void setExternalOwner(MotionOwner owner);
 
   // ---- Wire::Adapter: motion ----
 
@@ -221,7 +223,23 @@ class WireAdapter : public Wire::Adapter {
   //     established for the six motion verbs (sprint 008 ticket 001).
   // TlmMode::kNow remains the pre-existing one-shot exception (never
   // stored into mode_) -- see wire_adapter.cpp's own onTlm() comment.
+  // It now ALSO arms the one-shot flag consumeOneShotTelemetry() below
+  // reads, giving TLM NOW a real emitted frame instead of an ack that
+  // produces nothing.
   Wire::Result onTlm(Wire::TlmMode mode) override;
+
+  // TLM NOW's one-shot delivery: true (and clears the flag) exactly
+  // once for each accepted `TLM NOW #<id>`, regardless of whether a
+  // subscription is even active -- see this class's own onTlm() for
+  // where the flag is armed. Deliberately NOT a const query-then-clear
+  // pair: whichever caller sees `true` back from this one call is the
+  // one obligated to build and emit the frame, so a request can never
+  // be observed by more than one caller and served twice (or by none,
+  // if a caller only ever peeked). protocol.cpp calls this once per
+  // fiber pass, independent of the periodic emission timer, so a
+  // one-shot request is served on the very next pass rather than
+  // waiting for that timer to elapse.
+  bool consumeOneShotTelemetry();
 
   // ---- sprint 004 ticket 004: telemetry projection -- NOT part of
   // Wire::Adapter's own interface (see this file's header comment).
@@ -271,6 +289,22 @@ class WireAdapter : public Wire::Adapter {
   // see resolvePendingIfDue()'s own doc comment below for exactly which
   // calls trigger the check -- not a push notification the instant the
   // engine itself finishes. Always false with no clock wired.
+  //
+  // This method now runs that same resolution itself, first, before
+  // reading the deadline -- previously only lastDone()/lastDoneReason()
+  // (reached from replyAck()/replyNack()/STATUS) did, so a caller that
+  // never happens to poll one of those still saw a motion read "live"
+  // for the rest of its ORIGINAL declared window even though the
+  // kernel had been idle since it actually finished. protocol.cpp's
+  // fiber loop polls only this accessor every pass, so that was exactly
+  // the gap: a caller with no other reason to touch lastDone() got no
+  // self-clear at all. See motionObligationDeadlineLive() below (the
+  // private, non-resolving half of what this method used to do on its
+  // own) for why the internal resolution path reads the raw deadline
+  // directly instead of calling back into this method -- this method
+  // calls resolvePendingIfDue(), which calls resolvePendingReason(),
+  // which needs the raw deadline read too; routing that through THIS
+  // method again would recurse forever.
   bool hasLiveMotionObligation() const;
 
   // ---- sprint 005 ticket 004: a REAL motion-completion signal (closes
@@ -330,12 +364,18 @@ class WireAdapter : public Wire::Adapter {
   Wire::Identity identity_;
   Wire::TlmMode mode_ = Wire::TlmMode::kOff;
 
-  // Set only via setJobOwnsMotion() above -- see that method's own
-  // comment for why this class holds a plain bool rather than
-  // protocol.cpp's own three-state motionOwner_ (this class only ever
-  // needs to know "is a job in the way right now", never which of the
-  // other two states applies).
-  bool jobOwnsMotion_ = false;
+  // Set by onTlm() on an accepted `TLM NOW`, never by anything else;
+  // cleared by consumeOneShotTelemetry() (above), never by anything
+  // else. Deliberately independent of mode_ -- see onTlm()'s own
+  // comment for why a one-shot request must not disturb whatever
+  // subscription (or lack of one) is already persisted.
+  bool oneShotTelemetryDue_ = false;
+
+  // Set only via setExternalOwner() above -- see that method's own
+  // comment. Compared against kNone everywhere below: this class only
+  // ever needs "is something else holding the drivetrain right now",
+  // never which of kJob/kBlock it is.
+  MotionOwner externalOwner_ = MotionOwner::kNone;
 
   // ---- real clock + motion-obligation state ----
   NowMsFn now_ = nullptr;
@@ -370,12 +410,22 @@ class WireAdapter : public Wire::Adapter {
   mutable uint32_t lastDoneId_ = 0;
   mutable Wire::DoneReason lastDoneReason_ = Wire::DoneReason::kNone;
 
+  // Pure, non-resolving read of the deadline itself: true iff
+  // motionObligationActive_ is set and now_() has not yet reached
+  // motionObligationDeadline_. This is what hasLiveMotionObligation()
+  // (public, above) used to do as its entire body; it is now split out
+  // so resolvePendingReason() below can read the SAME raw check
+  // without going back through hasLiveMotionObligation() itself --
+  // that method now resolves FIRST, and resolvePendingReason() runs
+  // AS PART OF that resolution, so the two must never call each other.
+  bool motionObligationDeadlineLive() const;
+
   // Pure function of currently observable state (diagValue()'s estop/
-  // stall flags, hasLiveMotionObligation(), and -- for a goal-directed
-  // pending motion only -- engineMoveActive()); never mutates anything.
-  // Returns kNone whenever nothing is pending OR the pending motion has
-  // not yet reached a terminal state -- callers distinguish those two
-  // cases via pendingActive_ themselves.
+  // stall flags, motionObligationDeadlineLive() above, and -- for a
+  // goal-directed pending motion only -- engineMoveActive()); never
+  // mutates anything. Returns kNone whenever nothing is pending OR the
+  // pending motion has not yet reached a terminal state -- callers
+  // distinguish those two cases via pendingActive_ themselves.
   Wire::DoneReason resolvePendingReason() const;
 
   // Commits resolvePendingReason()'s result into lastDoneId_/

@@ -1,6 +1,7 @@
 // protocol.cpp -- see protocol.h.
 #include "protocol.h"
 
+#include "../core/fiber_identity.h"
 #include "../platform/vfp_guard.h"
 
 #include <cstdio>  // plain snprintf, not std::snprintf: newlib-nano's
@@ -436,10 +437,36 @@ void Protocol::dispatchJob() {
   runQueue_.release(slot);
 
   motionOwner_ = MotionOwner::kJob;
-  wireAdapter_.setJobOwnsMotion(true);
+  wireAdapter_.setExternalOwner(MotionOwner::kJob);
   runDispatch();
-  wireAdapter_.setJobOwnsMotion(false);
+  wireAdapter_.setExternalOwner(MotionOwner::kNone);
   motionOwner_ = MotionOwner::kNone;
+}
+
+bool Protocol::tryTakeBlockOwnership() {
+  if (!diffDrive::tryTakeBlockOwnership(&motionOwner_)) return false;
+  wireAdapter_.setExternalOwner(MotionOwner::kBlock);
+  return true;
+}
+
+void Protocol::releaseBlockOwnership() {
+  if (motionOwner_ != MotionOwner::kBlock) return;
+  diffDrive::releaseBlockOwnership(&motionOwner_);
+  wireAdapter_.setExternalOwner(MotionOwner::kNone);
+}
+
+// shims.cpp's own seam onto the two methods above -- same same-package
+// forward-declaration convention as registerTickServiceHook()/
+// runDispatch() (this file's own top-of-file forward declarations):
+// only Protocol can see a wire request, a dispatched job, AND a block-
+// motion call together, so a block-motion entry point reaches this
+// singleton through a plain free function rather than holding a
+// reference of its own.
+bool protocolTryTakeBlockOwnership() {
+  return protocol().tryTakeBlockOwnership();
+}
+void protocolReleaseBlockOwnership() {
+  protocol().releaseBlockOwnership();
 }
 
 void Protocol::invokeRunDispatch(const char* text) {
@@ -455,9 +482,59 @@ void Protocol::setCurrentRunText(const char* text) {
 const char* Protocol::currentRunText() const { return currentRunText_; }
 
 void Protocol::serviceHookEntry() {
-  if (protocol().motionOwner_ != MotionOwner::kJob) return;
-  protocol().serviceOnce();
+  Protocol& p = protocol();
+  if (!diffDrive::shouldServiceHookRun(p.protocolFiberId_,
+                                       p.currentFiberFn_()))
+    return;
+  p.serviceOnce();
 }
+
+// The real "current fiber" reader: currentFiber is CODAL's own global
+// scheduler pointer, reached unqualified via MicroBit.h's own
+// "using namespace codal" -- the same path microbit_friendly_name()/
+// microbit_serial_number() (buildIdentity(), above) and create_fiber()
+// (platform_ports.h) already reach their own globals through. Compared
+// only for pointer identity by shouldServiceHookRun(), never
+// dereferenced.
+const void* Protocol::defaultCurrentFiber() {
+  return static_cast<const void*>(currentFiber);
+}
+
+Protocol::CurrentFiberFn Protocol::currentFiberFn_ = &Protocol::defaultCurrentFiber;
+
+// ---- stack-canary fill: measurement scaffold, no production effect --
+//
+// Gated on the same macro nezha_port.cpp's own fault-forensics spin
+// already uses: a debug build built for a bench pyOCD session, never a
+// normal build. Painting happens exactly once, as literally the first
+// thing run() does, so the "unused below here" boundary this function
+// computes is the shallowest possible point in this fiber's own
+// lifetime -- everything from there down through stack_bottom is
+// guaranteed untouched so far, and everything from there up through
+// this call's own frame is left alone.
+//
+// A local variable's own address stands in for "the current stack
+// pointer": on this ABI it sits within a few words of the true SP,
+// comfortably above anything this very call still needs, so the fill
+// below can never overwrite a byte this function is using. currentFiber
+// is the same CODAL global defaultCurrentFiber() above already reaches
+// unqualified; its stack_bottom/stack_top bound the heap-allocated
+// region a later offline memory read can scan.
+#ifdef DIFFDRIVE_FAULT_SPIN
+void Protocol::paintStackCanary() {
+  constexpr uint8_t kFillByte = 0xA5;
+  volatile uint8_t sentinel = 0;
+  uintptr_t ceiling = reinterpret_cast<uintptr_t>(&sentinel);
+  uintptr_t low = static_cast<uintptr_t>(currentFiber->stack_bottom);
+  uintptr_t high = static_cast<uintptr_t>(currentFiber->stack_top);
+  if (ceiling < high) high = ceiling;
+  for (uintptr_t addr = low; addr < high; ++addr) {
+    *reinterpret_cast<volatile uint8_t*>(addr) = kFillByte;
+  }
+}
+#else
+void Protocol::paintStackCanary() {}
+#endif
 
 uint32_t Protocol::runDropCount() const { return runQueue_.dropped(); }
 uint32_t Protocol::emitDropCount() const { return emitQueue_.dropped(); }
@@ -643,9 +720,44 @@ void Protocol::serviceOnce() {
     }
     lastEmit_ = now;
   }
+
+  // TLM NOW's one-shot frame: independent of the periodic timer just
+  // above and of whether a subscription is even active -- see
+  // WireAdapter::consumeOneShotTelemetry()'s own comment for why a
+  // one-shot request must not wait for either. Reuses the exact same
+  // buildSnapshot()/emitTelemetry() pair the periodic block above uses,
+  // called one additional time here rather than through any new
+  // emission path, and mirrors that block's own per-transport gating
+  // exactly so a one-shot frame reaches every transport a periodic one
+  // would have.
+  if (wireAdapter_.consumeOneShotTelemetry()) {
+    const Wire::Snapshot& snapshot = wireAdapter_.buildSnapshot();
+    wireHandler_.emitTelemetry(snapshot);
+    if (radioEnabled_) {
+      wireHandlerRadio_.emitTelemetry(snapshot);
+    }
+    if (wifiEnabled_ && wifiLink_.telemetryAllowed()) {
+      wifiLink_.markTelemetry(true);
+      wireHandlerWifi_.emitTelemetry(snapshot);
+      wifiLink_.markTelemetry(false);
+    }
+  }
 }
 
 void Protocol::run() {
+  // Must come before anything else in this function: see
+  // paintStackCanary()'s own comment above for why this fiber's frame
+  // has to still be as shallow as possible at the moment it runs.
+  paintStackCanary();
+
+  // Captured once, the first (and only) time this fiber body executes
+  // -- see serviceHookEntry()'s own comment (protocol.h) for the whole
+  // reason this fiber's own identity has to be knowable at all. Same
+  // "read now that this fiber is actually executing" timing buildIdentity()
+  // below needs, for the same underlying reason: neither is safe or
+  // meaningful before this fiber has actually started.
+  protocolFiberId_ = currentFiberFn_();
+
   // Real identity, read now that this fiber is actually executing --
   // see buildIdentity()'s own comment (protocol.h) for why this is
   // deliberately NOT done at Protocol construction time. Must happen
@@ -664,8 +776,8 @@ void Protocol::run() {
 
   // Register this fiber's own servicing as tickDrive()'s service hook --
   // see serviceHookEntry()'s own comment (protocol.h) for what it does
-  // and why it is a deliberate no-op outside a dispatched job's own
-  // call span.
+  // and why it only ever runs on THIS fiber, regardless of which fiber
+  // called tickDrive().
   registerTickServiceHook(&Protocol::serviceHookEntry);
 
   while (true) {

@@ -104,25 +104,28 @@ class EncoderGlitchArmor {
   // primed with (see markPrimed()/seedLastGoodRaw() below -- before
   // priming, every reading is accepted unconditionally, matching the
   // pre-extraction behavior of an un-begun port).
+  //
+  // Explicit raw-zero rejection: a destroyed sample (an interposed I2C
+  // transaction landing inside this counter's own select-to-read settle
+  // window) reads back as an exact raw 0. Magnitude alone cannot catch
+  // that while lastGoodRaw_ is itself still small -- early after a
+  // fresh baseline, |0 - lastGoodRaw_| sits comfortably inside
+  // kMaxDeltaCounts and would otherwise fall straight through to
+  // kAccept below, integrating the destroyed sample as real motion (a
+  // jump toward zero, then back, the next time a genuine reading
+  // arrives). Treat any exact 0 as suspect the moment the counter has
+  // ever produced a nonzero good reading, regardless of magnitude --
+  // routed through the SAME two-strike disambiguation the magnitude
+  // check below uses (handleImplausible()), so a counter that has
+  // genuinely restarted -- one implausible reading followed by a
+  // second consistent with it, zero or otherwise -- still reaches
+  // kAcceptAsRebaseline; only a lone, unconfirmed zero is held pending.
   Decision evaluate(int32_t raw) {
     if (primed_) {
+      if (raw == 0 && lastGoodRaw_ != 0) return handleImplausible(raw);
       const int32_t delta = raw - lastGoodRaw_;
       const int32_t mag = delta < 0 ? -delta : delta;
-      if (mag > kMaxDeltaCounts) {
-        const int32_t rejDelta = raw - lastRejectedRaw_;
-        const int32_t rejMag = rejDelta < 0 ? -rejDelta : rejDelta;
-        if (rejectPending_ && rejMag <= kMaxDeltaCounts) {
-          // Second consecutive self-consistent implausible reading: the
-          // counter restarted, not the wheel. Caller re-anchors instead
-          // of integrating this as motion.
-          rejectPending_ = false;
-          lastGoodRaw_ = raw;
-          return Decision::kAcceptAsRebaseline;
-        }
-        lastRejectedRaw_ = raw;
-        rejectPending_ = true;
-        return Decision::kRejectPending;
-      }
+      if (mag > kMaxDeltaCounts) return handleImplausible(raw);
     }
     rejectPending_ = false;
     lastGoodRaw_ = raw;
@@ -148,6 +151,26 @@ class EncoderGlitchArmor {
   void markPrimed() { primed_ = true; }
 
  private:
+  // The shared two-strike disambiguation: an implausible reading (raw-
+  // zero or over-magnitude, evaluate() has already decided which) is
+  // held on its first appearance; a SECOND reading self-consistent with
+  // the first rejected one (within kMaxDeltaCounts of it) reclassifies
+  // both as a counter restart instead of integrated motion. One holder
+  // of this logic means the zero check and the magnitude check can
+  // never drift apart on what counts as "consistent".
+  Decision handleImplausible(int32_t raw) {
+    const int32_t rejDelta = raw - lastRejectedRaw_;
+    const int32_t rejMag = rejDelta < 0 ? -rejDelta : rejDelta;
+    if (rejectPending_ && rejMag <= kMaxDeltaCounts) {
+      rejectPending_ = false;
+      lastGoodRaw_ = raw;
+      return Decision::kAcceptAsRebaseline;
+    }
+    lastRejectedRaw_ = raw;
+    rejectPending_ = true;
+    return Decision::kRejectPending;
+  }
+
   int32_t lastGoodRaw_ = 0;
   int32_t lastRejectedRaw_ = 0;
   bool rejectPending_ = false;

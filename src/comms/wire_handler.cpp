@@ -1444,10 +1444,15 @@ void WireHandler::execRun(char** fields, size_t fieldCount, uint32_t id,
   const char* argv[kMaxRunArgs];
   for (size_t i = 0; i < argc; ++i) argv[i] = fields[1 + i];
 
-  char result[kMaxRunResultBytes] = {};
+  // runResult_ is a member (wire_handler.h's own doc comment on it) --
+  // cleared explicitly here so a future onRun() override that sets
+  // hasResult without null-terminating can never leak text left behind
+  // by a PREVIOUS call, the same guarantee a freshly-initialized stack
+  // local gave every call before this.
+  std::memset(runResult_, 0, sizeof(runResult_));
   bool hasResult = false;
-  Result outcome =
-      adapter_.onRun(name, argv, argc, result, sizeof(result), hasResult);
+  Result outcome = adapter_.onRun(name, argv, argc, runResult_,
+                                   sizeof(runResult_), hasResult);
 
   errCode = resultCode(outcome);
   if (outcome != Result::kOk) return;
@@ -1460,7 +1465,7 @@ void WireHandler::execRun(char** fields, size_t fieldCount, uint32_t id,
   // plus "ret "/" #<id>"/'\n' fits kMaxLineBytes, and sanitizing can
   // only shrink it further, never risk overflow.
   char sanitized[kMaxRunResultBytes];
-  sanitizeLineText(result, sanitized, sizeof(sanitized));
+  sanitizeLineText(runResult_, sanitized, sizeof(sanitized));
 
   // +1: kMaxLineBytes already counts the WIRE content up to and
   // including '\n', but snprintf() also needs room for its own NUL

@@ -792,6 +792,15 @@ class WireHandler {
   // formatting buffer onto it would be a correctness landmine for a
   // future edit, not a real memory saving.
   char emitBuf_[kMaxLineBytes] = {};
+
+  // RUN's own reply-body scratch, same emitBuf_ reasoning applied to
+  // execRun(): a member instead of a stack local so this array's
+  // storage never adds to that function's own frame at all, regardless
+  // of where in the function body it would otherwise be declared.
+  // argv[] stays a plain local in execRun() -- it is genuinely needed
+  // as the adapter call's own argument, before any early-return point
+  // exists ahead of it.
+  char runResult_[kMaxRunResultBytes] = {};
 };
 
 }  // namespace Wire

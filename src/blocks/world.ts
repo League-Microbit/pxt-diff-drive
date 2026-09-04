@@ -37,6 +37,12 @@ namespace diffDrive {
      * Declare where the robot is right now, in world coordinates.
      * Sets BOTH pose sources -- the world sensor and the wheel
      * odometry -- so they start agreed.
+     *
+     * This is a LIVE I2C bus transaction (writes the world sensor's
+     * pose registers) -- call it from the same fiber that is ticking
+     * the drive loop (driveTick()/move()/goTo()/startDrive()'s own
+     * loop), never concurrently with one. See this file's own header
+     * comment.
      * @param x world x, eg: 0
      * @param y world y, eg: 0
      * @param heading world heading in degrees CCW, eg: 0
@@ -53,6 +59,14 @@ namespace diffDrive {
     /**
      * Take a fresh fix from the world sensor. Returns false if the
      * sensor did not answer; the last good values are kept.
+     *
+     * This is a LIVE I2C bus transaction -- call it from the same
+     * fiber that is ticking the drive loop
+     * (driveTick()/move()/goTo()/startDrive()'s own loop), never
+     * concurrently with one: startDrive()'s background loop already
+     * samples this itself (its own doc comment, motion.ts), so do not
+     * also call this from a separate `forever` loop while that drive
+     * is running. See this file's own header comment.
      */
     //% block="read world position"
     //% group="World" weight=150
@@ -94,6 +108,13 @@ namespace diffDrive {
     /**
      * Recalibrate the sensor's gyro bias. The robot must be parked and
      * completely still for about a second.
+     *
+     * This is a LIVE I2C bus transaction -- call it from the same
+     * fiber that is ticking the drive loop, never concurrently with
+     * one (and only while the robot is genuinely idle -- see this
+     * file's own header comment). It does not itself tick the drive
+     * loop, so calling it mid-move would collide with whichever fiber
+     * IS ticking.
      */
     //% block="calibrate world sensor"
     //% group="World" weight=200
