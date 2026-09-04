@@ -656,7 +656,7 @@ class WireHandler {
   // (ack + err), not a decode failure (nack) -- the line itself parses
   // fine; only its meaning is out of range, same class as the
   // cruise/speed <0/==0 handling WireAdapter::onWheelsX() et al. already
-  // do. See wire_handler.cpp's kMaxMotionTimeoutMs/clampMotionTimeout()
+  // do. See wire_handler.cpp's kMaxMotionTimeout/clampMotionTimeout()
   // for the full rationale. ----
   bool decodeWheelsX(char** fields, size_t fieldCount);
   void execWheelsX(char** fields, size_t fieldCount, uint32_t id,

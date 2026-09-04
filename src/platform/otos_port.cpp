@@ -10,7 +10,7 @@
 
 namespace diffDrive {
 
-void OtosPort::busGap() { vfpSafeSleep(kBusClearanceMs); }
+void OtosPort::busGap() { vfpSafeSleep(kBusClearance); }
 
 namespace {
 // codal-microbit-v2 (V2) I2C takes uint8_t*; classic DAL (V1) takes

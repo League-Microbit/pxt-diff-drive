@@ -124,7 +124,7 @@ constexpr uint16_t kWifiHostPort = 7655;
 // How often the `DBG:wifi` line repeats while the link is NOT ready, on
 // top of the one-per-state-change emission -- a bench operator watching
 // USB during a slow join (6-170 s, measured) should see it still alive.
-constexpr uint32_t kWifiDebugPeriodMs = 10000;
+constexpr uint32_t kWifiDebugPeriod = 10000;  // [ms]
 
 // The old-style cleartext RUN carve-out (see protocol.h's own top-of-file
 // comment): detected directly by its literal prefix now that the v5
@@ -138,8 +138,8 @@ constexpr size_t kOldRunPrefixLen = 4;
 // deleted, S8.5): small enough that a command arriving just after one
 // poll is still picked up promptly; not so small it spins this fiber
 // against an idle UART between bytes.
-constexpr uint32_t kTelemetryEmitPeriodMs = 50;
-constexpr uint32_t kPollIntervalMs = 5;
+constexpr uint32_t kTelemetryEmitPeriod = 50;  // [ms]
+constexpr uint32_t kPollInterval = 5;  // [ms]
 
 // Bypass names for handleRun() below: these two skip runQueue_ entirely
 // and dispatch immediately, regardless of what else is running -- see
@@ -307,17 +307,17 @@ void Protocol::serviceWifi() {
     config.port = kWifiPort;
     config.hostPort = kWifiHostPort;
     wifiLink_.begin(config);
-    lastWifiDbgMs_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+    lastWifiDbg_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
     emitWifiDebug();
   }
 
   wifiLink_.service();
 
-  const uint32_t nowMs = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+  const uint32_t now = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
   if (wifiLink_.pollStateChanged() ||
       (!wifiLink_.ready() &&
-       static_cast<int32_t>(nowMs - (lastWifiDbgMs_ + kWifiDebugPeriodMs)) >= 0)) {
-    lastWifiDbgMs_ = nowMs;
+       static_cast<int32_t>(now - (lastWifiDbg_ + kWifiDebugPeriod)) >= 0)) {
+    lastWifiDbg_ = now;
     emitWifiDebug();
   }
 
@@ -385,14 +385,14 @@ void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
   // are different text, so they are not each other's repeats. A
   // deliberate re-run of the same command just needs to be spaced past
   // the window.
-  const uint32_t nowMs = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+  const uint32_t now = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
   if (std::strcmp(lastRunText_, text) == 0 &&
-      static_cast<int32_t>(nowMs - lastRunMs_) < kRunDedupeMs) {
-    lastRunMs_ = nowMs;   // extend across a burst of repeats
+      static_cast<int32_t>(now - lastRun_) < kRunDedupe) {
+    lastRun_ = now;   // extend across a burst of repeats
     return;
   }
   std::memcpy(lastRunText_, text, dataLen + 1);
-  lastRunMs_ = nowMs;
+  lastRun_ = now;
 
   // Abort/clearestop bypass runQueue_ entirely and dispatch RIGHT NOW,
   // on whatever fiber called handleRun() -- run()'s own loop normally,
@@ -480,7 +480,7 @@ Wire::Identity Protocol::buildIdentity() {
   return identity;
 }
 
-uint32_t Protocol::wireNowMs() {
+uint32_t Protocol::wireNow() {  // [ms]
   // Reuses this Protocol instance's own clock_ (unchanged member, still
   // backing handleRun()'s dedupe timing too) via the protocol()
   // singleton accessor -- the only way a plain, non-capturing function
@@ -617,9 +617,9 @@ void Protocol::serviceOnce() {
   // NOT "restore" a periodic, rate-limited, gap-gated, or
   // telemetry-carried re-emission here -- that would reintroduce a
   // free-running beacon this design deliberately has none of.
-  const uint32_t nowMs = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
-  if (static_cast<int32_t>(nowMs - lastEmitMs_) >=
-      static_cast<int32_t>(kTelemetryEmitPeriodMs)) {
+  const uint32_t now = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
+  if (static_cast<int32_t>(now - lastEmit_) >=
+      static_cast<int32_t>(kTelemetryEmitPeriod)) {
     if (wireAdapter_.telemetryEnabled()) {
       const Wire::Snapshot& snapshot = wireAdapter_.buildSnapshot();
       wireHandler_.emitTelemetry(snapshot);
@@ -641,7 +641,7 @@ void Protocol::serviceOnce() {
         wifiLink_.markTelemetry(false);
       }
     }
-    lastEmitMs_ = nowMs;
+    lastEmit_ = now;
   }
 }
 
@@ -660,7 +660,7 @@ void Protocol::run() {
   // wireHandler_'s own dispatch.
   wireHandler_.sendBanner();
 
-  lastEmitMs_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+  lastEmit_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
 
   // Register this fiber's own servicing as tickDrive()'s service hook --
   // see serviceHookEntry()'s own comment (protocol.h) for what it does
@@ -698,7 +698,7 @@ void Protocol::run() {
       // wheel speed -- and the dereference took a precise bus error.
       // Every yield in this extension must go through the guarded
       // wrapper; see the yield-discipline invariant in the design notes.
-      vfpSafeSleep(kPollIntervalMs);
+      vfpSafeSleep(kPollInterval);
     }
   }
 }

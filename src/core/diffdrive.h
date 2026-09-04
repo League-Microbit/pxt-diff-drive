@@ -200,10 +200,44 @@ class DifferentialDrive {
   void emergencyStopMotors();
   void clearStallLatch();
   void rebasePosition();
+  // K4 (sprint 029 ticket 001, design §4.5): deferred request, same
+  // shape as rebasePosition() -- disarms posRefLeft_/Right_ and
+  // twistRef_ at the START of the next step(), before controlStep()
+  // runs, so that SAME step() re-anchors all three references at the
+  // new origin instead of carrying a stale one across a segment
+  // boundary. Unlike rebasePosition() this does NOT touch the wheel
+  // samples or bump epoch_ -- it only clears the "armed" latches that
+  // control re-anchoring, exactly what a caller wants when the
+  // COMMAND is changing (e.g. a pivot-to-straight handoff) but the
+  // measured position itself is still valid.
+  void rearmReferences();
 
   Output output() const;
 
   void step();
+
+  // ---- Diagnostic accessors (sprint 029 ticket 001; host-test support
+  // for K1/K3/K4) -- read-only windows into the reference integrators
+  // those patches govern. Not part of the control law, not written by
+  // any production caller, and safe to call at any time (return 0 /
+  // false before the kernel has ever armed the corresponding
+  // reference). Added because a host test verifying the post-floor
+  // twist integration or the anti-windup clamp has no other way to see
+  // these private integrators without re-deriving them from duty
+  // output, which is indirect and fragile for an exact-value assertion.
+  float twistReferenceCounts() const { return twistRef_.reference; }  // [counts]
+  bool twistReferenceArmed() const { return twistRef_.armed; }
+  float positionReferenceCounts(bool leftWheel) const {  // [counts]
+    return (leftWheel ? posRefLeft_ : posRefRight_).reference;
+  }
+  // K1, corrected (sprint 029 ticket 010, design §4.5): the scale
+  // applySpeedFloor() applied on the MOST RECENT controlStep() call
+  // (1.0 when the floor did not bind). Exposed so a host test can
+  // reconstruct twistRef_'s expected increment (scaledTwist *
+  // floorScale * dt) independently, without re-deriving floorScale
+  // from observed duty -- which would be indirect and, once trim is
+  // folded into duty, no longer equal to floorScale at all.
+  float lastFloorScale() const { return lastFloorScale_; }  // [1]
 
  private:
   struct Command {
@@ -258,12 +292,13 @@ class DifferentialDrive {
                          float bias) const;
   float fastPid(float posError, float err, float aCmd) const;  // [counts] [counts/s] [counts/s^2]
   float positionError(float speed, const WheelSample& wheel, PositionRef& ref,
-                      float dt);  // [counts/s] [s] -> [counts]
+                      float dt,
+                      bool advanced);  // [counts/s] [s] bool -> [counts]
   void adaptBias(float& bias, float err, float aCmd, float vCmdMagnitude,
                  bool fresh, float dt) const;
   float crawlDuty(float duty, float& carry) const;
   void applySpeedFloor(float rawLeft, float rawRight, float& speedLeft,
-                       float& speedRight) const;
+                       float& speedRight, float& floorScale) const;  // [1]
   void updateLatch(bool conditionNow, float window, uint32_t now,
                    uint32_t& since, bool& latched) const;  // [ms]
 
@@ -286,8 +321,10 @@ class DifferentialDrive {
 
   volatile uint32_t clearStallReq_ = 0;
   volatile uint32_t rebaseReq_ = 0;
+  volatile uint32_t rearmReq_ = 0;   // K4: rearmReferences()'s own counter
   uint32_t seenClearStallReq_ = 0;
   uint32_t seenRebaseReq_ = 0;
+  uint32_t seenRearmReq_ = 0;
 
   Status lastError_ = Status::kOk;
   void noteRefusal(Status status) {
@@ -303,6 +340,15 @@ class DifferentialDrive {
 
   WheelSample sampleLeft_;
   WheelSample sampleRight_;
+  // K2 (design §4.5): did the PREVIOUS step()'s own collect actually
+  // advance this wheel's cached sample -- set at the end of step()
+  // from the same stampBefore/After comparison i2cFaultCount_ already
+  // makes, and consumed at the TOP of the NEXT step()'s controlStep()
+  // call (the earliest point that step's own positionError() can see
+  // it). Defaults true so the very first step() -- before any collect
+  // has run -- behaves like an ordinary fresh tick, not a frozen one.
+  bool sampleAdvancedLeft_ = true;
+  bool sampleAdvancedRight_ = true;
 
   PositionRef posRefLeft_;
   PositionRef posRefRight_;
@@ -321,6 +367,7 @@ class DifferentialDrive {
   float biasRight_ = 0.0f;         // [counts/s]
   float lastSpeedLeft_ = 0.0f;     // [counts/s] Stage A direction-of-change memory
   float lastSpeedRight_ = 0.0f;    // [counts/s]
+  float lastFloorScale_ = 1.0f;    // [1] applySpeedFloor()'s most recent scale
   float lastPidLeft_ = 0.0f;       // [counts/s]
   float lastPidRight_ = 0.0f;      // [counts/s]
   float crawlCarryLeft_ = 0.0f;    // Bresenham accumulators

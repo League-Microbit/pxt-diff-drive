@@ -108,7 +108,7 @@ class OtosPort : public PoseSource {
   static constexpr float kVelocityPerLsb = 5000.0f / 32768.0f;  // [mm/s/LSB]
   static constexpr float kOmegaPerLsb = 34.9f / 32768.0f;       // [rad/s/LSB]
 
-  static constexpr int kBusClearanceMs = 4;  // [ms] between transactions
+  static constexpr int kBusClearance = 4;  // [ms] between transactions
 
   void busGap();  // fiber-sleep the shared-bus clearance
   bool writeReg8(uint8_t reg, uint8_t val);

@@ -11,8 +11,8 @@
 //     kernel's velocity interface. The TypeScript layer polls
 //     updateMove() -- blocking and loop-style forms are both built on
 //     that poll. Both updateMove() and the tick engine below share one
-//     implementation, serviceMove().
-//   - TICK ENGINE: tickDrive() runs one kernel.step() + serviceMove()
+//     implementation, service().
+//   - TICK ENGINE: tickDrive() runs one kernel.step() + service()
 //     on the CALLER's own fiber, then self-paces to the next 24 ms
 //     deadline. The kernel's own background fiber pacer
 //     (start()/run()/fiberEntry()) is deliberately left unwired -- see
@@ -128,11 +128,11 @@ struct Rig {
   // tick engine (sprint 002): caller-driven stepping replaces the
   // kernel's own now-unwired fiber pacer -- see ensure(), tickDrive(),
   // and the starvation watchdog section below.
-  uint64_t lastTickUs = 0;       // [us] clock.nowMicros() at the start
+  uint64_t lastTick = 0;       // [us] clock.nowMicros() at the start
                                   // of the most recent tickDrive() call
                                   // -- the watchdog's only freshness
                                   // signal. 0 = no tick has run yet.
-  uint64_t tickDeadlineUs = 0;   // [us] tickDrive()'s own absolute-
+  uint64_t tickDeadline = 0;   // [us] tickDrive()'s own absolute-
                                   // deadline pacing anchor. 0 = no tick
                                   // has run yet -- re-anchor to now.
   bool stepBusy = false;         // concurrency guard around
@@ -162,7 +162,7 @@ struct Rig {
   // are two unrelated meanings of zero that used to be collapsed onto
   // one field: the wire layer's sentinel (this) vs. the kernel's own
   // "0 = uncalibrated, refuse VELOCITY" gate
-  // (DifferentialDrive::checkCommandable()). See engineDefaultCruiseMmS()
+  // (DifferentialDrive::checkCommandable()). See engineDefaultCruise()
   // below, the wire-layer section, for the consumer. Seeded to 150.0f
   // -- NOT derived from any kernel constant, and NOT the duty ceiling --
   // chosen AT IMPLEMENTATION TIME to numerically match the block
@@ -179,7 +179,7 @@ struct Rig {
   // future change that wants a real coupling would need the TS layer
   // to read this field back over the wire before choosing its own
   // default, not a comment asserting they match.
-  float defaultCruiseMmS_ = 150.0f;  // [mm/s]
+  float defaultCruise_ = 150.0f;  // [mm/s]
 
   // Sprint 015 ticket 006 (build checkpoint): one-shot handoff from
   // engineSetGoToDeadline() to engineGoToRArmed() (both below), the
@@ -197,7 +197,7 @@ struct Rig {
   // (sim.ts's _setGoToDeadline()/_goToR() pair, called back-to-back by
   // motion.ts's startGoTo()) so there is nowhere for a stale value to
   // leak in from.
-  uint32_t pendingGoToDeadlineMs_ = 0;  // [ms]
+  uint32_t pendingGoToDeadline_ = 0;  // [ms]
 };
 
 static Rig* rig = nullptr;
@@ -214,18 +214,18 @@ static Rig& ensure() {
     cfg.ki = 6.0f;                   // [1/s]
     cfg.iMax = 765.6f;               // [counts/s]
     cfg.pidMax = 1276.0f;            // [counts/s]
-    // 70 mm/s (2026-08-29), was 20 mm/s (255.2f), a bare-motor figure.
-    // With the floor under breakaway, MOVE_X's end taper let the
-    // position I-term brake the wheel to a near-stop 6-11 mm short and
-    // the 25%-of-cruise crawl feedforward (3-5% duty) could not restart
-    // it, so every leg ended with a stiction jump. MEASURED tovez
-    // 2026-08-29 wheels-up, captures/tovez-taper-20260829/variants.json
-    // (SET speed_floor 893: 0 stalls at 100/150/200 mm/s, legs within
-    // +-1.4 mm; baseline.json: 6-9 mm stalls) and gopiv 2026-08-29,
-    // captures/gopiv-floor70-20260829/ (this default in source: 0/6
-    // restart bumps vs 6/6 stock, legs end ~0.2 s sooner). UNVERIFIED
-    // loaded/on the floor and on vevov; 100 mm/s overshot 2-4 mm.
-    cfg.vMin = 893.2f;               // [counts/s] = 70 mm/s at 12.76 c/mm
+    // K5 (this ticket, design motion-profile-unification.md
+    // S4.5): the floor now lives in MotionLimits::vFloor (motion_limits.h,
+    // default 70 mm/s -- the same MEASURED tovez/gopiv 2026-08-29 value
+    // this field used to carry, see that field's own comment for the
+    // full history: captures/tovez-taper-20260829/variants.json,
+    // captures/gopiv-floor70-20260829/). A kernel floor under an
+    // already-shaped profile is exactly the double-decision this design
+    // removes (S3: "the ratio-preserving speed floor moves from the
+    // kernel to the profiler") -- applySpeedFloor() (diffdrive.cpp)
+    // stays in the vendored kernel for upstream firmware that still
+    // wants it, but is inert here with vMin pinned at 0.
+    cfg.vMin = 0.0f;                 // [counts/s]
     cfg.posErrMax = 127.6f;          // [counts]
     cfg.biasMax = 303.7f;            // [counts/s]
     cfg.tauAdapt = 30.0f;            // [s]
@@ -350,10 +350,10 @@ void setWheels(int left, int right) {  // [mm/s] [mm/s]
 //%
 void driveTwist(int speed, int yawRate) {  // [mm/s] [cdeg/s]
   Rig& r = ensure();
-  const float yawRad = static_cast<float>(yawRate) * kCdegToRad;
-  const float twistMmS = yawRad * 0.5f * r.engine.effectiveTrackWidth();
-  const float speedMmS = static_cast<float>(speed);
-  r.engine.wheelsV(speedMmS - twistMmS, speedMmS + twistMmS,
+  const float yaw = static_cast<float>(yawRate) * kCdegToRad;  // [rad]
+  const float twist = yaw * 0.5f * r.engine.effectiveTrackWidth();  // [mm/s]
+  const float vx = static_cast<float>(speed);  // [mm/s]
+  r.engine.wheelsV(vx - twist, vx + twist,
                    DiffDrive::DifferentialDrive::kLeaseMax);
 }
 
@@ -366,21 +366,21 @@ void driveTwist(int speed, int yawRate) {  // [mm/s] [cdeg/s]
 // `//%`-annotated: not block-facing (protocol.cpp is their only caller,
 // via same-package forward declarations).
 void setWheelsTimed(int left, int right,
-                    uint32_t durationMs) {  // [mm/s] [mm/s] [ms]
+                    uint32_t duration) {  // [mm/s] [mm/s] [ms]
   Rig& r = ensure();
   // WHEELS supersedes any in-flight move-engine move -- wheelsV() itself
   // clears it (motion-api.md S6, motion_engine.h).
   r.engine.wheelsV(static_cast<float>(left), static_cast<float>(right),
-                   durationMs);
+                   duration);
 }
 
 void driveTwistTimed(int speed, int yawRate,
-                     uint32_t durationMs) {  // [mm/s] [cdeg/s] [ms]
+                     uint32_t duration) {  // [mm/s] [cdeg/s] [ms]
   Rig& r = ensure();
-  const float yawRad = static_cast<float>(yawRate) * kCdegToRad;
-  const float twistMmS = yawRad * 0.5f * r.engine.effectiveTrackWidth();
-  const float speedMmS = static_cast<float>(speed);
-  r.engine.wheelsV(speedMmS - twistMmS, speedMmS + twistMmS, durationMs);
+  const float yaw = static_cast<float>(yawRate) * kCdegToRad;  // [rad]
+  const float twist = yaw * 0.5f * r.engine.effectiveTrackWidth();  // [mm/s]
+  const float vx = static_cast<float>(speed);  // [mm/s]
+  r.engine.wheelsV(vx - twist, vx + twist, duration);
 }
 
 // ---- wire motion-engine primitives (WireAdapter's WHEELS_X/MOVE_X
@@ -389,23 +389,23 @@ void driveTwistTimed(int speed, int yawRate,
 // driveTwistTimed() above -- WireAdapter has no reference of its own to
 // this Rig's `engine`, so it forwards through these thin, wire-shaped
 // calls instead. Wire-shaped units throughout (mm, mm/s, ms);
-// `rotationRad` arrives at engineMoveX() ALREADY converted from the
+// `rotation` arrives at engineMoveX() ALREADY converted from the
 // wire's milliradian integer (wire_adapter.cpp's mradToRad()). `cruise`
 // <= 0 here is MotionEngine's own existing no-op -- the wire's "0 means
-// the configured default" substitution (engineDefaultCruiseMmS() below)
+// the configured default" substitution (engineDefaultCruise() below)
 // is resolved BEFORE calling these; neither of these two ever sees the
 // sentinel itself. Deliberately NOT `//%`-annotated: the block API's
 // own startMove() already has a call shape of its own.
 void engineWheelsX(float left, float right, float cruise,
-                   uint32_t timeoutMs) {  // [mm] [mm] [mm/s] [ms]
+                   uint32_t timeout) {  // [mm] [mm] [mm/s] [ms]
   Rig& r = ensure();
-  r.engine.wheelsX(left, right, cruise, timeoutMs);
+  r.engine.wheelsX(left, right, cruise, timeout);
 }
 
-void engineMoveX(float distance, float rotationRad, float cruise,
-                 uint32_t timeoutMs) {  // [mm] [rad] [mm/s] [ms]
+void engineMoveX(float distance, float rotation, float cruise,
+                 uint32_t timeout) {  // [mm] [rad] [mm/s] [ms]
   Rig& r = ensure();
-  r.engine.moveX(distance, rotationRad, cruise, timeoutMs);
+  r.engine.moveX(distance, rotation, cruise, timeout);
 }
 
 // The wire's "cruise == 0 means the configured default" substitution
@@ -420,45 +420,61 @@ void engineMoveX(float distance, float rotationRad, float cruise,
 // "uncalibrated, refuse VELOCITY commands entirely"
 // (DifferentialDrive::checkCommandable()) -- an unrelated meaning of
 // zero that happened to share a variable with this substitution. Now
-// returns the Rig's own, independently configured defaultCruiseMmS_
+// returns the Rig's own, independently configured defaultCruise_
 // (seeded 150 mm/s above, settable/gettable via the `default_cruise`
 // wire field, ordinal 15 -- setKernelValue()/getConfigValue() below).
 // fullDutyVelocity remains the duty CEILING elsewhere in this file and
-// the kernel; it is no longer read here. Returns 0 if defaultCruiseMmS_
+// the kernel; it is no longer read here. Returns 0 if defaultCruise_
 // itself is non-positive (an operator can still force "no default
 // available" via `SET default_cruise 0`) -- wire_adapter.cpp's four
 // verb handlers already treat that as a range refusal, not a
 // silently-accepted zero-speed command; that refusal logic is
 // unchanged by this ticket.
-float engineDefaultCruiseMmS() {
-  return ensure().defaultCruiseMmS_;
+float engineDefaultCruise() {  // [mm/s]
+  return ensure().defaultCruise_;
 }
 
 // SUC-003: same same-package forward-declaration convention as
-// engineDefaultCruiseMmS() immediately above -- WireAdapter has no
-// reference of its own to this Rig's `engine`. engineADecelMmS2() lets
+// engineDefaultCruise() immediately above -- WireAdapter has no
+// reference of its own to this Rig's `engine`. engineADecel() lets
 // the wire layer decide, per call, whether a `cruise == 0` sentinel
 // should resolve from the flat legacy default above or from the
-// call's own leg distance below; engineDefaultCruiseForDistanceMmS()
+// call's own leg distance below; engineDefaultCruiseForDistance()
 // is that distance-aware resolve itself, forwarding straight onto
 // MotionEngine::defaultCruiseForDistance() (motion_engine.h). Neither
 // is read by engineWheelsX()'s own wire path -- WHEELS_X/WHEELS_V keep
 // the flat sentinel unconditionally.
-float engineADecelMmS2() {
-  return ensure().engine.aDecelMmS2();
+//
+// this ticket: this used to read MotionEngine::aDecelMmS2(),
+// which selected "legacy mode" at its compiled-in 0.0 default (no
+// shaping configured yet). That field is deleted -- MotionLimits::decel
+// defaults to 400 and can never be set back to 0 (design S8: accel/
+// decel are "now always active, no legacy mode") -- so this now reads
+// limits().decel directly, which is always positive. The wire-layer
+// consequence: onMoveX()'s own `engineADecel() > 0.0f ? ... :
+// ...` selector (wire_adapter.cpp) now ALWAYS takes the distance-aware
+// branch; a MOVE_X `cruise == 0` no longer ever resolves through the
+// flat `default_cruise` field. This is a genuine, ticket-3-forced
+// behavior change (not a choice made here) -- see this ticket's own
+// report for the affected tests (test_wire_motion_verbs.py's SUC-003
+// section) and why the flat-default wire surface itself is out of this
+// ticket's scope (ticket 004 owns the descriptor table).
+float engineADecel() {  // [mm/s^2]
+  return ensure().engine.limits().decel;
 }
 
-float engineDefaultCruiseForDistanceMmS(float distanceMm) {
-  return ensure().engine.defaultCruiseForDistance(distanceMm);
+float engineDefaultCruiseForDistance(float distance) {  // [mm] -> [mm/s]
+  return ensure().engine.defaultCruiseForDistance(distance);
 }
 
 // SUC-003: MOVE_X's own D input for the resolver above -- a pure pivot
 // (distance == 0) still has a real wheel-travel distance, so onMoveX()
 // (wire_adapter.cpp) reaches this instead of taking |distance| alone.
-// Forwards onto MotionEngine::dominantAxisTravelMm() (motion_engine.h),
-// the same `dominant` quantity startSegment() itself reduces to.
-float engineDominantAxisTravelMm(float distanceMm, float rotationRad) {
-  return ensure().engine.dominantAxisTravelMm(distanceMm, rotationRad);
+// Forwards onto MotionEngine::dominantAxisTravel() (motion_engine.h,
+// renamed from dominantAxisTravelMm() -- no-units-in-identifiers.md),
+// the same `dominant` quantity beginSegment() itself reduces to.
+float engineDominantAxisTravel(float distance, float rotation) {  // [mm] [rad] -> [mm]
+  return ensure().engine.dominantAxisTravel(distance, rotation);
 }
 
 // Sprint 005 ticket 004 (closing wire-motion-completion-signal.md/R-23):
@@ -487,8 +503,8 @@ void startMove(int distance, int yaw, int speed, int yawRate) {
   // [mm] [cdeg] [mm/s] [cdeg/s]
   Rig& r = ensure();
   odomUpdate(r);
-  const float distanceMm = static_cast<float>(distance);
-  const float rotationRad = static_cast<float>(yaw) * kCdegToRad;
+  const float distanceF = static_cast<float>(distance);  // [mm]
+  const float rotation = static_cast<float>(yaw) * kCdegToRad;  // [rad]
 
   // This shim predates MotionEngine::moveX()'s single-`cruise` wire-
   // shaped signature (motion-api.md S2: move_x(distance,rot) ==
@@ -510,35 +526,35 @@ void startMove(int distance, int yaw, int speed, int yawRate) {
   // the degenerate straight/pivot cases.
   const float cpm = r.engine.countsPerMm();
   const float b = r.engine.effectiveTrackWidth();
-  const float distTargetCounts = distanceMm * cpm;              // [counts]
-  const float yawTargetCounts = rotationRad * 0.5f * b * cpm;   // [counts]
-  const float speedCounts =
+  const float distTarget = distanceF * cpm;              // [counts]
+  const float yawTarget = rotation * 0.5f * b * cpm;   // [counts]
+  const float distSpeed =
       static_cast<float>(speed > 0 ? speed : 1) * cpm;    // [counts/s]
   const float yawRadPerS =
       static_cast<float>(yawRate > 0 ? yawRate : 1) * kCdegToRad;
-  const float twistCounts = yawRadPerS * 0.5f * b * cpm;  // [counts/s]
+  const float twistSpeed = yawRadPerS * 0.5f * b * cpm;  // [counts/s]
 
   // One duration covers both axes -> simultaneous arc completion. This
-  // max()-based `duration` is also what derives `cruiseMmS` below
+  // max()-based `duration` is also what derives `cruise` below
   // (unaffected by the split-aware budget fix further down) -- it is
   // the legacy dual-rate reconciliation the header comment above
   // describes, correct regardless of whether moveX() ends up splitting.
   float distDuration = 0.0f;  // [s]
-  if (distTargetCounts != 0.0f)
-    distDuration = std::fabs(distTargetCounts) / speedCounts;
+  if (distTarget != 0.0f)
+    distDuration = std::fabs(distTarget) / distSpeed;
   float yawDuration = 0.0f;  // [s]
-  if (yawTargetCounts != 0.0f)
-    yawDuration = std::fabs(yawTargetCounts) / twistCounts;
+  if (yawTarget != 0.0f)
+    yawDuration = std::fabs(yawTarget) / twistSpeed;
   const float duration = distDuration > yawDuration ? distDuration
                                                       : yawDuration;
   if (duration <= 0.0f) return;  // nothing to do
 
-  const float leftCounts = distTargetCounts - yawTargetCounts;
-  const float rightCounts = distTargetCounts + yawTargetCounts;
-  const float absLeft = std::fabs(leftCounts);
-  const float absRight = std::fabs(rightCounts);
-  const float dominantCounts = absLeft > absRight ? absLeft : absRight;
-  const float cruiseMmS = (dominantCounts / duration) / cpm;  // [mm/s]
+  const float left = distTarget - yawTarget;
+  const float right = distTarget + yawTarget;
+  const float absLeft = std::fabs(left);
+  const float absRight = std::fabs(right);
+  const float dominant = absLeft > absRight ? absLeft : absRight;
+  const float cruise = (dominant / duration) / cpm;  // [mm/s]
 
   // moveX() (motion_engine.cpp) splits a nonzero distance combined with
   // a large enough rotation into pivot-then-straight -- two SEQUENTIAL
@@ -547,27 +563,27 @@ void startMove(int distance, int yaw, int speed, int yawRate) {
   // than one blended segment where both axes finish together. Budget
   // the SUM of both axes' durations for that case; max() only covers
   // the genuinely simultaneous (non-split) move. Read the split
-  // threshold from MotionEngine itself (turnFirstAngleRad(), the public
-  // accessor for its own private kTurnFirstAngleRad) rather than
+  // threshold from MotionEngine itself (turnFirstAngle(), the public
+  // accessor for its own private kTurnFirstAngle) rather than
   // retyping the 50 deg constant here, so this decision can never drift
   // from moveX()'s own.
   const bool willSplit =
-      distanceMm != 0.0f &&
-      std::fabs(rotationRad) >= MotionEngine::turnFirstAngleRad();
+      distanceF != 0.0f &&
+      std::fabs(rotation) >= MotionEngine::turnFirstAngle();
   const float budgetDuration =
       willSplit ? (distDuration + yawDuration) : duration;
 
   // Backstop: for a single segment, this covers the end-of-move taper
-  // (serviceMove) -- the last ~15 deg / ~40 mm run at reduced rate,
+  // (service()) -- the last ~15 deg / ~40 mm run at reduced rate,
   // adding up to ~1 s. When the split above fires, it is ALSO the only
   // thing paying for the SECOND phase's own ramp/taper overhead, since
   // one deadline spans both phases. This is moveX()'s own `timeout` --
   // a REAL backstop the wire's own MOVE_X carries as a required field,
   // not an internally re-derived one.
-  const uint32_t timeoutMs =
+  const uint32_t timeout =
       static_cast<uint32_t>(budgetDuration * 1000.0f) + 1500u;
 
-  r.engine.moveX(distanceMm, rotationRad, cruiseMmS, timeoutMs);
+  r.engine.moveX(distanceF, rotation, cruise, timeout);
 }
 
 //%
@@ -578,7 +594,7 @@ bool updateMove() {
   // lazily updated (poseX()/Y()/heading() on demand) otherwise.
   const bool wasActive = r.engine.isMoveActive();
   if (wasActive) odomUpdate(r);
-  const bool moveActive = r.engine.serviceMove();
+  const bool moveActive = r.engine.service();
   // Cross-fiber stop delivery (sprint 006 ticket 002, BLK-01(b)): this
   // poller's own call path -- isMoving() (moveProgress() is read-only;
   // see verify-blocks.md's BLK-12 spot check, which confirmed
@@ -604,7 +620,7 @@ static bool commandLooksActive(const Rig& r);
 // ---- tick engine --------------------------------------------------------
 // tickDrive(): the caller-driven replacement for the kernel's own
 // now-unwired fiber (see ensure()'s comment). Runs exactly one
-// kernel.step() + serviceMove() on the CALLER's fiber, then self-paces
+// kernel.step() + service() on the CALLER's fiber, then self-paces
 // to the next absolute 24 ms deadline -- the same absolute-deadline
 // pacing DifferentialDrive::run() uses, lifted here since run() itself
 // is no longer wired to anything. The deadline anchors to the previous
@@ -618,8 +634,8 @@ static bool commandLooksActive(const Rig& r);
 // continuous-mode driving never progresses.
 //
 // Returns commandLooksActive(r) -- a move-engine move still in flight,
-// OR nonzero applied duty -- computed AFTER serviceMove() runs. NOT raw
-// post-serviceMove() moveActive: wheelsV()/wheelsX() clear the move
+// OR nonzero applied duty -- computed AFTER service() runs. NOT raw
+// post-service() moveActive: wheelsV()/wheelsX() clear the move
 // planner before tickDrive() is ever called, so a continuous-mode
 // `while (tickDrive())` loop reading raw moveActive exited on its very
 // first iteration (the starvation watchdog then stopped the robot
@@ -635,8 +651,8 @@ static bool commandLooksActive(const Rig& r);
 //%
 bool tickDrive() {
   Rig& r = ensure();
-  const uint64_t cycleStartUs = r.clock.nowMicros();
-  r.lastTickUs = cycleStartUs;  // the watchdog's only freshness signal
+  const uint64_t cycleStart = r.clock.nowMicros();  // [us]
+  r.lastTick = cycleStart;  // the watchdog's only freshness signal
 
   // Concurrency guard: check-and-set with no intervening yield is
   // atomic on CODAL's cooperative fibers, so this is safe against a
@@ -650,7 +666,34 @@ bool tickDrive() {
   r.stepBusy = true;
   r.kernel.step();
 
-  const bool wasActive = r.engine.isMoveActive();
+  // isDriving() (seg_.active || hold_.active), NOT isMoveActive()
+  // (seg_.active alone) -- this used to read isMoveActive(), which
+  // mirrored updateMove()'s own gate just below
+  // but, unlike THAT gate, feeds the settle-loop decision a few lines
+  // down. A continuous WHEELS_V/MOVE_V hold reaching ITS OWN deadline
+  // inside service() (Hold's "holdExpired" branch, motion_engine.cpp)
+  // sets hold_.active = false and stages kernel_.neutral() exactly like
+  // a Segment's own arrival does -- but with the OLD isMoveActive()
+  // read, `wasActive` was ALWAYS false for a Hold (seg_.active is never
+  // true for one), so `wasActive && !moveActive` never fired and the
+  // settle loop below never ran for a Hold's natural end, only for a
+  // Segment's. The staged neutral then had to wait for a FURTHER
+  // kernel.step() to ever commit -- and once this wire-issued Hold's
+  // own lease (hasLiveMotionObligation(), wire_adapter.cpp) elapses at
+  // essentially the same instant, protocol.cpp's run() loop stops
+  // calling tickDrive() at all, so that further step() never comes:
+  // Output (velocityLeft/Right, appliedDutyLeft/Right, positionLeft/
+  // Right, cycleCount) freezes at its last mid-drive, nonzero reading
+  // forever, and STATUS's `active` bit (computed from that same frozen
+  // velocity) reads stuck "still moving" indefinitely -- MEASURED via
+  // this ticket's own host test,
+  // tests/host/test_wire_motion_verbs.py::test_wheels_v_hold_expiry_settles_and_status_reads_fresh,
+  // which reproduces the freeze with the OLD isMoveActive() read and
+  // confirms it is gone with isDriving(). commandLooksActive() (this
+  // file, below) already made this exact isMoveActive()->isDriving()
+  // fix for the starvation watchdog; this was the same bug in the
+  // sibling check tickDrive() itself makes, missed at the time.
+  const bool wasActive = r.engine.isDriving();
   // odomUpdate() now runs UNCONDITIONALLY, every tick (sprint 006 ticket
   // 003, closes R-09/BLK-05, continuous-mode-odometry-chord-error.md):
   // this used to read `if (wasActive) odomUpdate(r);`, matching
@@ -669,12 +712,15 @@ bool tickDrive() {
   // is a different concern (folding post-move coast counts into pose)
   // and is unaffected by this change. updateMove()'s OWN odometry gate
   // -- a different caller, serving the TypeScript layer's blocking-move
-  // poll -- is untouched; see its own comment.
+  // poll -- is untouched; see its own comment. (updateMove() has the
+  // SAME isMoveActive()-vs-isDriving() gap in its own `wasActive`, for
+  // the TS blocking-poll path rather than the wire path this ticket
+  // scoped -- flagged, not fixed here; see this ticket's session notes.)
   odomUpdate(r);
-  const bool moveActive = r.engine.serviceMove();
+  const bool moveActive = r.engine.service();
 
   // Move-completion stop delivery (bench root-cause, 2026-08-20): when
-  // serviceMove() ends the move it posts kernel.neutral(), but the
+  // service() ends the move it posts kernel.neutral(), but the
   // neutral only reaches the MOTORS on the NEXT kernel.step() -- and a
   // `while (tickDrive())` caller exits the moment we return false, so
   // that step never ran. The wheels then coasted at the last commanded
@@ -683,6 +729,9 @@ bool tickDrive() {
   // corruption. (It was intermittent only because the protocol fiber's
   // former co-ticking sometimes delivered this step by accident.) Run
   // one extra step here so the stop lands before we report "done".
+  // This now also catches a continuous Hold's own natural deadline
+  // (wasActive is isDriving(), above), not just a Segment's arrival --
+  // same mechanism, same reason.
   if (wasActive && !moveActive) {
     // Settling before reporting "done": kernel.neutral() only STAGES a
     // zero command, and one extra step's own encoder read can land
@@ -718,19 +767,19 @@ bool tickDrive() {
   // (diffdrive.cpp:290-306): read the cadence from the kernel's own
   // config (still 24 ms per sprint.md's Design Rationale) rather than
   // duplicating the constant here.
-  const uint64_t periodUs =
+  const uint64_t period =  // [us]
       static_cast<uint64_t>(r.kernel.config().cyclePeriod) * 1000ull;
   const bool consecutive =
-      r.tickDeadlineUs != 0 && cycleStartUs < r.tickDeadlineUs + periodUs;
-  const uint64_t deadlineUs =
-      consecutive ? r.tickDeadlineUs + periodUs : cycleStartUs + periodUs;
-  r.tickDeadlineUs = deadlineUs;
+      r.tickDeadline != 0 && cycleStart < r.tickDeadline + period;
+  const uint64_t deadline =  // [us]
+      consecutive ? r.tickDeadline + period : cycleStart + period;
+  r.tickDeadline = deadline;
 
-  const uint64_t nowUs = r.clock.nowMicros();
-  if (nowUs < deadlineUs) {
-    const uint32_t shortfallMs =
-        static_cast<uint32_t>((deadlineUs - nowUs + 999) / 1000);
-    r.sleeper.sleepMillis(shortfallMs);
+  const uint64_t now = r.clock.nowMicros();  // [us]
+  if (now < deadline) {
+    const uint32_t shortfall =  // [ms]
+        static_cast<uint32_t>((deadline - now + 999) / 1000);
+    r.sleeper.sleepMillis(shortfall);
   } else {
     ++r.tickOverrunCount;
     r.sleeper.yield();
@@ -795,8 +844,8 @@ int cycleStat(int which) {
 // choice given commandLooksActive() below can only see stale state
 // (nothing refreshes Output without a step()) until ticking resumes.
 
-static constexpr uint32_t kWatchdogPeriodMs = 50;          // [ms]
-static constexpr uint64_t kWatchdogTimeoutUs = 100000ull;  // [us] ~4 periods
+static constexpr uint32_t kWatchdogPeriod = 50;          // [ms]
+static constexpr uint64_t kWatchdogTimeout = 100000ull;  // [us] ~4 periods
 
 // The kernel exposes no direct "is the commanded mode non-neutral"
 // accessor (Command::mode is private, read only inside step()).
@@ -809,7 +858,17 @@ static constexpr uint64_t kWatchdogTimeoutUs = 100000ull;  // [us] ~4 periods
 // continuous-drive (setWheels/driveTwist and their timed variants) and
 // move-engine abandonment.
 static bool commandLooksActive(const Rig& r) {
-  if (r.engine.isMoveActive()) return true;
+  // this ticket: isDriving() (seg_.active || hold_.active),
+  // not isMoveActive() (seg_.active alone). wheelsV()/wheelsX() no
+  // longer call kernel_.drive() synchronously -- service()'s lazy start
+  // (design S6.5) means a freshly-armed continuous hold shows zero
+  // applied duty for one extra tick (the command lands on the NEXT
+  // step(), after service() stages it), so isMoveActive()'s old
+  // Segment-only reading would let this fall through to the applied-
+  // duty check below and read false for that one tick -- exactly the
+  // starvation this function exists to prevent. isDriving() covers the
+  // hold immediately, synchronously, the moment wheelsV() arms it.
+  if (r.engine.isDriving()) return true;
   const DiffDrive::DifferentialDrive::Output out = r.kernel.output();
   return out.appliedDutyLeft != 0.0f || out.appliedDutyRight != 0.0f;
 }
@@ -817,10 +876,10 @@ static bool commandLooksActive(const Rig& r) {
 static void watchdogEntry(void* context) {
   Rig& r = *static_cast<Rig*>(context);
   while (true) {
-    r.sleeper.sleepMillis(kWatchdogPeriodMs);
-    const uint64_t nowUs = r.clock.nowMicros();
-    const uint64_t sinceLastTickUs = nowUs - r.lastTickUs;
-    if (sinceLastTickUs <= kWatchdogTimeoutUs) continue;
+    r.sleeper.sleepMillis(kWatchdogPeriod);
+    const uint64_t now = r.clock.nowMicros();  // [us]
+    const uint64_t sinceLastTick = now - r.lastTick;  // [us]
+    if (sinceLastTick <= kWatchdogTimeout) continue;
     if (!commandLooksActive(r)) continue;
     r.kernel.neutral();      // commands neutral for whenever step() next runs
     r.engine.endMove();      // clears the move-engine's own in-flight state
@@ -1035,10 +1094,82 @@ void setGeometry(int trackWidth, int calib) {  // [0.1 mm] [1e-4 mm/deg]
 // of crossing to protocol.cpp.
 static OtosPort& otosRef();
 
+// ---- shaping-field descriptor table (this ticket, design S4.7's own
+// review-CO-05-scoped rationale: "one descriptor table replaces the
+// three parallel switches for the shaping fields") -----------------------
+// {ordinal, setter, field} rows that setKernelValue()/getConfigValue()
+// (below) both consult BEFORE falling into their own per-field switch --
+// every one of design S4.7's ten wire-name-table rows that maps onto a
+// MotionLimits member (v_floor/stop_distance/accel/decel/v_max/jerk/
+// omega_max/omega_floor/arrive_dist/arrive_yaw) lives here instead of as
+// a standalone `case N:` line. `setter` is one of MotionLimits' own
+// "positive, else keep" validated setters (motion_limits.h) -- called
+// through a pointer-to-member-function, exactly the way `field` (a
+// pointer-to-data-member) is read through -- so this table adds no
+// validation logic of its own; it only ROUTES. A later ticket (design
+// review CO-05's fuller ask, the complete config surface) extends this
+// same table additively -- new rows, no new switch statement -- rather
+// than growing a fourth parallel mapping.
+namespace {
+struct LimitsFieldEntry {
+  int ordinal;
+  void (MotionLimits::*setter)(float);
+  float MotionLimits::*field;
+};
+
+// this ticket, design S4.7's wire-name table: {ordinal, setter, field}
+// for the ten shaping ordinals -- kOrdinal/kSetter/kField values below
+// come straight from motion_limits.h's own "positive, else keep"
+// setters and public members (both declared there, see that header's
+// own comment for the naming rationale). Order matches the design
+// table's own row order, not declaration/ordinal order, so a reader
+// comparing the two side by side does not have to re-sort either one.
+constexpr LimitsFieldEntry kLimitsFields[] = {
+    {19, &MotionLimits::setAccel, &MotionLimits::accel},
+    {20, &MotionLimits::setDecel, &MotionLimits::decel},
+    {21, &MotionLimits::setVMax, &MotionLimits::vMax},
+    {28, &MotionLimits::setJerk, &MotionLimits::jerk},
+    {30, &MotionLimits::setOmegaMax, &MotionLimits::omegaMax},
+    // 8 (this ticket, K5): v_floor -- the ordinal is unchanged from the
+    // old kernel speed_floor, but the setter now writes HERE, not
+    // k.setSpeedFloor(); the kernel's own vMin stays pinned at 0
+    // (ensure()'s own Config seed comment above).
+    {8, &MotionLimits::setVFloor, &MotionLimits::vFloor},
+    {34, &MotionLimits::setOmegaFloor, &MotionLimits::omegaFloor},
+    // 18 (this ticket): stop_distance -- the ordinal is unchanged from
+    // the old pivot_overrun; see wire_adapter.cpp's kFields row for the
+    // rename's own provenance.
+    {18, &MotionLimits::setStopDistance, &MotionLimits::stopDistance},
+    {35, &MotionLimits::setArriveDist, &MotionLimits::arriveDist},
+    {36, &MotionLimits::setArriveYaw, &MotionLimits::arriveYaw},
+    // 37 (design S4.1/S10.2, NEW ordinal): lag --
+    // the drivetrain's own first-order response lag, [s]. See
+    // motion_limits.h's own field comment and wire_adapter.cpp's kFields
+    // row for the provenance.
+    {37, &MotionLimits::setLag, &MotionLimits::lag},
+};
+constexpr size_t kLimitsFieldCount =
+    sizeof(kLimitsFields) / sizeof(kLimitsFields[0]);
+
+const LimitsFieldEntry* findLimitsField(int ordinal) {
+  for (const auto& entry : kLimitsFields) {
+    if (entry.ordinal == ordinal) return &entry;
+  }
+  return nullptr;
+}
+}  // namespace
+
 //%
 void setKernelValue(int field, int value) {  // [x1000 scaled]
   Rig& r = ensure();
   const float v = static_cast<float>(value) * 0.001f;
+  // this ticket: every shaping ordinal (design S4.7's wire-name table)
+  // is handled by kLimitsFields above, BEFORE the kernel-field switch
+  // below is even reached -- see that table's own header comment.
+  if (const LimitsFieldEntry* entry = findLimitsField(field)) {
+    (r.engine.limits().*(entry->setter))(v);
+    return;
+  }
   DiffDrive::DifferentialDrive& k = r.kernel;
   switch (field) {
     case 0: k.setMaxDuty(v); break;
@@ -1049,7 +1180,6 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
     case 5: k.setKaff(v); break;
     case 6: k.setPidMax(v); break;
     case 7: k.setTwistHoldGain(v); break;
-    case 8: k.setSpeedFloor(v); break;
     case 9: k.setPositionErrorMax(v); break;
     case 10: k.setStall(v, k.config().stallDemand,
                         k.config().stallWindow); break;
@@ -1061,20 +1191,20 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
     case 14: k.setCrawlPulse(v); break;
     // 15 (sprint 007 ticket 003, closing R-11/BLK-03/API-03):
     // default_cruise -- the wire layer's OWN configured-default cruise
-    // field (Rig::defaultCruiseMmS_, NOT kernel.config()), see
-    // engineDefaultCruiseMmS()'s own comment above. Same ">0" silent-
+    // field (Rig::defaultCruise_, NOT kernel.config()), see
+    // engineDefaultCruise()'s own comment above. Same ">0" silent-
     // ignore validation style as setGeometry() -- a `SET default_cruise
     // 0` line over the wire is accepted (kOk) but does not clear the
     // field to 0; that is only reachable via the test double's own
     // direct setter (there is no wire-level way to force "no default
     // available" at ordinal 15, deliberately -- unlike stall_clear's
     // ordinal 17 below, this is a real stored value, not an action).
-    case 15: if (v > 0.0f) r.defaultCruiseMmS_ = v; break;
+    case 15: if (v > 0.0f) r.defaultCruise_ = v; break;
     // 16 (ticket 005, closing R-14/API-06): rotational_slip -- a thin
     // forward to the now-tested MotionEngine::setRotationalSlip(),
     // which already applies the ">0, else keep the prior value"
     // validation itself (motion_engine.h); no duplicate check needed
-    // here, unlike case 15's own inline check above (defaultCruiseMmS_
+    // here, unlike case 15's own inline check above (defaultCruise_
     // has no dedicated setter to own that validation).
     case 16: r.engine.setRotationalSlip(v); break;
     // 17 (ticket 001): stall_clear -- a write-triggered ACTION wearing a
@@ -1084,29 +1214,19 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
     // magnitude is otherwise ignored. Deliberately does not touch
     // estopLatch_ -- see clearStall()'s own comment above.
     case 17: if (v != 0.0f) k.clearStallLatch(); break;
-    // 18 (2026-08-29, OOP): pivot_overrun -- a thin forward to
-    // MotionEngine::setPivotOverrunMm(), which owns its own ">= 0, else
-    // keep the prior value" validation (motion_engine.h), same shape as
-    // case 16's rotational_slip forward above.
-    case 18: r.engine.setPivotOverrunMm(v); break;
-    // 19-27: constant-a shaping plus the five pre-existing end-of-move
-    // shaping knobs, all thin forwards to MotionEngine setters that
-    // already own their own validation (motion_engine.h) -- same
-    // shape as case 16/18's forwards above, no inline check needed
-    // here.
-    case 19: r.engine.setAAccelMmS2(v); break;
-    case 20: r.engine.setADecelMmS2(v); break;
-    case 21: r.engine.setVMaxMmS(v); break;
-    case 22: r.engine.setBrakeFrac(v); break;
-    case 23: r.engine.setDistTaper(v); break;
-    case 24: r.engine.setYawTaper(v); break;
-    case 25: r.engine.setDistFloor(v); break;
-    case 26: r.engine.setTurnFloor(v); break;
-    case 27: r.engine.setRampMs(v); break;
-    case 28: r.engine.setJerkMmS3(v); break;
-    case 29: r.engine.setPlateauMinS(v); break;
-    case 30: r.engine.setMaxYawRateDegS(v); break;
-    case 31: r.engine.setProfileExitMmS(v); break;
+    // 18-21, 28, 30, 34-37 (design S4.7's wire-name table, extended for
+    // lag): stop_distance/accel/decel/v_max/jerk/
+    // omega_max/omega_floor/arrive_dist/arrive_yaw/lag, and 8 (v_floor)
+    // -- all eleven now handled by kLimitsFields/findLimitsField()
+    // above, before this switch is ever reached. 22, 23, 24, 25, 26, 27,
+    // 29, 31 (brake_frac/dist_taper/
+    // yaw_taper/dist_floor/turn_floor/ramp_ms/plateau_min_s/profile_exit)
+    // are REMOVED ordinals (design S4.7/S8) with no case here at all --
+    // wire_adapter.cpp's kFields no longer names them, so no caller can
+    // reach this switch with one of these numbers over the wire; a
+    // direct C++ caller passing one falls through to `default: break`
+    // below, the same as any other unrecognized field number always
+    // has.
     // 32: rebase -- zero the odometry frame, a write-triggered action
     // wearing a config-field's clothes (same shape as stall_clear's
     // case 17 above). Writes BOTH pose sources, mirroring seedPose()'s
@@ -1151,6 +1271,13 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
 // declaration. An out-of-range field returns 0.
 int getConfigValue(int field) {  // -> [x1000 scaled]
   Rig& r = ensure();
+  // this ticket: every shaping ordinal (design S4.7's wire-name table)
+  // is handled by kLimitsFields above, BEFORE the kernel Config switch
+  // below is even reached -- mirrors setKernelValue()'s own gate.
+  if (const LimitsFieldEntry* entry = findLimitsField(field)) {
+    const float lv = r.engine.limits().*(entry->field);
+    return static_cast<int>(std::lround(lv * 1000.0));
+  }
   const DiffDrive::DifferentialDrive::Config c = r.kernel.config();
   float v = 0.0f;
   switch (field) {
@@ -1162,7 +1289,6 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
     case 5: v = c.kaff; break;
     case 6: v = c.pidMax; break;
     case 7: v = c.twistHoldGain; break;
-    case 8: v = c.vMin; break;
     case 9: v = c.posErrMax; break;
     case 10: v = c.stallSpeed; break;
     case 11: v = c.stallDemand; break;
@@ -1172,8 +1298,8 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
     // 15 (sprint 007 ticket 003): default_cruise's GET side --
     // deliberately NOT read from `c` (this ordinal has no stored
     // kernel Config field at all; it lives on Rig, see
-    // defaultCruiseMmS_'s own field comment above).
-    case 15: v = r.defaultCruiseMmS_; break;
+    // defaultCruise_'s own field comment above).
+    case 15: v = r.defaultCruise_; break;
     // 16 (ticket 005): rotational_slip's GET side -- a thin forward to
     // MotionEngine::rotationalSlip(), deliberately NOT read from `c`
     // (this ordinal has no kernel Config field at all; it lives on
@@ -1184,24 +1310,14 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
     // ordinal has no stored Config field at all; see clearStall()'s own
     // comment above and sprint 007's design/DESIGN.md §5 field table).
     case 17: v = r.kernel.output().stallHalted ? 1.0f : 0.0f; break;
-    // 18: pivot_overrun's GET side -- MotionEngine::pivotOverrunMm(),
-    // not a kernel Config field (same as case 16 above).
-    case 18: v = r.engine.pivotOverrunMm(); break;
-    // 19-27: GET side of the setKernelValue() forwards above, same
-    // "not a kernel Config field" shape as case 16/18.
-    case 19: v = r.engine.aAccelMmS2(); break;
-    case 20: v = r.engine.aDecelMmS2(); break;
-    case 21: v = r.engine.vMaxMmS(); break;
-    case 22: v = r.engine.brakeFrac(); break;
-    case 23: v = r.engine.distTaper(); break;
-    case 24: v = r.engine.yawTaper(); break;
-    case 25: v = r.engine.distFloor(); break;
-    case 26: v = r.engine.turnFloor(); break;
-    case 27: v = r.engine.rampMs(); break;
-    case 28: v = r.engine.jerkMmS3(); break;
-    case 29: v = r.engine.plateauMinS(); break;
-    case 30: v = r.engine.maxYawRateDegS(); break;
-    case 31: v = r.engine.profileExitMmS(); break;
+    // 8, 18-21, 28, 30, 34-37 (lag extends the range): all
+    // handled by kLimitsFields/findLimitsField() above, before this
+    // switch is ever reached. 22,
+    // 23, 24, 25, 26, 27, 29, 31 (removed ordinals) have no case here at
+    // all any more -- wire_adapter.cpp's kFields no longer names them,
+    // so this switch's own `default: return 0` is the only path a stray
+    // direct C++ call with one of these numbers can take, same as any
+    // other unrecognized field.
     // 33: estop_clear's GET side -- a convenience readback of
     // Output.estopped, same "not a stored Config field" shape as the
     // stall latch's own clear field's GET (case 17 above). 32 (rebase)
@@ -1232,16 +1348,17 @@ static OtosPort& otosRef() {
 // ---- wire motion-engine primitives, part 2 (WireAdapter's MOVE_V/
 // GO_TO_R/GO_TO_W handlers) -----------------------------------------------
 // Same forward-declaration convention as engineWheelsX()/engineMoveX()/
-// engineDefaultCruiseMmS() above. `omegaRad` arrives at engineMoveV()
+// engineDefaultCruise() above. `omega` arrives at engineMoveV()
 // ALREADY converted from the wire's milliradian integer
 // (wire_adapter.cpp's mradToRad()); `speed`'s <0/==0 "configured
 // default" substitution is resolved by onGoToR()/onGoToW() BEFORE
-// either of these is ever called, via engineDefaultCruiseMmS() above.
+// either of these is ever called, via engineDefaultCruise() above.
 // Placed after otosRef(), not with engineWheelsX()/engineMoveX() above,
 // because engineGoToW() below needs it.
-void engineMoveV(float vx, float omegaRad, uint32_t durationMs) {
+void engineMoveV(float vx, float omega,
+                 uint32_t duration) {  // [mm/s] [rad/s] [ms]
   Rig& r = ensure();
-  r.engine.moveV(vx, omegaRad, durationMs);
+  r.engine.moveV(vx, omega, duration);
 }
 
 // Deliberately NOT `//%`-annotated any more (sprint 015 ticket 006) --
@@ -1254,9 +1371,10 @@ void engineMoveV(float vx, float omegaRad, uint32_t durationMs) {
 // those functions' comments for why the split exists. Wire-shaped
 // units (mm, mm/s, ms); cm-to-mm conversion stays the TS caller's job,
 // exactly as startMove() already does for _startMove().
-void engineGoToR(float x, float y, float speed, float arrive, uint32_t timeoutMs) {
+void engineGoToR(float x, float y, float speed, float arrive,
+                 uint32_t timeout) {  // [ms]
   Rig& r = ensure();
-  r.engine.goToR(x, y, speed, arrive, timeoutMs);
+  r.engine.goToR(x, y, speed, arrive, timeout);
 }
 
 // `//%`-annotated -- pre-arms the NEXT engineGoToRArmed() call's
@@ -1269,27 +1387,27 @@ void engineGoToR(float x, float y, float speed, float arrive, uint32_t timeoutMs
 // abort. setTaperWindows()'s own comment already recorded an earlier
 // incident with the identical symptom; this build is what confirmed
 // it. Every `//%` shim in this file now stays at <=4 params. See
-// Rig::pendingGoToDeadlineMs_ (above, in the struct) for the handoff
+// Rig::pendingGoToDeadline_ (above, in the struct) for the handoff
 // contract -- one caller only (sim.ts's _setGoToDeadline(), called by
 // motion.ts's startGoTo() immediately before _goToR()), so there is no
 // path for a stale deadline to reach an unrelated move.
 //%
-void engineSetGoToDeadline(uint32_t timeoutMs) {
-  ensure().pendingGoToDeadlineMs_ = timeoutMs;
+void engineSetGoToDeadline(uint32_t timeout) {  // [ms]
+  ensure().pendingGoToDeadline_ = timeout;
 }
 
 // `//%`-annotated -- the block layer's own entry point onto the SAME
 // goToR() the wire's GO_TO_R verb reaches via engineGoToR() above,
 // just split to FOUR parameters (engineSetGoToDeadline() immediately
-// above supplies the fifth, `timeoutMs`, via
-// Rig::pendingGoToDeadlineMs_) -- see that function's comment for why.
+// above supplies the fifth, `timeout`, via
+// Rig::pendingGoToDeadline_) -- see that function's comment for why.
 // Deliberately delegates to engineGoToR() above rather than calling
 // r.engine.goToR() directly a second time, so the actual move-engine
 // call site stays in exactly one place.
 //%
 void engineGoToRArmed(float x, float y, float speed, float arrive) {
   Rig& r = ensure();
-  engineGoToR(x, y, speed, arrive, r.pendingGoToDeadlineMs_);
+  engineGoToR(x, y, speed, arrive, r.pendingGoToDeadline_);
 }
 
 // GO_TO_W's own PoseSource selection: the ONE place this project
@@ -1316,16 +1434,16 @@ void engineGoToRArmed(float x, float y, float speed, float arrive) {
 // delegating to goToR() -- nothing re-reads or re-selects a pose source
 // while a move is in flight.
 bool engineGoToW(float x, float y, float speed, float arrive,
-                uint32_t timeoutMs) {
+                uint32_t timeout) {  // [ms]
   OtosPort& otos = otosRef();
   Rig& r = ensure();
   PoseSource& pose = selectPoseSource(otos.connected(), otos, r.encoderPose);
-  r.engine.goToW(pose, x, y, speed, arrive, timeoutMs);
+  r.engine.goToW(pose, x, y, speed, arrive, timeout);
   return true;
 }
 
 // SUC-003: GO_TO_W's own D input for
-// engineDefaultCruiseForDistanceMmS() above -- the TRUE body-frame
+// engineDefaultCruiseForDistance() above -- the TRUE body-frame
 // chord from the robot's CURRENT pose to this call's WORLD-frame
 // (worldX, worldY) target, not the target's distance from the world
 // origin (hypot(worldX, worldY) alone, which is wrong whenever the
@@ -1339,42 +1457,74 @@ bool engineGoToW(float x, float y, float speed, float arrive,
 // engineGoToW() reads them again for the real dispatch, mutates
 // nothing and cannot observe a different value than that dispatch
 // will.
-float engineGoToWChordMm(float worldX, float worldY) {
+float engineGoToWChord(float worldX, float worldY) {
   OtosPort& otos = otosRef();
   Rig& r = ensure();
   PoseSource& pose = selectPoseSource(otos.connected(), otos, r.encoderPose);
   return std::hypot(worldX - pose.x(), worldY - pose.y());
 }
 
-// Set end-of-move shaping. Larger tapers and lower floors buy accuracy
-// with time; a closed-loop caller that re-fixes between moves should
-// spend far less of it. Zero or negative leaves a field unchanged.
-// NOTE: kept to TWO arguments each. A single five-argument shim made
-// the PXT compiler fail with "TS9200: Assertion failed" -- reported
-// against this project's single pre-sprint-012-split top-level file at
-// (1,1), nowhere near the real cause. The `//%` marker
-// must also sit IMMEDIATELY above the signature; a comment between
-// them makes the scanner miss the function entirely.
+// RETIRED (sprint 029 ticket 003/004, design motion-profile-
+// unification.md S4.7/S8/S12): harmless no-op shims kept for one
+// release so a MakeCode project saved before this sprint that still
+// calls `setTaperWindows`/`setTaperFloors`/`setRampMs` compiles and
+// runs -- it just does nothing now. These used to set end-of-move
+// shaping fields (distTaper_/yawTaper_/distFloor_/turnFloor_/rampMs_)
+// that ticket 003 DELETED from MotionEngine entirely -- the taper
+// window, the floor fraction and the ramp time are all superseded by
+// MotionLimits + VelocityShaper (design S4.1/S4.2): shaping is now
+// `set config`'s own accel/decel/jerk/v_max/omega_max/v_floor/
+// omega_floor fields (ConfigField, blocks/motion.ts), reachable only
+// through limits(), which these three no-shim parameter shapes have no
+// way to express (percent-of-cruise floors and counts-windows don't
+// correspond to anything VelocityShaper reads). Neither of these three
+// was ever a draggable BLOCK (no `//% block=` was ever declared for
+// them -- only sim.ts/test.ts ever called them directly as plain
+// TypeScript), so there is no toolbox entry to hide; "hidden" here
+// means "does nothing", not "no longer visible in the palette". Design
+// S12 open question 3 (may these be removed outright, or must they stay
+// no-ops for a release) is undecided as of this ticket -- defaulting to
+// the no-op posture per that question's own stated default.
 //%
-void setTaperWindows(int distCounts, int yawCounts) {
-  Rig& r = ensure();
-  if (distCounts > 0) r.engine.setDistTaper(static_cast<float>(distCounts));
-  if (yawCounts > 0) r.engine.setYawTaper(static_cast<float>(yawCounts));
+void setTaperWindows(int dist, int yaw) {
+  (void)dist;
+  (void)yaw;
 }
 
 //%
-void setTaperFloors(int distPct, int turnPct) {
-  Rig& r = ensure();
-  if (distPct > 0)
-    r.engine.setDistFloor(static_cast<float>(distPct) * 0.01f);
-  if (turnPct > 0)
-    r.engine.setTurnFloor(static_cast<float>(turnPct) * 0.01f);
+void setTaperFloors(int dist, int turn) {
+  (void)dist;
+  (void)turn;
 }
 
 //%
 void setRampMs(int ms) {
+  (void)ms;
+}
+
+// this ticket (design motion-profile-unification.md S4.7): the ONE
+// shim `test.ts`'s two profile functions (openLoopProfile()/
+// closedLoopProfile()) now call, replacing the three retired shims
+// immediately above. Four `int` parameters, not five -- sprint 015
+// ticket 006's own PXT packager finding (engineSetGoToDeadline()'s
+// comment above) is why every `//%` shim in this file stays at <=4
+// params; a MotionLimits-shaped call with five plain fields (accel,
+// decel, vMax, omegaMax, plus a floor or arrival window) would cross
+// that line, so this shim covers only the two profile-selected rate
+// ceilings (design S4.7's own `setLimits({accel, decel, vMax,
+// omegaMax})` pseudocode) -- floors and stop_distance stay per-robot,
+// set once from the deploy bake (or `set config`), never per profile.
+// No wire-scale (x1000) convention here, unlike setKernelValue() --
+// plain student units straight through, matching startMove()'s own
+// int-parameter shims.
+//%
+void setLimits(int accel, int decel, int vMax, int omegaMax) {  // [mm/s^2] [mm/s^2] [mm/s] [deg/s]
   Rig& r = ensure();
-  if (ms > 0) r.engine.setRampMs(static_cast<float>(ms));
+  MotionLimits& lim = r.engine.limits();
+  lim.setAccel(static_cast<float>(accel));
+  lim.setDecel(static_cast<float>(decel));
+  lim.setVMax(static_cast<float>(vMax));
+  lim.setOmegaMax(static_cast<float>(omegaMax));
 }
 
 // Measured wheel speed [mm/s] straight from the kernel's per-tick

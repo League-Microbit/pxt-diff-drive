@@ -149,10 +149,10 @@ bool parseUint32(const char* field, uint32_t& out) {
 // all). The two ceilings are close in magnitude only because "very
 // large but still safe" happens to land in the same neighborhood in
 // both domains.
-constexpr uint32_t kMaxMotionTimeoutMs = 2147483647u;  // 2^31 - 1
+constexpr uint32_t kMaxMotionTimeout = 2147483647u;  // 2^31 - 1
 
 // Applied identically to WHEELS_X/WHEELS_V/MOVE_X/MOVE_V/GO_TO_R/GO_TO_W's
-// own timeout/duration field (see kMaxMotionTimeoutMs's own doc comment
+// own timeout/duration field (see kMaxMotionTimeout's own doc comment
 // above for why, and DESIGN.md S14's Design Rationale for the
 // reject-vs-clamp choice on each end): `0` is refused outright
 // (matching the existing precedent that `cruise <= 0` already refuses
@@ -165,10 +165,10 @@ constexpr uint32_t kMaxMotionTimeoutMs = 2147483647u;  // 2^31 - 1
 // rejecting would force every large-sentinel-using host to learn this
 // project's specific ceiling. Returns false (reject) for exactly 0,
 // leaving `timeout` unmodified; otherwise clamps `timeout` in place to
-// at most kMaxMotionTimeoutMs and returns true.
+// at most kMaxMotionTimeout and returns true.
 bool clampMotionTimeout(uint32_t& timeout) {
   if (timeout == 0) return false;
-  if (timeout > kMaxMotionTimeoutMs) timeout = kMaxMotionTimeoutMs;
+  if (timeout > kMaxMotionTimeout) timeout = kMaxMotionTimeout;
   return true;
 }
 
@@ -231,7 +231,7 @@ bool parseTlmMode(const char* field, TlmMode& mode) {
 // symbol would mean this host-portable, no-project-includes file
 // (src/DESIGN.md S4) including wire_adapter.h, inverting this project's
 // wire_adapter-depends-on-wire_handler layering rule -- same reasoning
-// kMaxMotionTimeoutMs's own doc comment above already applies to a
+// kMaxMotionTimeout's own doc comment above already applies to a
 // different pair of ceilings. 1,000,000.0f is chosen with two orders of
 // magnitude of headroom above this project's largest real config value
 // (fullDutyVelocity, 10795.0 counts/s) while keeping the scaled product
@@ -1287,7 +1287,7 @@ void WireHandler::execMoveX(char** fields, size_t fieldCount, uint32_t id,
   // Sprint 008 (R-06 + R-18): shared reject-0/clamp-above-2^31-1 bound --
   // see clampMotionTimeout()'s own doc comment above. Rejecting here
   // means engineMoveX() never runs for timeout == 0, so
-  // MotionEngine::moveX()'s own `move_.deadline = nowMs() + timeoutMs`
+  // MotionEngine::moveX()'s own `move_.deadline = now() + timeout`
   // never gets set to "now" (this verb's own instant-no-op behavior,
   // confirmed unchanged from the ticket's own description by reading
   // motion_engine.cpp directly -- see this ticket's own report).
@@ -1352,7 +1352,7 @@ void WireHandler::execGoToR(char** fields, size_t fieldCount, uint32_t id,
   // see clampMotionTimeout()'s own doc comment above. Rejecting here
   // means engineGoToR() never runs for timeout == 0, so
   // MotionEngine::goToR()'s own deadline math (identical
-  // "nowMs() + timeoutMs" shape to moveX(), see execMoveX()'s comment
+  // "now() + timeout" shape to moveX(), see execMoveX()'s comment
   // above) never sees the instant-no-op input either.
   if (!clampMotionTimeout(timeout)) {
     errCode = resultCode(Result::kRange);

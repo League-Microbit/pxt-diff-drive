@@ -234,11 +234,11 @@ class Protocol {
 
   // tickDrive()'s (shims.cpp) service hook, registered once via
   // registerTickServiceHook() when run() starts -- a plain
-  // no-capture function pointer (same reason wireNowMs() below is a
+  // no-capture function pointer (same reason wireNow() below is a
   // plain static member function, not a lambda: a bare C function
   // pointer cannot capture `this`), so it reaches this specific
   // Protocol instance through the protocol() singleton accessor, safe
-  // for the same reason wireNowMs() is. Deliberately a NO-OP unless
+  // for the same reason wireNow() is. Deliberately a NO-OP unless
   // motionOwner_ == kJob: tickDrive() is also called (a) from run()'s
   // own loop for a live WIRE motion obligation, which already gets its
   // own servicing once per pass via run()'s own loop calling
@@ -269,7 +269,7 @@ class Protocol {
   // Drains every currently-queued line out of emitQueue_, in FIFO
   // order, into emitLineNow() -- called once at the top of run()'s loop,
   // before either transport's own RX poll, so a line any fiber queued
-  // reaches the wire within one poll interval (kPollIntervalMs).
+  // reaches the wire within one poll interval (kPollInterval).
   void drainEmitQueue();
 
   // emitQueue_'s slot text bytes: RadioTransport::kMaxPayloadBytes (the
@@ -322,9 +322,9 @@ class Protocol {
   // row impossible, which is exactly the shape a parameter sweep
   // sends. 400 ms still swallows a burst and gives deliberate repeats
   // back.
-  static constexpr int32_t kRunDedupeMs = 400;
+  static constexpr int32_t kRunDedupe = 400;  // [ms]
   char lastRunText_[kRunTextBytes] = {};
-  uint32_t lastRunMs_ = 0;   // [ms] arrival time of the last accepted RUN
+  uint32_t lastRun_ = 0;   // [ms] arrival time of the last accepted RUN
 
   // ---- identity, assembled once the fiber actually runs ---------------
   // WireAdapter must stay CODAL-free (host-testable), so this CODAL-
@@ -345,7 +345,7 @@ class Protocol {
   // Protocol instance through the existing protocol() singleton
   // accessor instead, safe here because it is only ever CALLED from the
   // running fiber, well after that singleton is assigned).
-  static uint32_t wireNowMs();
+  static uint32_t wireNow();  // [ms]
 
   // ---- ticket 005: the v6 wire transport seam --------------------------
   // The one Sink WireHandler writes every reply line through (Sink's own
@@ -415,9 +415,9 @@ class Protocol {
   SerialTransport transport_;
   WifiUartCodal wifiUart_;
   CodalFiberLauncher launcher_;
-  CodalClock clock_;  // PING's t=<ms> equivalent is now wireNowMs(); this
+  CodalClock clock_;  // PING's t=<ms> equivalent is now wireNow(); this
                       // instance now backs only handleRun()'s own dedupe
-                      // timing and wireNowMs() itself (via protocol()).
+                      // timing and wireNow() itself (via protocol()).
   bool running_ = false;
 
   // The v6 radio link is OPT-IN: false until setupRadio() flips it.
@@ -441,11 +441,11 @@ class Protocol {
   // on this fiber.
   bool wifiEnabled_ = false;
   bool wifiBegun_ = false;
-  uint32_t lastWifiDbgMs_ = 0;
+  uint32_t lastWifiDbg_ = 0;  // [ms]
 
   // NSDMI, not a hand-written constructor: each member depends only on
   // members declared textually above it (transport_/radioTransport_ for
-  // the sinks; wireNowMs() for wireAdapter_; wireAdapter_ + the sinks
+  // the sinks; wireNow() for wireAdapter_; wireAdapter_ + the sinks
   // for wireHandler_/wireHandlerRadio_), so declaration-order in-class
   // initializers are enough. wireAdapter_ starts with a placeholder
   // Wire::Identity(); run() supplies the real one via setIdentity()
@@ -457,7 +457,7 @@ class Protocol {
   // expectedNext_.
   SerialSink serialSink_{transport_};
   RadioSink radioSink_{radioTransport_};
-  WireAdapter wireAdapter_{Wire::Identity(), &Protocol::wireNowMs};
+  WireAdapter wireAdapter_{Wire::Identity(), &Protocol::wireNow};
   Wire::WireHandler wireHandler_{wireAdapter_, serialSink_};
   Wire::WireHandler wireHandlerRadio_{wireAdapter_, radioSink_};
 
@@ -466,7 +466,7 @@ class Protocol {
   // reason the radio got a second one (see this file's top comment):
   // each transport keeps its own expectedNext_, so a sequence gap on
   // WiFi can never nack serial's or radio's next command.
-  WifiLink wifiLink_{wifiUart_, &Protocol::wireNowMs};
+  WifiLink wifiLink_{wifiUart_, &Protocol::wireNow};
   WifiSink wifiSink_{wifiLink_};
   Wire::WireHandler wireHandlerWifi_{wireAdapter_, wifiSink_};
   uint8_t wifiRxBuf_[WifiLink::kMaxLineBytes + 1];
@@ -496,7 +496,7 @@ class Protocol {
   // serviceOnce()'s own telemetry-cadence clock, the same reason
   // lineBuf_ above became a member -- shared safely across reentrant
   // calls for the same reason.
-  uint32_t lastEmitMs_ = 0;
+  uint32_t lastEmit_ = 0;  // [ms]
 };
 
 // Lazy singleton, mirroring shims.cpp's Rig/ensure() pattern:

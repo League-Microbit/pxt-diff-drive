@@ -44,12 +44,12 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   void requestSample() override;
   void setDuty(float duty) override;      // [-1, 1] staged
   void emergencyStop() override;          // zero NOW, unstaged
-  void tick(uint64_t nowUs) override;     // [us] execute staged + collect
+  void tick(uint64_t now) override;     // [us] execute staged + collect
   float position() const override;        // [counts]
   float velocity() const override;        // [counts/s]
   float appliedDuty() const override;     // [-1, 1]
   bool connected() const override { return connected_; }
-  uint64_t sampleTime() const override { return sampleTimeUs_; }
+  uint64_t sampleTime() const override { return sampleTime_; }
   void rebaseline() override;             // software re-anchor, no bus
   bool wedged() const override { return wedgeLatched_; }
   bool wedgeSuspect() const override { return wedgeSuspect_; }
@@ -77,9 +77,9 @@ class NezhaMotorPort final : public DiffDrive::Motor {
 
   bool writeFrame(uint8_t arg, uint8_t reg, uint8_t val);
   bool readEncoderRaw(int32_t* raw);
-  void writeShapedDuty(float duty, uint32_t nowMs);
-  void writeRawDuty(float duty, uint64_t nowUs, bool stopping);
-  void collect(uint64_t nowUs);
+  void writeShapedDuty(float duty, uint32_t now);  // [-1,1] [ms]
+  void writeRawDuty(float duty, uint64_t now, bool stopping);  // [-1,1] [us]
+  void collect(uint64_t now);  // [us]
 
   uint8_t port_;
   int8_t fwdSign_;
@@ -99,7 +99,7 @@ class NezhaMotorPort final : public DiffDrive::Motor {
                                    // through-zero corner reversal is the
                                    // latch trigger)
   bool atZero_ = false;            // commanded zero is currently held
-  uint32_t zeroSinceMs_ = 0;       // [ms] when the zero hold began --
+  uint32_t zeroSince_ = 0;       // [ms] when the zero hold began --
                                    // credited toward the reversal dwell
   bool dwelling_ = false;
   uint32_t dwellStart_ = 0;        // [ms]
@@ -125,15 +125,15 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   EncoderGlitchArmor glitchArmor_;
 
   float dutyCarry_ = 0.0f;         // [-1,1] sigma-delta remainder
-  int8_t lastWrittenPct_ = kNeverWritten;
-  uint64_t lastWriteTimeUs_ = 0;   // [us]
+  int8_t lastWritten_ = kNeverWritten;  // [pct]
+  uint64_t lastWriteTime_ = 0;   // [us]
 
   // encoder state
   int32_t encOffset_ = 0;          // [counts] software rebaseline
   float lastPosition_ = 0.0f;      // [counts]
   float velocity_ = 0.0f;          // [counts/s]
-  uint64_t sampleTimeUs_ = 0;      // [us] last SUCCESSFUL collect
-  uint64_t lastTickUs_ = 0;        // [us]
+  uint64_t sampleTime_ = 0;      // [us] last SUCCESSFUL collect
+  uint64_t lastTick_ = 0;        // [us]
   bool hasLastTick_ = false;
   bool connected_ = false;
 

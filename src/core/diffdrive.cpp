@@ -390,6 +390,10 @@ void DifferentialDrive::rebasePosition() {
   ++rebaseReq_;
 }
 
+void DifferentialDrive::rearmReferences() {
+  ++rearmReq_;
+}
+
 DifferentialDrive::Output DifferentialDrive::output() const {
   Output copy;
   uint32_t s1, s2;
@@ -469,6 +473,18 @@ void DifferentialDrive::step() {
     sampleLeft_ = WheelSample{};
     sampleRight_ = WheelSample{};
   }
+  if (rearmReq_ != seenRearmReq_) {
+    // K4 (design §4.5): disarm both position references and the twist
+    // reference -- controlStep() below re-anchors whichever of them is
+    // still active THIS SAME step(), at the wheels' current measured
+    // position, with no wasted neutral tick and no epoch bump (the
+    // wheel samples and epoch_ are untouched; only the "armed" latches
+    // that gate re-anchoring are cleared).
+    seenRearmReq_ = rearmReq_;
+    posRefLeft_.armed = false;
+    posRefRight_.armed = false;
+    twistRef_.armed = false;
+  }
 
   const Command cmd = snapshotCommand();
 
@@ -509,6 +525,14 @@ void DifferentialDrive::step() {
       sampleRight_.sampleTime == stampRightBefore) {
     ++i2cFaultCount_;
   }
+  // K2 (design §4.5): remember, per wheel, whether THIS cycle's own
+  // collect actually advanced the cached sample. Consumed at the TOP
+  // of the NEXT step()'s controlStep() call -- the earliest point that
+  // step's own positionError() can see the sample this collect just
+  // produced, since controlStep() always runs before this cycle's own
+  // requestSample()/tick() pair.
+  sampleAdvancedLeft_ = sampleLeft_.sampleTime != stampLeftBefore;
+  sampleAdvancedRight_ = sampleRight_.sampleTime != stampRightBefore;
 
   const uint64_t busyEndUs = clock_.nowMicros();
   publishOutput(nowMs, cycleStartUs, busyEndUs, measuredPeriodUs,
@@ -584,11 +608,15 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
 
   float scaledLeft = lambda_ * rawLeft;
   float scaledRight = lambda_ * rawRight;
-  const float scaledTwist = lambda_ * cmd.twist;
+
+  // K1 (design §4.5, sprint 029 ticket 001): decided up front so the
+  // SAME condition governs both the trim computed below and whether
+  // the reference is allowed to integrate once the floor has run.
+  const bool twistHoldActive = active_.twistHoldGain > 0.0f &&
+                               sampleLeft_.connected && sampleRight_.connected;
 
   float trim = 0.0f;
-  if (active_.twistHoldGain > 0.0f && sampleLeft_.connected &&
-      sampleRight_.connected) {
+  if (twistHoldActive) {
     if (!twistRef_.armed || twistRef_.epoch != epoch_) {
       twistRef_.reference = 0.0f;
       twistRef_.originLeft = sampleLeft_.position;
@@ -596,15 +624,19 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
       twistRef_.epoch = epoch_;
       twistRef_.armed = true;
     }
-    if (dt > 0.0f) twistRef_.reference += scaledTwist * dt;
     const float measuredTwistPosition =
         0.5f * ((sampleRight_.position - twistRef_.originRight) -
                 (sampleLeft_.position - twistRef_.originLeft));  // [counts]
     const float twistError = twistRef_.reference - measuredTwistPosition;
     const float authority = rail * active_.fullDutyVelocity;  // [counts/s]
+    // Headroom against the last FLOORED command (lastSpeedLeft_/Right_
+    // are only overwritten below, after applySpeedFloor() runs, so
+    // here they still hold the PREVIOUS cycle's post-floor values) --
+    // not this cycle's pre-floor scaledLeft/Right, which understates
+    // how little authority remains once the floor rescales up.
     const float headroom = std::max(
-        0.0f, authority - std::max(std::fabs(scaledLeft),
-                                   std::fabs(scaledRight)));
+        0.0f, authority - std::max(std::fabs(lastSpeedLeft_),
+                                   std::fabs(lastSpeedRight_)));
     trim = clampf(active_.twistHoldGain * twistError, -headroom, headroom);
   } else {
     twistRef_.armed = false;
@@ -613,8 +645,31 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
   float targetLeft = scaledLeft - trim;
   float targetRight = scaledRight + trim;
 
-  float speedLeft, speedRight;
-  applySpeedFloor(targetLeft, targetRight, speedLeft, speedRight);
+  float speedLeft, speedRight, floorScale;
+  applySpeedFloor(targetLeft, targetRight, speedLeft, speedRight, floorScale);
+  lastFloorScale_ = floorScale;  // [1] host-test diagnostic (lastFloorScale())
+
+  // K1, corrected 2026-09-04 (design §4.5): integrate the FLOORED
+  // COMMANDED twist -- scaledTwist * floorScale, computed from
+  // scaledLeft/scaledRight BEFORE trim is folded in -- never the
+  // post-floor targets (speedLeft/speedRight), which already contain
+  // +/-trim. The first landing (ticket 001) integrated
+  // 0.5*(speedRight - speedLeft) of those trimmed targets: the servo's
+  // own trim output fed straight back into the reference it is judged
+  // against next tick, a positive-feedback loop ideal (matched) wheels
+  // never excite because their trim stays near zero. MEASURED tovez
+  // 2026-09-04, captures/bench-acceptance-029-20260904c/: WHEELS_V 200
+  // 200 drove the left wheel negative (~-76 mm/s) and the right to
+  // 492 mm/s under this defect. floorScale (1.0 when the floor does
+  // not bind) still applies the floor's rescale to the reference, so
+  // K1's original fix (integrate the FLOORED value, not the pre-floor
+  // one) is preserved; only the trim contribution is now excluded.
+  // With vMin == 0, floorScale == 1.0 always and this reduces to the
+  // pre-K1-patch line, scaledTwist * dt.
+  if (twistHoldActive && dt > 0.0f) {
+    const float scaledTwist = 0.5f * (scaledRight - scaledLeft);
+    twistRef_.reference += scaledTwist * floorScale * dt;
+  }
 
   const float correctedLeft =
       correctedCommand(speedLeft, lastSpeedLeft_, true, biasLeft_);
@@ -643,10 +698,10 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
   const float errLeft = speedLeft - sampleLeft_.velocity;
   const float errRight = speedRight - sampleRight_.velocity;
 
-  const float posErrorLeft =
-      positionError(speedLeft, sampleLeft_, posRefLeft_, dt);
-  const float posErrorRight =
-      positionError(speedRight, sampleRight_, posRefRight_, dt);
+  const float posErrorLeft = positionError(speedLeft, sampleLeft_, posRefLeft_,
+                                           dt, sampleAdvancedLeft_);
+  const float posErrorRight = positionError(
+      speedRight, sampleRight_, posRefRight_, dt, sampleAdvancedRight_);
   const float pidLeft =
       (speedLeft == 0.0f) ? 0.0f
                           : fastPid(posErrorLeft, errLeft, cmdAccelLeft_);
@@ -854,7 +909,8 @@ float DifferentialDrive::fastPid(float posError, float err, float aCmd) const {
 }
 
 float DifferentialDrive::positionError(float speed, const WheelSample& wheel,
-                                       PositionRef& ref, float dt) {
+                                       PositionRef& ref, float dt,
+                                       bool advanced) {
   if (speed == 0.0f || dt <= 0.0f || !wheel.connected ||
       ref.epoch != epoch_ || !ref.armed) {
     ref.armed = (speed != 0.0f) && wheel.connected;
@@ -863,7 +919,31 @@ float DifferentialDrive::positionError(float speed, const WheelSample& wheel,
     ref.reference = 0.0f;
     return 0.0f;
   }
-  ref.reference += speed * dt;                                     // [counts]
+  // K2 (design §4.5): `advanced` reflects whether the PREVIOUS step()'s
+  // own collect actually moved this wheel's cached sample (see step()'s
+  // stampBefore/After comparison). A tick whose sample did NOT advance
+  // must not integrate the reference against a wheel.position that
+  // never moved -- doing so injects a full tick's worth of phantom
+  // position error the instant the sample resumes (MEASURED: +6 duty
+  // points off one frozen tick, review MK-03 / profile_probe.cpp E5).
+  // wheel.position is unchanged from the last call by construction
+  // here, so recomputing from the UNCHANGED reference against the
+  // UNCHANGED position reproduces the previous call's error exactly --
+  // "return the last error" needs no separate stored field.
+  if (advanced) {
+    ref.reference += speed * dt;                                   // [counts]
+    if (active_.posErrMax > 0.0f) {
+      // K3 anti-windup (design §4.5): clamp the STORED reference, not
+      // just the returned error, so a wheel that fell behind for a
+      // long stretch cannot carry an unbounded backlog into the taper
+      // and discharge it there (the "end bump" memory). Previously
+      // only the error below was clamped; the reference itself grew
+      // without bound.
+      const float measured = wheel.position - ref.origin;  // [counts]
+      ref.reference = clampf(ref.reference, measured - active_.posErrMax,
+                             measured + active_.posErrMax);
+    }
+  }
   float error = ref.reference - (wheel.position - ref.origin);     // [counts]
   if (active_.posErrMax > 0.0f) {
     if (error > active_.posErrMax) error = active_.posErrMax;
@@ -904,9 +984,11 @@ float DifferentialDrive::crawlDuty(float duty, float& carry) const {
 
 void DifferentialDrive::applySpeedFloor(float rawLeft, float rawRight,
                                         float& speedLeft,
-                                        float& speedRight) const {
+                                        float& speedRight,
+                                        float& floorScale) const {
   speedLeft = rawLeft;
   speedRight = rawRight;
+  floorScale = 1.0f;  // [1] no rescale unless the floor binds below
   if (active_.vMin <= 0.0f) return;
   const float dominantMag =
       std::max(std::fabs(rawLeft), std::fabs(rawRight));
@@ -914,6 +996,7 @@ void DifferentialDrive::applySpeedFloor(float rawLeft, float rawRight,
   const float scale = active_.vMin / dominantMag;
   speedLeft = rawLeft * scale;
   speedRight = rawRight * scale;
+  floorScale = scale;  // [1]
 }
 
 void DifferentialDrive::updateLatch(bool conditionNow, float window,

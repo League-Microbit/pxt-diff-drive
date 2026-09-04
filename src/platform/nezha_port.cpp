@@ -256,10 +256,10 @@ void NezhaMotorPort::emergencyStop() {
   // The one call that must not depend on a healthy tick(): zero the
   // stage AND write zero through the never-shaped stop path now.
   stagedDuty_ = 0.0f;
-  writeShapedDuty(0.0f, static_cast<uint32_t>(lastTickUs_ / 1000));
+  writeShapedDuty(0.0f, static_cast<uint32_t>(lastTick_ / 1000));
 }
 
-void NezhaMotorPort::writeShapedDuty(float duty, uint32_t nowMs) {
+void NezhaMotorPort::writeShapedDuty(float duty, uint32_t now) {  // [-1,1] [ms]
   // 1. Exact zero short-circuits ALL shaping. Stop is stop. The zero
   //    entry TIME is recorded and the last nonzero SIGN is kept: a
   //    reversal that passes through a brief commanded zero (a move
@@ -274,10 +274,10 @@ void NezhaMotorPort::writeShapedDuty(float duty, uint32_t nowMs) {
   if (duty == 0.0f) {
     if (!atZero_) {
       atZero_ = true;
-      zeroSinceMs_ = nowMs;
+      zeroSince_ = now;
     }
     dwelling_ = false;  // an explicit stop supersedes a pending dwell
-    writeRawDuty(0.0f, lastTickUs_, /*stopping=*/true);
+    writeRawDuty(0.0f, lastTick_, /*stopping=*/true);
     return;
   }
   // 2. Deadband BOOST: a genuine sub-deadband command is raised to the
@@ -293,20 +293,20 @@ void NezhaMotorPort::writeShapedDuty(float duty, uint32_t nowMs) {
   if (lastNonzeroSign_ != 0 && sign != lastNonzeroSign_) {
     if (!dwelling_) {
       dwelling_ = true;
-      dwellStart_ = atZero_ ? zeroSinceMs_ : nowMs;
+      dwellStart_ = atZero_ ? zeroSince_ : now;
     }
-    if (static_cast<float>(nowMs - dwellStart_) < reversalDwell_) {
-      writeRawDuty(0.0f, lastTickUs_, /*stopping=*/true);
+    if (static_cast<float>(now - dwellStart_) < reversalDwell_) {
+      writeRawDuty(0.0f, lastTick_, /*stopping=*/true);
       return;  // still holding; the new duty ships on a later tick
     }
     dwelling_ = false;
   }
   atZero_ = false;
   lastNonzeroSign_ = sign;
-  writeRawDuty(duty, lastTickUs_, /*stopping=*/false);
+  writeRawDuty(duty, lastTick_, /*stopping=*/false);
 }
 
-void NezhaMotorPort::writeRawDuty(float duty, uint64_t nowUs,
+void NezhaMotorPort::writeRawDuty(float duty, uint64_t now,  // [-1,1] [us]
                                   bool stopping) {
   duty = clampf(duty, -1.0f, 1.0f);
 
@@ -328,22 +328,22 @@ void NezhaMotorPort::writeRawDuty(float duty, uint64_t nowUs,
   // its last speed and one lost zero write is permanent.
   const bool stopNotTaken =
       pct == 0 && std::fabs(velocity_) > kStopConfirmVelocity;
-  if (pct == lastWrittenPct_ && !stopNotTaken) return;
+  if (pct == lastWritten_ && !stopNotTaken) return;
 
   // Min-write throttle -- stop writes always bypass it.
   if (!stopping && writeThrottle_ > 0.0f &&
-      static_cast<float>(nowUs - lastWriteTimeUs_) < writeThrottle_) {
+      static_cast<float>(now - lastWriteTime_) < writeThrottle_) {
     return;
   }
 
   // Slew -- skipped for a stop and for the very first write (the
   // kNeverWritten sentinel through a clamp once produced a
   // wrong-direction first command, a wedge trigger).
-  if (!stopping && lastWrittenPct_ != kNeverWritten) {
-    const int step = pct - lastWrittenPct_;
+  if (!stopping && lastWritten_ != kNeverWritten) {
+    const int step = pct - lastWritten_;
     const int maxStep = static_cast<int>(slewRate_);
-    if (step > maxStep) pct = lastWrittenPct_ + maxStep;
-    else if (step < -maxStep) pct = lastWrittenPct_ - maxStep;
+    if (step > maxStep) pct = lastWritten_ + maxStep;
+    else if (step < -maxStep) pct = lastWritten_ - maxStep;
   }
 
   const int signed_pct = pct * fwdSign_;
@@ -353,8 +353,8 @@ void NezhaMotorPort::writeRawDuty(float duty, uint64_t nowUs,
   if (writeFrame(direction, kRegMotorRun, magnitude)) {
     // Commit only on ACK: a NAK'd write retries next tick instead of
     // latching "already written".
-    lastWrittenPct_ = static_cast<int8_t>(pct);
-    lastWriteTimeUs_ = nowUs;
+    lastWritten_ = static_cast<int8_t>(pct);
+    lastWriteTime_ = now;
   } else {
     connected_ = false;
   }
@@ -368,7 +368,7 @@ void NezhaMotorPort::requestSample() {
   writeFrame(0x00, kRegEncoder, 0x00);
 }
 
-void NezhaMotorPort::collect(uint64_t nowUs) {
+void NezhaMotorPort::collect(uint64_t now) {  // [us]
   int32_t raw = 0;
   if (readEncoderRaw(&raw)) {
     // Glitch/discontinuity plausibility decision, extracted to
@@ -401,7 +401,7 @@ void NezhaMotorPort::collect(uint64_t nowUs) {
       // uses, generalized from "map to 0" to "map to the current
       // position."
       //
-      // Hold sampleTimeUs_ here instead of falling through to the
+      // Hold sampleTime_ here instead of falling through to the
       // shared accept-path advance. MEASURED gopiv 2026-09-02,
       // captures/gopiv-frozen-encoder-fix-20260902/notes.md: hardware
       // acceptance of this ticket's OTHER guard below (raw ==
@@ -421,7 +421,7 @@ void NezhaMotorPort::collect(uint64_t nowUs) {
       // "this sample says 0 because we just discarded an untrustworthy
       // raw delta." This tick's true velocity is unknown -- the armor
       // rejected the raw delta as implausible precisely because it
-      // cannot be trusted as motion -- so withhold sampleTimeUs_
+      // cannot be trusted as motion -- so withhold sampleTime_
       // exactly as the raw-unchanged guard below and the outright
       // read-failure branch already do, holding the prior known-good
       // velocity instead of manufacturing a zero. The position
@@ -438,7 +438,7 @@ void NezhaMotorPort::collect(uint64_t nowUs) {
       lastPosition_ = static_cast<float>(raw - encOffset_) *
                        static_cast<float>(fwdSign_);  // == prior lastPosition_
       hasLastTick_ = true;
-      return;  // sampleTimeUs_ HOLDS -- velocity_ holds its prior value
+      return;  // sampleTime_ HOLDS -- velocity_ holds its prior value
     }
     connected_ = true;
     const float pos =
@@ -454,7 +454,7 @@ void NezhaMotorPort::collect(uint64_t nowUs) {
     // captures/gopiv-profile-sweep-20260901/tour_tight.json frames
     // 185-191: posr frozen for one tick while driven, i2cf unmoved,
     // vr reported 0, duty stepped 3300->4500, wheel overshot to
-    // 420 mm/s. Withhold the fresh sampleTimeUs_ stamp exactly as the
+    // 420 mm/s. Withhold the fresh sampleTime_ stamp exactly as the
     // read-failure branch below already does, so
     // DifferentialDrive::refreshSample()'s existing
     // sampleTime-unchanged gate holds the previously-derived velocity
@@ -468,26 +468,26 @@ void NezhaMotorPort::collect(uint64_t nowUs) {
         raw == previousGoodRaw &&
         std::fabs(appliedDuty()) > kMotionThreshold) {
       lastPosition_ = pos;  // already equal to lastPosition_ by construction
-      return;  // sampleTimeUs_ HOLDS -- velocity_ holds its prior value
+      return;  // sampleTime_ HOLDS -- velocity_ holds its prior value
     }
 
     if (hasLastTick_) {
       const float dt =
-          static_cast<float>(nowUs - sampleTimeUs_) / 1e6f;  // [s]
+          static_cast<float>(now - sampleTime_) / 1e6f;  // [s]
       if (dt > 0.0f) velocity_ = (pos - lastPosition_) / dt;
     }
     lastPosition_ = pos;
-    sampleTimeUs_ = nowUs;  // stamped at collect SUCCESS only
+    sampleTime_ = now;  // stamped at collect SUCCESS only
     hasLastTick_ = true;
   } else {
-    connected_ = false;  // sampleTimeUs_ HOLDS -- age grows honestly
+    connected_ = false;  // sampleTime_ HOLDS -- age grows honestly
   }
 }
 
-void NezhaMotorPort::tick(uint64_t nowUs) {
-  lastTickUs_ = nowUs;
-  collect(nowUs);
-  writeShapedDuty(stagedDuty_, static_cast<uint32_t>(nowUs / 1000));
+void NezhaMotorPort::tick(uint64_t now) {  // [us]
+  lastTick_ = now;
+  collect(now);
+  writeShapedDuty(stagedDuty_, static_cast<uint32_t>(now / 1000));
 
   // Wedge detector: consecutive IDENTICAL position reads, raw and
   // unconditional; the suspect flavor additionally requires drive.
@@ -515,8 +515,8 @@ float NezhaMotorPort::position() const { return lastPosition_; }
 float NezhaMotorPort::velocity() const { return velocity_; }
 
 float NezhaMotorPort::appliedDuty() const {
-  if (lastWrittenPct_ == kNeverWritten) return 0.0f;
-  return static_cast<float>(lastWrittenPct_) / 100.0f;
+  if (lastWritten_ == kNeverWritten) return 0.0f;
+  return static_cast<float>(lastWritten_) / 100.0f;
 }
 
 void NezhaMotorPort::rebaseline() {

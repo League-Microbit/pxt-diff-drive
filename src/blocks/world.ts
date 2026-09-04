@@ -136,7 +136,7 @@ namespace diffDrive {
     // straight, and that is what actually hit the dots (0.7-12.7 cm
     // when it was done host-side; this moves it onto the robot).
     // Anything under 12 deg is left to curve out over the leg.
-    let turnFirstDeg = 12.0
+    let turnFirst = 12.0  // [deg]
 
     /**
      * How close counts as "arrived", in cm.
@@ -206,7 +206,7 @@ namespace diffDrive {
         // one -- re-planning (bx, by) from a fresh OTOS fix after the
         // pivot moves the robot -- and goToR() cannot do that for
         // itself, since it reads its pose once, by contract.
-        if (Math.abs(bearing) >= turnFirstDeg * Math.PI / 180) {
+        if (Math.abs(bearing) >= turnFirst * Math.PI / 180) {
             tickedMove(0, bearing * 180 / Math.PI)
             readWorld()
             ph = worldHeading() * Math.PI / 180

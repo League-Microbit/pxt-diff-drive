@@ -8,9 +8,9 @@ namespace diffDrive {
     let simHeading = 0      // [rad]
     let simVel = 0          // [mm/s]
     let simYawRate = 0      // [rad/s]
-    let simLastMs = 0
-    let simMoveRemainMm = 0
-    let simMoveRemainRad = 0
+    let simLast = 0  // [ms]
+    let simMoveRemainDist = 0  // [mm]
+    let simMoveRemainYaw = 0  // [rad]
     let simMoveActive = false
 
     // E-stop latch (sprint 007 ticket 004, closes R-13/BLK-07): mirrors
@@ -31,16 +31,16 @@ namespace diffDrive {
     // cadence) so a simulator-run program is timing-observable the same
     // way hardware is -- an anchored deadline while ticks stay
     // consecutive, re-anchored to "now" after a gap.
-    const kSimTickPeriodMs = 24
-    let simTickDeadlineMs = 0    // 0 = no tick has run yet
+    const kSimTickPeriod = 24  // [ms]
+    let simTickDeadline = 0    // [ms] 0 = no tick has run yet
     let simCycleCount = 0
     let simTickOverrunCount = 0
 
     function simIntegrate(): void {
         const now = control.millis()
-        let dt = (now - simLastMs) / 1000
+        let dt = (now - simLast) / 1000
         if (dt < 0 || dt > 0.5) dt = 0
-        simLastMs = now
+        simLast = now
         if (dt == 0) return
         // Capture the velocity/yaw-rate in effect for THIS step before
         // any end-of-move zeroing below, and clip this step's own
@@ -51,23 +51,23 @@ namespace diffDrive {
         const stepYawRate = simYawRate
         let stepDt = dt
         if (simMoveActive) {
-            const dMm = simVel * dt
-            const dRad = simYawRate * dt
+            const dDist = simVel * dt  // [mm]
+            const dYaw = simYawRate * dt  // [rad]
             let frac = 1
-            if (dMm != 0 && simMoveRemainMm < Math.abs(dMm)) {
-                const f = simMoveRemainMm / Math.abs(dMm)
+            if (dDist != 0 && simMoveRemainDist < Math.abs(dDist)) {
+                const f = simMoveRemainDist / Math.abs(dDist)
                 if (f < frac) frac = f
             }
-            if (dRad != 0 && simMoveRemainRad < Math.abs(dRad)) {
-                const f = simMoveRemainRad / Math.abs(dRad)
+            if (dYaw != 0 && simMoveRemainYaw < Math.abs(dYaw)) {
+                const f = simMoveRemainYaw / Math.abs(dYaw)
                 if (f < frac) frac = f
             }
             if (frac < 0) frac = 0
             stepDt = dt * frac
 
-            simMoveRemainMm -= Math.abs(dMm)
-            simMoveRemainRad -= Math.abs(dRad)
-            if (simMoveRemainMm <= 0 && simMoveRemainRad <= 0) {
+            simMoveRemainDist -= Math.abs(dDist)
+            simMoveRemainYaw -= Math.abs(dYaw)
+            if (simMoveRemainDist <= 0 && simMoveRemainYaw <= 0) {
                 simMoveActive = false
                 simVel = 0
                 simYawRate = 0
@@ -86,7 +86,7 @@ namespace diffDrive {
     // copies, kept as two named constants (not one derived literal) so a
     // future geometry/slip bake update can't silently reopen the gap
     // between this divisor and effectiveTrackWidth()'s.
-    const kSimTrackWidthMm = 114.2
+    const kSimTrackWidth = 114.2  // [mm]
     const kSimRotationalSlip = 0.952
 
     //% shim=diffDrive::setWheels
@@ -97,7 +97,7 @@ namespace diffDrive {
         // Differential-drive kinematics: omega [rad/s] = (v_right -
         // v_left) [mm/s] / trackWidth [mm] -- the same relation
         // _driveTwist() below applies in reverse (its hardware shim
-        // computes `twistMmS = yawRad * 0.5 * effectiveTrackWidth()`,
+        // computes `twist = yaw * 0.5 * effectiveTrackWidth()`,
         // shims.cpp). Hardware's own divisor is NOT trackWidth_ alone:
         // it is effectiveTrackWidth() = trackWidth_ / rotationalSlip_
         // (motion_engine.h), and _driveTwist() below already reproduces
@@ -106,14 +106,14 @@ namespace diffDrive {
         // hardware's calibration mechanism -- rotationalSlip_ corrects
         // for a real wheel imperfection this idealized simulator has no
         // equivalent of -- so this divides by the same two constituent
-        // constants (kSimTrackWidthMm / kSimRotationalSlip, just above)
+        // constants (kSimTrackWidth / kSimRotationalSlip, just above)
         // rather than growing its own "slip" concept. (Previously
         // divided by trackWidth_ alone via a bare 115 literal -- a 4.3%
         // discrepancy against hardware and against _driveTwist() below.
         // Before that, divided by 10 first as well, an erroneous
         // effective 1150 mm track that turned 10x too slowly --
         // R-12/BLK-06.)
-        simYawRate = (right - left) / (kSimTrackWidthMm / kSimRotationalSlip)  // [rad/s]
+        simYawRate = (right - left) / (kSimTrackWidth / kSimRotationalSlip)  // [rad/s]
         simMoveActive = false
     }
 
@@ -131,8 +131,8 @@ namespace diffDrive {
         yawRate: number): void {
         simIntegrate()
         if (simEstopped) return
-        simMoveRemainMm = Math.abs(distance)
-        simMoveRemainRad = Math.abs(yaw / 100) * Math.PI / 180
+        simMoveRemainDist = Math.abs(distance)
+        simMoveRemainYaw = Math.abs(yaw / 100) * Math.PI / 180
         let duration = 0
         if (distance != 0) duration = Math.abs(distance) / speed
         if (yaw != 0) {
@@ -164,8 +164,8 @@ namespace diffDrive {
     // _goToR()'s own comment below), so this is a genuine no-op here
     // -- nothing to store, nothing for _goToR() below to read.
     //% shim=diffDrive::engineSetGoToDeadline
-    export function _setGoToDeadline(timeoutMs: number): void {
-        // Simulator: no-op. `timeoutMs` is a hardware-only deadline
+    export function _setGoToDeadline(timeout: number): void {  // [ms]
+        // Simulator: no-op. `timeout` is a hardware-only deadline
         // backstop; nothing can strand a move in this simulator. The
         // explicit `return` below is load-bearing, not decorative: a
         // body with zero statements -- even one containing only this
@@ -216,8 +216,8 @@ namespace diffDrive {
         const spd = speed > 0 ? speed : 1
         const duration = Math.abs(s) / spd
         if (duration <= 0) return
-        simMoveRemainMm = Math.abs(s)
-        simMoveRemainRad = Math.abs(theta)
+        simMoveRemainDist = Math.abs(s)
+        simMoveRemainYaw = Math.abs(theta)
         simVel = s / duration
         simYawRate = theta / duration
         simMoveActive = true
@@ -256,11 +256,11 @@ namespace diffDrive {
         const stillCommanded = simMoveActive || simVel != 0 || simYawRate != 0
 
         const now = control.millis()
-        const consecutive = simTickDeadlineMs != 0 &&
-            now < simTickDeadlineMs + kSimTickPeriodMs
+        const consecutive = simTickDeadline != 0 &&
+            now < simTickDeadline + kSimTickPeriod
         const deadline = consecutive ?
-            simTickDeadlineMs + kSimTickPeriodMs : now + kSimTickPeriodMs
-        simTickDeadlineMs = deadline
+            simTickDeadline + kSimTickPeriod : now + kSimTickPeriod
+        simTickDeadline = deadline
 
         const wait = deadline - control.millis()
         if (wait > 0) {
@@ -279,7 +279,7 @@ namespace diffDrive {
     //% shim=diffDrive::cycleStat
     function _cycleStat(which: number): int32 {
         switch (which) {
-            case 0: return kSimTickPeriodMs * 1000  // nominal period [us]
+            case 0: return kSimTickPeriod * 1000  // nominal period [us]
             case 1: return 0                        // busy [us]: not modeled
             case 2: return simTickOverrunCount
             case 3: return simCycleCount
@@ -412,28 +412,50 @@ namespace diffDrive {
     export function probe(what: number): number { return 0 }
 
     /**
-     * End-of-move shaping. Bigger tapers and lower floors trade time
-     * for accuracy; a closed-loop caller that takes a fresh fix before
-     * every move should spend far less time on it. 0 leaves unchanged.
-     * Simulator: no taper/floor/ramp shaping model exists in the
-     * browser, so these are no-ops -- real (if trivial) bodies below,
-     * not bare `{}`, so pxt doesn't treat them as native-only shims
-     * (no pxsim implementation exists for any of the three, so an
-     * empty body would crash the simulator at the call site).
+     * RETIRED (design S4.7/S8): no-ops kept for one
+     * release so a program saved before this sprint still compiles and
+     * runs. Shaping is now `set config`'s own accel/decel/jerk/v_max/
+     * omega_max/v_floor/omega_floor fields (ConfigField), or the
+     * `setLimits` shim `test.ts`'s profile functions use. Simulator: no
+     * taper/floor/ramp shaping model exists in the browser, so these
+     * were already no-ops there -- real (if trivial) bodies below, not
+     * bare `{}`, so pxt doesn't treat them as native-only shims (no
+     * pxsim implementation exists for any of the three, so an empty
+     * body would crash the simulator at the call site).
      */
     //% shim=diffDrive::setTaperWindows
-    export function setTaperWindows(distCounts: number, yawCounts: number): void {
+    export function setTaperWindows(dist: number, yaw: number): void {
         return
     }
 
     //% shim=diffDrive::setTaperFloors
-    export function setTaperFloors(distPct: number, turnPct: number): void {
+    export function setTaperFloors(dist: number, turn: number): void {
         return
     }
 
     //% shim=diffDrive::setRampMs
     export function setRampMs(ms: number): void {
         return
+    }
+
+    // this ticket: the replacement for the three retired shims above --
+    // see shims.cpp's own setLimits() comment for the full rationale
+    // (four plain-unit int params, no wire x1000 scaling). Simulator has
+    // no shaping model to update; recorded the same way _setKernelValue()
+    // above records its own last-seen args, so a test can still observe
+    // the call landed.
+    let simLastLimitsAccel = 0
+    let simLastLimitsDecel = 0
+    let simLastLimitsVMax = 0
+    let simLastLimitsOmegaMax = 0
+
+    //% shim=diffDrive::setLimits
+    export function setLimits(accel: number, decel: number, vMax: number,
+        omegaMax: number): void {
+        simLastLimitsAccel = accel
+        simLastLimitsDecel = decel
+        simLastLimitsVMax = vMax
+        simLastLimitsOmegaMax = omegaMax
     }
 
     //% shim=diffDrive::otosBegin

@@ -30,8 +30,8 @@ enum ConfigField {
     PidMax = 6,
     //% block="twist hold gain"
     TwistHoldGain = 7,
-    //% block="speed floor"
-    SpeedFloor = 8,
+    //% block="speed floor mm/s"
+    VFloor = 8,
     //% block="position error limit"
     PosErrMax = 9,
     //% block="stall speed"
@@ -50,33 +50,36 @@ enum ConfigField {
     RotationalSlip = 16,
     //% block="clear stall latch"
     StallClear = 17,
-    //% block="pivot overrun mm"
-    PivotOverrun = 18,
+    //% block="stop distance mm"
+    StopDistance = 18,
     //% block="acceleration mm/s2"
     Accel = 19,
     //% block="deceleration mm/s2"
     Decel = 20,
     //% block="max speed mm/s"
     VMax = 21,
-    //% block="brake fraction"
-    BrakeFrac = 22,
-    //% block="distance taper counts"
-    DistTaper = 23,
-    //% block="yaw taper counts"
-    YawTaper = 24,
-    //% block="distance floor"
-    DistFloor = 25,
-    //% block="turn floor"
-    TurnFloor = 26,
-    //% block="ramp ms"
-    RampMs = 27,
+    // 22, 23, 24, 25, 26, 27, 29, 31 (BrakeFrac/DistTaper/YawTaper/
+    // DistFloor/TurnFloor/RampMs/PlateauMinS/ProfileExit) are REMOVED
+    // (design S4.7/S8): the
+    // taper window, the floor fraction, the ramp time and the plateau/
+    // profile-exit derate are all superseded by MotionLimits +
+    // VelocityShaper -- see Accel/Decel/VMax/Jerk/OmegaMax/VFloor/
+    // OmegaFloor above and below. No enum member exists for these
+    // ordinals any more; `set config` can no longer be asked for one at
+    // compile time, and the matching wire names answer `err 1` for one
+    // release (wire_adapter.cpp's kFields).
     //% block="jerk"
     Jerk = 28,
-    //% block="plateau min s"
-    PlateauMinS = 29,
-    //% block="max yaw rate"
-    MaxYawRate = 30,
-    ProfileExit = 31
+    //% block="max turn rate deg/s"
+    OmegaMax = 30,
+    //% block="turn rate floor deg/s"
+    OmegaFloor = 34,
+    //% block="arrive distance mm"
+    ArriveDist = 35,
+    //% block="arrive yaw deg"
+    ArriveYaw = 36,
+    //% block="response lag (s)"
+    Lag = 37
 }
 
 //% color=#0f9c5a icon="" block="DiffDrive"
@@ -290,12 +293,12 @@ namespace diffDrive {
         // bearing-then-chord split and short-arc wrap instead
         // (motion_engine.cpp), reaching (x, y) exactly.
         if (x == 0 && y == 0) return
-        const xMm = Math.round(x * 10)
-        const yMm = Math.round(y * 10)
-        const speedMmS = Math.round(defaultSpeed * 10)
+        const goalX = Math.round(x * 10)  // [mm]
+        const goalY = Math.round(y * 10)  // [mm]
+        const goalSpeed = Math.round(defaultSpeed * 10)  // [mm/s]
         // arrive: 1 mm -- tight enough that "on target" means on
         // target, loose enough not to fight int-mm rounding.
-        const arriveMm = 1
+        const goalArrive = 1  // [mm]
         // timeout: goToR() drives a <=180 deg pivot (its own short-arc
         // wrap) THEN the straight-line chord -- two SEQUENTIAL phases,
         // not one blended segment like startMove()'s reconciliation, so
@@ -306,12 +309,12 @@ namespace diffDrive {
         const chordCm = Math.sqrt(x * x + y * y)
         const pivotS = 180 / defaultYawRate
         const straightS = chordCm / defaultSpeed
-        const timeoutMs = Math.round((pivotS + straightS) * 1000) + 1500
+        const timeout = Math.round((pivotS + straightS) * 1000) + 1500  // [ms]
         // Must precede _goToR() immediately -- see
-        // Rig::pendingGoToDeadlineMs_'s comment (shims.cpp) for the
+        // Rig::pendingGoToDeadline_'s comment (shims.cpp) for the
         // one-shot handoff contract this pair relies on.
-        _setGoToDeadline(timeoutMs)
-        _goToR(xMm, yMm, speedMmS, arriveMm)
+        _setGoToDeadline(timeout)
+        _goToR(goalX, goalY, goalSpeed, goalArrive)
     }
 
     /**

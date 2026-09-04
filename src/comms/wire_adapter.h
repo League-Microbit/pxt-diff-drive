@@ -99,13 +99,13 @@ class WireAdapter : public Wire::Adapter {
   // `identity`'s own pointer fields are borrowed (Wire::Identity's own
   // doc comment, wire_handler.h): the CALLER's identity strings must
   // outlive this adapter. Copied by value here (copies the pointers,
-  // not the strings they point to). `nowMs`, if supplied, must remain
+  // not the strings they point to). `now`, if supplied, must remain
   // valid for this adapter's whole lifetime -- in practice a free
   // function or a static member function, never a capturing closure
   // (the type above cannot express one). Defaults to nullptr for every
   // caller with no real clock to offer (every existing host test).
   explicit WireAdapter(const Wire::Identity& identity,
-                       NowMsFn nowMs = nullptr);
+                       NowMsFn now = nullptr);
 
   // ---- Wire::Adapter: session ----
   void identity(Wire::Identity& out) const override;
@@ -145,7 +145,7 @@ class WireAdapter : public Wire::Adapter {
 
   // WHEELS_X: wire fields already mm/mm/mm-per-s/ms; `cruise` < 0
   // refused kRange (a ceiling has no sign); `cruise` == 0 -> configured
-  // default via engineDefaultCruiseMmS(), refused kRange if that too is
+  // default via engineDefaultCruise(), refused kRange if that too is
   // unconfigured.
   Wire::Result onWheelsX(float left, float right, float cruise,
                          uint32_t timeout, uint32_t id) override;
@@ -289,7 +289,7 @@ class WireAdapter : public Wire::Adapter {
   // groups:
   //   - WHEELS_V/WHEELS_X/MOVE_V resolve done-vs-timeout-vs-superseded
   //     entirely from this class's OWN existing
-  //     motionObligationActive_/motionObligationDeadlineMs_ bookkeeping
+  //     motionObligationActive_/motionObligationDeadline_ bookkeeping
   //     (already present for hasLiveMotionObligation()) -- no new
   //     dependency.
   //   - MOVE_X/GO_TO_R/GO_TO_W additionally need to know whether the
@@ -338,14 +338,14 @@ class WireAdapter : public Wire::Adapter {
   bool jobOwnsMotion_ = false;
 
   // ---- real clock + motion-obligation state ----
-  NowMsFn nowMs_ = nullptr;
+  NowMsFn now_ = nullptr;
   // `mutable`, same reason as the pendingActive_ family below: sprint 016
   // ticket 003 has resolvePendingIfDue() (a const method, called from the
   // const accessors lastDone()/lastDoneReason()) clear this the moment it
   // lazily discovers a pending motion has resolved, not only on an
   // explicit STOP/ESTOP as before.
   mutable bool motionObligationActive_ = false;
-  uint32_t motionObligationDeadlineMs_ = 0;  // [ms], nowMs_'s own scale
+  uint32_t motionObligationDeadline_ = 0;  // [ms], now_'s own scale
 
   // ---- sprint 005 ticket 004: motion-completion tracking (S8.8) -----
   // `pendingActive_`/`pendingId_`/`pendingGoalDirected_` track the most
@@ -360,7 +360,7 @@ class WireAdapter : public Wire::Adapter {
   // `stall_clear`, an estop cleared) -- this class reports what a
   // motion ACTUALLY ended with, not the live diagnostic state at read
   // time. Only armed/force-resolved with a real clock wired
-  // (nowMs_ != nullptr, matching motionObligationActive_'s own
+  // (now_ != nullptr, matching motionObligationActive_'s own
   // gating) -- with no clock, lastDone()/lastDoneReason() keep
   // reporting the honest 0/kNone default forever, same as before this
   // ticket. See wire_adapter.cpp for the full resolution logic.
@@ -409,7 +409,7 @@ class WireAdapter : public Wire::Adapter {
 
   // Arms tracking for a freshly ACCEPTED motion verb -- call AFTER any
   // supersede has already been resolved (forceResolvePending(kAborted))
-  // and AFTER motionObligationActive_/motionObligationDeadlineMs_ are
+  // and AFTER motionObligationActive_/motionObligationDeadline_ are
   // set. `goalDirected`: true for MOVE_X/GO_TO_R/GO_TO_W (needs
   // engineMoveActive() to resolve), false for WHEELS_V/WHEELS_X/MOVE_V
   // (resolves purely from the deadline -- see resolvePendingReason()).
