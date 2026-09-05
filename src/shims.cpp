@@ -245,6 +245,18 @@ struct Rig {
   // motion.ts's startGoTo()) so there is nowhere for a stale value to
   // leak in from.
   uint32_t pendingGoToDeadline_ = 0;  // [ms]
+
+  // Same one-shot handoff shape as pendingGoToDeadline_ immediately
+  // above, added for the go-to entry point's own yaw-rate ceiling
+  // (engineSetGoToYawRate()/engineGoToRArmed() below) -- kept a
+  // SEPARATE field/setter pair rather than a 5th engineGoToRArmed()
+  // parameter for the exact same reason pendingGoToDeadline_ itself
+  // exists: every `//%` shim in this file stays at <=4 params (see
+  // pendingGoToDeadline_'s own comment for the PXT packager crash this
+  // avoids). One caller (sim.ts's _setGoToYawRate(), called by
+  // motion.ts's startGoTo() immediately before _goToR(), alongside
+  // _setGoToDeadline()).
+  float pendingGoToYawRate_ = 0.0f;  // [cdeg/s]
 };
 
 static Rig* rig = nullptr;
@@ -587,71 +599,49 @@ void startMove(int distance, int yaw, int speed, int yawRate) {
   // block API still passes two INDEPENDENT rate ceilings (speed for the distance
   // axis, yawRate for the yaw axis), picking whichever axis takes
   // LONGER at its own ceiling as the move's shared duration. Reconciled
-  // here, not by favoring one of the two legacy rates: derive the
-  // single cruise that reproduces the EXACT SAME commanded
-  // velocity/twist this dual-rate math has always produced, so
-  // move()/whileMoving()'s observable behavior is unchanged.
-  //
-  // Algebra: moveX()'s own wheels_x-style reduction commands
-  // velocity = distTarget/dominant*cruiseCounts (dominant =
-  // max(|left|,|right|), in counts). Setting cruiseCounts =
-  // dominant/duration -- `duration` computed the OLD way below --
-  // makes that velocity equal distTarget/duration exactly, the legacy
-  // formula, for ANY distance/yaw/speed/yawRate combination, not only
-  // the degenerate straight/pivot cases.
-  const float cpm = r.engine.countsPerMm();
-  const float b = r.engine.effectiveTrackWidth();
-  const float distTarget = distanceF * cpm;              // [counts]
-  const float yawTarget = rotation * 0.5f * b * cpm;   // [counts]
-  const float distSpeed =
-      static_cast<float>(speed > 0 ? speed : 1) * cpm;    // [counts/s]
-  const float yawRadPerS =
-      static_cast<float>(yawRate > 0 ? yawRate : 1) * kCdegToRad;
-  const float twistSpeed = yawRadPerS * 0.5f * b * cpm;  // [counts/s]
+  // via MotionEngine::reconcileDualRateCruise() (motion_engine.h), not
+  // by favoring one of the two legacy rates: it derives the single
+  // cruise that reproduces the EXACT SAME commanded velocity/twist this
+  // dual-rate math has always produced, so move()/whileMoving()'s
+  // observable behavior is unchanged. The floor-to-nonzero-before-
+  // converting-units step below (avoiding a divide-by-zero, not a
+  // meaningful floor) stays here rather than moving into that shared
+  // method, because it operates on the RAW int-scale inputs, before
+  // either is converted to mm/s or rad/s.
+  const float speedFloored =
+      static_cast<float>(speed > 0 ? speed : 1);          // [mm/s]
+  const float yawRateFloored =
+      static_cast<float>(yawRate > 0 ? yawRate : 1) * kCdegToRad;  // [rad/s]
 
-  // One duration covers both axes -> simultaneous arc completion. This
-  // max()-based `duration` is also what derives `cruise` below
-  // (unaffected by the split-aware budget fix further down) -- it is
-  // the legacy dual-rate reconciliation the header comment above
-  // describes, correct regardless of whether moveX() ends up splitting.
-  float distDuration = 0.0f;  // [s]
-  if (distTarget != 0.0f)
-    distDuration = std::fabs(distTarget) / distSpeed;
-  float yawDuration = 0.0f;  // [s]
-  if (yawTarget != 0.0f)
-    yawDuration = std::fabs(yawTarget) / twistSpeed;
-  const float duration = distDuration > yawDuration ? distDuration
-                                                      : yawDuration;
-  if (duration <= 0.0f) {
+  const MotionEngine::DualRateReconciliation rr =
+      r.engine.reconcileDualRateCruise(distanceF, rotation, speedFloored,
+                                       yawRateFloored);
+  if (rr.cruise <= 0.0f) {
     // Nothing to do -- release right away rather than leaving kBlock
     // held with no move in flight and no tick loop coming to notice.
     protocolReleaseBlockOwnership();
     return;
   }
 
-  const float left = distTarget - yawTarget;
-  const float right = distTarget + yawTarget;
-  const float absLeft = std::fabs(left);
-  const float absRight = std::fabs(right);
-  const float dominant = absLeft > absRight ? absLeft : absRight;
-  const float cruise = (dominant / duration) / cpm;  // [mm/s]
-
   // moveX() (motion_engine.cpp) splits a nonzero distance combined with
   // a large enough rotation into pivot-then-straight -- two SEQUENTIAL
   // segments sharing the one deadline this call sets (motion_engine.h:
   // "NOT reset across a pivot-to-straight phase transition") -- rather
   // than one blended segment where both axes finish together. Budget
-  // the SUM of both axes' durations for that case; max() only covers
-  // the genuinely simultaneous (non-split) move. Read the split
-  // threshold from MotionEngine itself (turnFirstAngle(), the public
-  // accessor for its own private kTurnFirstAngle) rather than
-  // retyping the 50 deg constant here, so this decision can never drift
-  // from moveX()'s own.
+  // the SUM of both axes' durations for that case; reconcileDualRateCruise()'s
+  // own max()-based duration (which ALSO derives `cruise` above,
+  // unaffected by this split-aware budget) only covers the genuinely
+  // simultaneous (non-split) move. Read the split threshold from
+  // MotionEngine itself (turnFirstAngle(), the public accessor for its
+  // own private kTurnFirstAngle) rather than retyping the 50 deg
+  // constant here, so this decision can never drift from moveX()'s own.
   const bool willSplit =
       distanceF != 0.0f &&
       std::fabs(rotation) >= MotionEngine::turnFirstAngle();
   const float budgetDuration =
-      willSplit ? (distDuration + yawDuration) : duration;
+      willSplit ? (rr.distDuration + rr.yawDuration)
+                : (rr.distDuration > rr.yawDuration ? rr.distDuration
+                                                     : rr.yawDuration);
 
   // Backstop: for a single segment, this covers the end-of-move taper
   // (service()) -- the last ~15 deg / ~40 mm run at reduced rate,
@@ -663,7 +653,7 @@ void startMove(int distance, int yaw, int speed, int yawRate) {
   const uint32_t timeout =
       static_cast<uint32_t>(budgetDuration * 1000.0f) + 1500u;
 
-  r.engine.moveX(distanceF, rotation, cruise, timeout);
+  r.engine.moveX(distanceF, rotation, rr.cruise, timeout);
 }
 
 //%
@@ -913,29 +903,6 @@ bool tickDrive() {
   // first pass it clears (run(), protocol.cpp).
   if (!active) protocolReleaseBlockOwnership();
   return active;
-}
-
-// cycleStat(): read-only tick/cycle diagnostics for desk verification
-// (and future wire-protocol reporting). 0 = measured cycle period [us],
-// 1 = measured busy time [us] (both straight off the kernel's own
-// Output, unaffected by who calls step()); 2 = the Rig-level
-// tick-overrun counter above (NOT the kernel's own cycleOverrunCount_,
-// which only its unused run() increments); 3 = cycleCount (existing
-// kernel Output field, likewise unaffected by who calls step()).
-// Deliberately NOT exposing more than these four fields -- diagValue()
-// above already covers the rest of Output for the wire protocol's DIAG
-// verb.
-//%
-int cycleStat(int which) {
-  Rig& r = ensure();
-  const DiffDrive::DifferentialDrive::Output out = r.kernel.output();
-  switch (which) {
-    case 0: return static_cast<int>(out.cyclePeriodMeasured);
-    case 1: return static_cast<int>(out.cycleBusy);
-    case 2: return static_cast<int>(r.tickOverrunCount);
-    case 3: return static_cast<int>(out.cycleCount);
-    default: return 0;
-  }
 }
 
 // ---- starvation watchdog ------------------------------------------------
@@ -1557,6 +1524,21 @@ void engineSetGoToDeadline(uint32_t timeout) {  // [ms]
   ensure().pendingGoToDeadline_ = timeout;
 }
 
+// `//%`-annotated -- same one-shot pre-arm shape as
+// engineSetGoToDeadline() immediately above, added so
+// engineGoToRArmed() below can reconcile a SEPARATE yaw-rate ceiling
+// against `speed` (mirroring startMove()'s existing (distance, yaw,
+// speed, yawRate) shape) without becoming a 5th engineGoToRArmed()
+// parameter -- see Rig::pendingGoToYawRate_'s own comment for why that
+// would resurrect the exact packager crash pendingGoToDeadline_ was
+// split out to avoid. One caller only (sim.ts's _setGoToYawRate(),
+// called by motion.ts's startGoTo() immediately before _goToR(),
+// alongside _setGoToDeadline()).
+//%
+void engineSetGoToYawRate(int yawRate) {  // [cdeg/s]
+  ensure().pendingGoToYawRate_ = static_cast<float>(yawRate);
+}
+
 // `//%`-annotated -- the block layer's own entry point onto the SAME
 // goToR() the wire's GO_TO_R verb reaches via engineGoToR() above,
 // just split to FOUR parameters (engineSetGoToDeadline() immediately
@@ -1565,6 +1547,20 @@ void engineSetGoToDeadline(uint32_t timeout) {  // [ms]
 // Deliberately delegates to engineGoToR() above rather than calling
 // r.engine.goToR() directly a second time, so the actual move-engine
 // call site stays in exactly one place.
+//
+// MotionEngine::goToR() threads a SINGLE `speed`/cruise parameter
+// through both its pivot and straight phases (motion_engine.cpp:
+// queuePivotThenStraight() reuses the same `cruise` for both), exactly
+// as moveX() does for startMove()'s own two axes -- so this reconciles
+// `speed` against the pre-armed yaw-rate ceiling
+// (Rig::pendingGoToYawRate_) the SAME way startMove() reconciles its
+// own two rate ceilings, via the shared
+// MotionEngine::reconcileDualRateCruise(). decomposeGoToR() reproduces
+// goToR()'s own bearing-then-chord split decision first, so this
+// reconciliation can never disagree with which phases goToR() will
+// actually run: the pivot/straight pair (bearingRaw, chord) when it
+// will split, or the single blended segment's own (theta, arcLength)
+// pair when it will not (see motion_engine.h's own GoToRPlan comment).
 //%
 void engineGoToRArmed(float x, float y, float speed, float arrive) {
   // Refused (a silent no-op), not superseding, while a wire motion or a
@@ -1575,7 +1571,26 @@ void engineGoToRArmed(float x, float y, float speed, float arrive) {
   // startMove() above.
   if (!protocolTryTakeBlockOwnership()) return;
   Rig& r = ensure();
-  engineGoToR(x, y, speed, arrive, r.pendingGoToDeadline_);
+
+  const MotionEngine::GoToRPlan plan = MotionEngine::decomposeGoToR(x, y);
+  const float speedFloored = speed > 0.0f ? speed : 1.0f;  // [mm/s]
+  const float yawRateFloored =
+      (r.pendingGoToYawRate_ > 0.0f ? r.pendingGoToYawRate_ : 1.0f) *
+      kCdegToRad;  // [rad/s]
+  const float pivotRotation = plan.willSplit ? plan.bearingRaw : plan.theta;
+  const float straightDistance =
+      plan.willSplit ? plan.chord : plan.arcLength;
+
+  const MotionEngine::DualRateReconciliation rr =
+      r.engine.reconcileDualRateCruise(straightDistance, pivotRotation,
+                                       speedFloored, yawRateFloored);
+  // Nothing to reconcile (target essentially at the current pose) --
+  // fall back to `speed` unchanged; goToR()'s own `arrive` gate below
+  // is what actually decides this is a no-op, same as before this
+  // reconciliation existed.
+  const float cruise = rr.cruise > 0.0f ? rr.cruise : speedFloored;
+
+  engineGoToR(x, y, cruise, arrive, r.pendingGoToDeadline_);
 }
 
 // GO_TO_W's own PoseSource selection: the ONE place this project

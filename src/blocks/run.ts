@@ -1,8 +1,27 @@
 namespace diffDrive {
-    // Parts of the RUN command currently being dispatched: [0] is the
-    // name, [1..] its arguments. Safe as shared state because
-    // MessageBus delivers these events one at a time, each after the
-    // previous handler returns.
+    // Argument-snapshot STACK for the RUN command(s) currently being
+    // dispatched: each frame is one command's split parts ([0] the
+    // name, [1..] its arguments), and the top of the stack (the last
+    // element) is whichever command is innermost on this fiber right
+    // now.
+    //
+    // A stack, not a bare variable, because RUN dispatch nests: the
+    // abort/clearestop bypass (src/comms/protocol.h) can dispatch a
+    // second command reentrantly, on this SAME fiber, while an outer
+    // handler's job is still mid-tick -- RUN handling runs nested on
+    // the protocol fiber itself rather than a second, forked fiber per
+    // command (see onRun()'s own doc comment below). wireRunDispatch()
+    // pushes a new frame before invoking any handler for it and pops
+    // that frame in a `finally` once every handler/any-handler has
+    // run, so an outer handler's runArg()/runArgText()/runArgCount()
+    // calls made AFTER a nested dispatch returns still see the OUTER
+    // command's own arguments, not whatever the nested dispatch left
+    // behind. Replaces a bare module-level `runParts` a nested
+    // dispatch could silently overwrite out from under the handler
+    // that was still running -- nothing exercised that today (every
+    // handler in this package reads its arguments only at entry,
+    // before any reentrancy point), but nothing enforced it either.
+    //
     // Declared with NO INITIALISER, created on first use. This file's
     // namespace initialisers run AFTER a test file's top-level code, so
     // an initialiser here is doubly wrong: `runNames.push(...)` from a
@@ -12,17 +31,27 @@ namespace diffDrive {
     // scheduled to print one), and any initialiser that DID run would
     // then wipe the handlers that were just registered. Measured both
     // ways on vevov 2026-08-21.
-    let runParts: string[]
+    let runPartsStack: string[][]
     let runNames: string[]
     let runHandlers: ((arg: number) => void)[]
     let runAnyHandlers: ((name: string, arg: number) => void)[]
     let runWired: boolean
 
     function ensureRunState(): void {
-        if (!runParts) runParts = []
+        if (!runPartsStack) runPartsStack = []
         if (!runNames) runNames = []
         if (!runHandlers) runHandlers = []
         if (!runAnyHandlers) runAnyHandlers = []
+    }
+
+    // The parts array of the innermost RUN command currently
+    // dispatching on this fiber (the top of runPartsStack), or
+    // `undefined` when nothing is dispatching at all -- e.g. a call
+    // to runArg()/runArgText()/runArgCount() from outside any onRun()
+    // handler.
+    function currentRunParts(): string[] {
+        if (!runPartsStack || runPartsStack.length == 0) return undefined
+        return runPartsStack[runPartsStack.length - 1]
     }
 
     // ================= remote test trigger (RUN verb) =================
@@ -47,13 +76,23 @@ namespace diffDrive {
             const text = runCommandText()
             if (text.length == 0) return
             ensureRunState()
-            runParts = text.split(":")
-            const name = runParts[0]
-            for (let i = 0; i < runNames.length; i++) {
-                if (runNames[i] == name) runHandlers[i](runArg(0))
-            }
-            for (let i = 0; i < runAnyHandlers.length; i++) {
-                runAnyHandlers[i](name, runArg(0))
+            const parts = text.split(":")
+            const name = parts[0]
+            // Push this dispatch's own frame -- see runPartsStack's
+            // declaration comment above -- and pop it in a `finally`
+            // so a handler that throws still unwinds the stack
+            // correctly, leaving whatever dispatch is next-outermost
+            // (if any) with its own frame back on top.
+            runPartsStack.push(parts)
+            try {
+                for (let i = 0; i < runNames.length; i++) {
+                    if (runNames[i] == name) runHandlers[i](runArg(0))
+                }
+                for (let i = 0; i < runAnyHandlers.length; i++) {
+                    runAnyHandlers[i](name, runArg(0))
+                }
+            } finally {
+                runPartsStack.pop()
             }
         })
     }
@@ -70,9 +109,15 @@ namespace diffDrive {
      * test functions to names so the bench host can trigger them
      * remotely, the same functions a button handler calls. The handler
      * receives the first argument as a number (0 when there is none);
-     * further arguments are available from runArg(). Handlers run on
-     * their own fiber, so a long test (a full tour) doesn't block the
-     * protocol. Names are matched exactly, so keep them lower case.
+     * further arguments are available from runArg(). Handlers run
+     * NESTED, directly on the wire's own (protocol) fiber -- not
+     * forked to a fiber of their own -- so anything that sleeps or
+     * blocks inside a handler body (or anything it calls) stalls
+     * PING/STATUS/ESTOP and every other wire command for as long as it
+     * runs. Keep a long test (a full tour) alive by ticking your own
+     * wait loop instead of sleeping (see test.ts's tickWait()); every
+     * tour handler in this package already does this. Names are
+     * matched exactly, so keep them lower case.
      * @param name the command name to answer to, eg: "tour"
      */
     //% block="on run %name $arg"
@@ -211,17 +256,65 @@ namespace diffDrive {
         return isNaN(value) ? 0 : value
     }
 
+    /**
+     * Typo-safe sibling of runArg(): a three-way contract that keeps
+     * "no such argument" distinct from "argument present but garbage",
+     * which runArg() collapses into the same 0. Unlike runArg(), this
+     * is opt-in -- every existing runArg() call site (pivot, face, arc,
+     * straight, seedxy, turnrate, etc.) is UNCHANGED by this function's
+     * existence.
+     *
+     *   - ABSENT   (runArgText(i) == "")        -> fallback
+     *   - PRESENT, valid, > minExclusive         -> the parsed value
+     *   - PRESENT but unparseable, OR <= minExclusive -> NaN
+     *
+     * NaN is the sentinel because it never collides with a real
+     * argument value a caller might legitimately pass (RUN:circle:0 is
+     * a valid, if degenerate, radius under the bare two-argument form
+     * -- parseFloat("0") is 0, not NaN, so it is returned as-is).
+     * NaN is NEVER the same as fallback and NEVER 0: a caller must
+     * check `isNaN()` itself rather than treating the return value as
+     * always-usable the way runArg()'s is.
+     *
+     * minExclusive is the opt-in "this argument is geometrically a
+     * radius (or similar quantity)" guard the Solution text asks for
+     * ("rejects NaN and non-positive radii"): passing 0 makes any
+     * parsed value <= 0 count as invalid too, folded into the same NaN
+     * sentinel rather than a second return channel. Left at its
+     * default (NaN, meaning "no bound") the function is pure typo
+     * detection with no range check at all. A parameterized bound
+     * lives on this one function rather than a wrapper per call site
+     * because every current caller wants the exact same "not a real
+     * radius" rule -- a wrapper would just be `runArgOr(i, fb, 0)`
+     * spelled out three times.
+     * @param i argument index, 0 being the first after the name, eg: 0
+     * @param fallback value to use when the argument is absent, eg: 30
+     * @param minExclusive reject a parsed value at or below this, eg: 0
+     */
+    //% blockHidden=true
+    export function runArgOr(i: number, fallback: number,
+        minExclusive: number = NaN): number {
+        const text = runArgText(i)
+        if (text.length == 0) return fallback
+        const value = parseFloat(text)
+        if (isNaN(value)) return NaN
+        if (!isNaN(minExclusive) && value <= minExclusive) return NaN
+        return value
+    }
+
     /** The i-th argument of the run command, as text ("" if absent). */
     //% blockHidden=true
     export function runArgText(i: number): string {
-        if (!runParts || i < 0 || i + 1 >= runParts.length) return ""
-        return runParts[i + 1]
+        const parts = currentRunParts()
+        if (!parts || i < 0 || i + 1 >= parts.length) return ""
+        return parts[i + 1]
     }
 
     /** How many arguments the run command being handled carries. */
     //% blockHidden=true
     export function runArgCount(): number {
-        if (!runParts) return 0
-        return runParts.length - 1
+        const parts = currentRunParts()
+        if (!parts) return 0
+        return parts.length - 1
     }
 }

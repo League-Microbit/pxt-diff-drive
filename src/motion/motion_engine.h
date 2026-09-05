@@ -214,6 +214,40 @@ class MotionEngine {
   // unit now a trailing comment, per this project's naming rule.
   float dominantAxisTravel(float distance, float rotation) const;  // [mm] [rad] -> [mm]
 
+  // A caller-facing pair (moveX()/goToR()) that reports its own
+  // reconciled duration alongside `cruise`, in [s] -- a plain aggregate
+  // (see AxisLimits above for why: no default member initializers, so
+  // it stays a C++11 aggregate).
+  struct DualRateReconciliation {
+    float cruise;        // [mm/s] see reconcileDualRateCruise() below
+    float distDuration;  // [s] the distance axis's own ceiling-limited duration
+    float yawDuration;   // [s] the yaw axis's own ceiling-limited duration
+  };
+
+  // The block API (`move`/`goTo`) exposes two INDEPENDENT rate ceilings
+  // -- a distance-axis speed and a yaw-axis rate -- but every native
+  // move-engine entry point (moveX()/goToR()) takes exactly one
+  // `cruise`. This reconciles the two into that one value: whichever
+  // axis takes LONGER at its own ceiling governs a shared `duration`
+  // (`distDuration`/`yawDuration`, both returned so a caller whose own
+  // move splits into sequential phases can budget a deadline off their
+  // SUM instead of this method's own max-based `duration`), and
+  // `cruise` is the dominant WHEEL's speed that reproduces the exact
+  // same commanded velocity/twist a caller driving both axes at this
+  // single ceiling would produce. `distance` [mm] and `rotation` [rad]
+  // are the axis targets (as moveX() itself would receive them, or the
+  // bearing/chord pair goToR()'s own split queues -- see decomposeGoToR()
+  // below); `speed` [mm/s] and `yawRate` [rad/s] must already be
+  // floored to a positive value by the caller (the same "avoid a
+  // divide-by-zero, not a meaningful floor" contract shims.cpp's
+  // startMove() already applies to its own int-scale inputs before
+  // converting them here). Returns cruise/distDuration/yawDuration all
+  // 0 when there is nothing to do (both axes already at target),
+  // matching beginSegment()'s own "dominant <= 0" degenerate contract.
+  DualRateReconciliation reconcileDualRateCruise(
+      float distance, float rotation, float speed,
+      float yawRate) const;  // [mm] [rad] [mm/s] [rad/s]
+
   // ---- the two primitives (motion-api.md S3.1/S3.2) ----
 
   // wheels_v(left, right, duration): hold each wheel at a commanded
@@ -258,6 +292,28 @@ class MotionEngine {
   // shims.cpp's startMove(), budgeting a caller-supplied timeout) reads
   // it from this class instead of re-typing the constant a second time.
   static constexpr float turnFirstAngle() { return kTurnFirstAngle; }
+
+  // goToR()'s own bearing-then-chord decomposition of a body-frame
+  // target (x forward, y left, both [mm]), extracted into its own pure
+  // function so a caller that must reconcile a SEPARATE yaw-rate
+  // ceiling against goToR()'s own split decision (e.g. the block API's
+  // go-to entry point) can compute the exact same split goToR() itself
+  // will make, rather than re-deriving it and risking drift -- same
+  // rationale as turnFirstAngle() just above, extended to the whole
+  // decomposition instead of only its threshold. See goToR()'s own
+  // comment (below/motion_engine.cpp) for the derivation of each field;
+  // `bearingRaw`/`chord` are the pivot/straight pair goToR() queues when
+  // `willSplit`, `theta`/`arcLength` are the single blended segment's
+  // own (rotation, distance) pair when it is not. A plain aggregate,
+  // same reason AxisLimits/DualRateReconciliation above are.
+  struct GoToRPlan {
+    float bearingRaw;  // [rad] atan2(y, x) -- the pivot angle when willSplit
+    float theta;       // [rad] wrapped 2*bearingRaw -- goToR()'s own split-decision angle, and the blended segment's own rotation when !willSplit
+    float chord;       // [mm] hypot(x, y) -- the straight-phase distance when willSplit
+    float arcLength;   // [mm] the blended segment's own signed distance when !willSplit
+    bool willSplit;    // |theta| >= kTurnFirstAngle
+  };
+  static GoToRPlan decomposeGoToR(float x, float y);  // [mm] [mm]
 
   // ---- move engine (motion-api.md S3.3-S3.5) -- see this file's header
   // comment for the shape of each reduction. ----
