@@ -26,15 +26,6 @@ __attribute__((noinline)) int guardedSerialSend(uint8_t* buf, int len) {
 }
 
 constexpr uint8_t kLineDelimiter = 0x0A;
-
-// Bounded retry cap for writeLine()'s two-writer guard (ticket 006):
-// small enough that a fiber stuck waiting cannot meaningfully stall the
-// 50 ms telemetry emission cadence (kMaxSendAttempts * 2 ms sleep =
-// 10 ms worst case), large enough that ordinary contention between the
-// TS fiber's emitLine() and the protocol fiber's own replies/keepalives
-// clears well within it. See writeLine()'s own doc comment
-// (serial_transport.h) for the policy this implements.
-constexpr int kMaxSendAttempts = 5;
 }  // namespace
 
 void SerialTransport::begin() {
@@ -51,25 +42,13 @@ void SerialTransport::begin() {
 }
 
 void SerialTransport::writeLine(const uint8_t* buf, size_t len) {
-  // Two-writer guard, bounded retry on the caller side (ticket 006):
-  // unlike RadioTransport::sendLine(), a caller that finds the guard
-  // already held does not drop immediately -- it sleeps 2 ms and checks
-  // again, up to kMaxSendAttempts times, because serial has no caller
-  // whose loss is "fine" (see this function's own doc comment in
-  // serial_transport.h). Exhausting the cap without ever acquiring the
-  // guard counts as a drop and gives up without sending anything.
-  int attempts = 0;
-  while (sending_) {
-    if (++attempts >= kMaxSendAttempts) {
-      ++dropCount_;
-      return;
-    }
-    vfpSafeSleep(2);
-  }
-  sending_ = true;
-
-  // Both uBit.serial.send() calls' return values are checked (ticket
-  // 006; previously ignored) -- a negative return indicates the send
+  // Single writer: the protocol fiber (see this function's own doc
+  // comment, serial_transport.h). Nothing is claimed or released here
+  // -- the two yielding sends below can only ever be interleaved by a
+  // SECOND writer, and there is none.
+  //
+  // Both uBit.serial.send() calls' return values are checked -- a
+  // negative return indicates the send
   // itself failed (mirrors this file's own tryReadLine(), which already
   // treats a negative uBit.serial.read() result as an error/no-data
   // signal). Either call failing counts as one dropped line, not two.
@@ -93,7 +72,6 @@ void SerialTransport::writeLine(const uint8_t* buf, size_t len) {
     ok = false;
   }
 
-  sending_ = false;
   if (!ok) ++dropCount_;
 }
 

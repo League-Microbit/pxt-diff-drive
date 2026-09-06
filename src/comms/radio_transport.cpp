@@ -86,17 +86,22 @@ void RadioTransport::onDatagram() {
   size_t len = d[2];
   if (static_cast<int>(kFrameHeaderBytes + len) > plen) return;
   if (len > 0 && d[kFrameHeaderBytes + len - 1] == kLineDelimiter) --len;
-  if (!radioRxLineFits(len, sizeof(rxLine_))) {
-    // Over-length: REJECT the whole frame -- never truncate it to a
-    // shorter, still-parseable prefix and deliver that prefix as if it
-    // were the complete line (radioRxLineFits()'s own doc comment,
-    // radio_transport.h, explains why truncate-and-accept was the
-    // actual hazard). rxReady_/rxLine_ are left untouched, exactly as
-    // an already-dropped MORE-flagged fragment above leaves them.
-    ++rxOversizeDropped_;
+  // One call decides the outcome and records it, so no path out of this
+  // handler can be a silent drop. radioRxClassify() is host-portable
+  // and host-tested (radio_transport.h); the wiring around it here is
+  // review-verified only, since this file needs pxt.h.
+  //
+  // Over-length: REJECT the whole frame -- never truncate it to a
+  // shorter, still-parseable prefix and deliver that prefix as if it
+  // were the complete line (radioRxLineFits()'s own doc comment).
+  // Slot busy: the previous line has not been drained yet. Both leave
+  // rxReady_/rxLine_ untouched, exactly as an already-dropped
+  // MORE-flagged fragment above leaves them -- the difference now is
+  // that a bench operator can see they happened.
+  if (radioRxClassify(len, sizeof(rxLine_), rxReady_, rxCounters_) !=
+      RadioRxDisposition::kAccept) {
     return;
   }
-  if (rxReady_) return;  // previous line unconsumed: drop (reference behavior)
   if (len > 0) memcpy(rxLine_, d + kFrameHeaderBytes, len);
   rxLen_ = len;
   rxReady_ = true;
@@ -149,6 +154,10 @@ void RadioTransport::sendFragmented(const uint8_t* payload,
 
 bool RadioTransport::tryReceiveLine(uint8_t* outBuf, size_t outCap,
                                     size_t* outLen) {
+  // Opt-in gate, ahead of ensureRadioReady(): NOT calling that is what
+  // leaves the radio to MakeCode's own radio blocks (enable()'s own
+  // doc comment, radio_transport.h).
+  if (!enabled_) return false;
   ensureRadioReady();
   if (!rxReady_) return false;
   size_t len = rxLen_;
@@ -160,15 +169,15 @@ bool RadioTransport::tryReceiveLine(uint8_t* outBuf, size_t outCap,
 }
 
 bool RadioTransport::sendLine(const uint8_t* data, size_t len) {
+  // Same opt-in gate tryReceiveLine() applies, and for the same reason:
+  // this call would otherwise bring the radio up out from under
+  // MakeCode's own radio blocks.
+  if (!enabled_) return false;
   ensureRadioReady();
 
-  // Re-entrancy guard (sprint 004 ticket 002): payloadBuf_/frameBuf_
-  // are shared scratch now reached by two fibers (see header comment).
-  // A caller that finds sending_ already true returns immediately,
-  // WITHOUT touching either buffer -- the in-flight caller owns them
-  // until it clears sending_ on its own way out below.
-  if (sending_) return false;
-  sending_ = true;
+  // Single writer: the protocol fiber. payloadBuf_/frameBuf_ below are
+  // reused every call but never reached concurrently, so nothing here
+  // guards them (see sendLine()'s own doc comment, radio_transport.h).
 
   // `data`/`len` plus one trailing '\n' delimiter -- the ONE
   // terminator every outbound line uses here, exactly as
@@ -182,8 +191,6 @@ bool RadioTransport::sendLine(const uint8_t* data, size_t len) {
   }
   payload[n] = kLineDelimiter;
   sendFragmented(payload, n + 1);
-
-  sending_ = false;
   return true;
 }
 

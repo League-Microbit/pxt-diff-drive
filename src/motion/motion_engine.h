@@ -104,9 +104,9 @@ class PoseSource {
   // by construction: `OtosPort` (src/platform/otos_port.h) reports heading
   // WRAPPED to (-pi, pi] (the chip's own int16 register, full scale
   // +/-pi); a Rig-odometry-backed source (motion-api.md S3.6's
-  // encoder fallback, `EncoderPoseSource`) is deliberately UNWRAPPED,
-  // matching `Rig`'s own odometry contract (`shims.cpp`'s `r.heading`
-  // accumulates without normalizing). Both are contractually valid
+  // encoder fallback, `Odometry` -- `motion/odometry.h`) is
+  // deliberately UNWRAPPED (it accumulates heading without
+  // normalizing). Both are contractually valid
   // because `MotionEngine::goToR()`/`goToW()` consume this value ONLY
   // through cos()/sin() (wrap-invariant) -- resolves code review
   // KERN-08, which found this comment's former unconditional

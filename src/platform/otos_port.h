@@ -57,8 +57,8 @@ class OtosPort : public PoseSource {
   // this is wrapped by hardware construction, not a choice this class
   // makes (resolves code review KERN-08: PoseSource::heading()'s
   // contract, motion_engine.h, is implementation-defined on wrap
-  // convention for exactly this reason -- OtosPort wraps,
-  // EncoderPoseSource, motion-api.md S3.6's encoder fallback, does
+  // convention for exactly this reason -- OtosPort wraps, Odometry
+  // (motion/odometry.h), motion-api.md S3.6's encoder fallback, does
   // not). Consume via cos()/sin() only; do not difference two
   // heading() reads and assume a shared wrap convention.
   float heading() const override { return heading_; }

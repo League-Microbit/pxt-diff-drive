@@ -6,7 +6,7 @@
 //
 // One exception, preserved deliberately: the OLD cleartext
 // "RUN:<name>[:<arg>...]" bridge (handleRun()/dispatchJob()/the
-// runQueue_ ring below) coexists with v6 on the same wire -- detected
+// runBridge_ object below) coexists with v6 on the same wire -- detected
 // directly by its literal "RUN:" prefix before a line ever reaches the
 // v6 stack (no verb registry involved -- see run()'s own comment). It
 // is the ONLY path that feeds the by-name test-trigger dispatch
@@ -47,8 +47,9 @@
 #include "wifi_link.h"        // WiFi transport (host-portable AT state machine)
 #include "wifi_uart.h"        // ...over NRF_UARTE1 (CODAL-free header)
 #include "wire_adapter.h"
-#include "run_queue.h"
+#include "run_bridge.h"
 #include "emit_queue.h"
+#include "transport_sink.h"  // the ONE Sink all three transports use
 #include "wire_handler.h"
 
 namespace diffDrive {
@@ -89,7 +90,7 @@ class Protocol {
   // the whole payload after `RUN:`, e.g. "pivot:180". Valid only while
   // dispatchJob()'s (or the abort/clearestop bypass's) own call into the
   // registered RUN dispatch callback is executing, on THIS fiber -- see
-  // invokeRunDispatch()'s own comment for why a nested reentrant
+  // RunBridge::currentText()'s own comment for why a nested reentrant
   // dispatch (abort arriving mid-job) can never corrupt an outer job's
   // already-consumed text. Called from the TS layer (shims.cpp's
   // now-zero-argument runCommandText() -- the old
@@ -139,6 +140,31 @@ class Protocol {
   // that rolls to zero reads as "nothing was lost".
   uint32_t runDropCount() const;
 
+  // Cleartext RUN payloads refused by RunBridge's own sanitizer --
+  // empty, overlong, non-printable, or an empty name -- surfaced for
+  // shims.cpp's diagValue(30)/probe(30). Kept apart from
+  // runDropCount() above on purpose: a malformed line and a full ring
+  // are different failures, and a bench operator seeing one climb
+  // needs to know which. From the relay, an uncounted malformed refusal
+  // is indistinguishable from radio loss.
+  uint32_t runMalformedCount() const;
+
+  // The radio RX path's four diagnostics, surfaced for
+  // diagValue(31..34)/probe(31..34) in that order: datagrams that
+  // arrived as a complete single-fragment line, lines actually
+  // delivered into the RX slot, lines dropped because the previous one
+  // was still unconsumed, and lines dropped because they were longer
+  // than the RX buffer.
+  //
+  // frames - accepted is the whole story of what the radio heard and
+  // could not keep. The first two used to exist as members nothing ever
+  // incremented, which answered that question with a permanent,
+  // confident zero.
+  uint32_t radioRxFrameCount() const;
+  uint32_t radioRxAcceptedCount() const;
+  uint32_t radioRxOverrunDropCount() const;
+  uint32_t radioRxOversizeDropCount() const;
+
   // emitLine() calls refused because emitQueue_ was already full,
   // surfaced for shims.cpp's diagValue(29)/probe(29). Same saturating
   // convention as runDropCount() above: should stay 0 across a normal
@@ -161,7 +187,7 @@ class Protocol {
   // free-function shim beside startProtocol() (protocol.cpp) is this
   // method's only caller.
   //
-  // Channel and group are applied BEFORE radioEnabled_ flips, so the
+  // Channel and group are applied BEFORE the link is enabled, so the
   // radio comes up already on the requested channel/group the first time
   // anything touches it -- the supported ordering (see
   // RadioTransport::setChannel()'s own doc comment for why the
@@ -251,25 +277,6 @@ class Protocol {
   // is dispatched exactly once per queued command, never re-entered.
   void dispatchJob();
 
-  // Copies `text` into currentRunText_ and invokes the one registered
-  // RUN dispatch callback (shims.cpp's runDispatch(), which runs
-  // whichever `onRun()`/`onRunCommand()` handler test.ts bound to this
-  // command's name) -- the single path both dispatchJob() (a queued job,
-  // gated on motionOwner_) and handleRun()'s abort/clearestop bypass
-  // (ungated, see that method's own comment) funnel through. Safe to
-  // call reentrantly (an abort dispatched from inside a running job's own
-  // tick loop): the callback reads currentRunText_ back via
-  // runCommandText() at its OWN entry, before doing anything else, so a
-  // nested call's overwrite can never corrupt an outer, still-running
-  // job's own already-consumed text -- every onRun() handler in this
-  // package reads its arguments only at entry (test/test.ts), never
-  // later during a long-running tick loop.
-  void invokeRunDispatch(const char* text);
-
-  // Copies `text` into currentRunText_, bounded to kRunTextBytes and
-  // always NUL-terminated. The one place that buffer is written.
-  void setCurrentRunText(const char* text);
-
   // One pass of this fiber's OWN servicing: drains emitQueue_, dispatches
   // one queued RUN job if the drivetrain is free, polls serial and radio
   // for new lines (the old-style cleartext RUN: bridge or the v6
@@ -288,6 +295,53 @@ class Protocol {
   // itself) is already mid-tick when this fires, so doing either here
   // would be reentrant and wrong.
   void serviceOnce();
+
+  // How many complete inbound lines serviceOnce() drains from ONE
+  // transport before moving on. Four, for three reasons that agree:
+  //
+  //  - One was too few. While a dispatched job runs, the tick hook is
+  //    the only caller, so a pass happens once per ~24 ms tick; serial
+  //    at 115200 delivers ~276 bytes into a 255-byte ring in that
+  //    window, so a host that writes two commands back-to-back
+  //    overflowed CODAL's ring, which drops the overflow silently.
+  //  - Four is what the WiFi path already bounded itself at, so all
+  //    three transports now answer to one number instead of three
+  //    independent ones.
+  //  - Unbounded would be wrong. Each routed line can emit several
+  //    reply lines, and the emit ring holds kEmitSlots (8) of them; a
+  //    host blasting commands would starve drainEmitQueue() and the
+  //    telemetry cadence, both of which run only between passes.
+  //
+  // Not a per-transport tuning knob: if one transport ever needs its
+  // own budget, that is a reason to name a second constant here, not to
+  // spell a bare number at its call site.
+  static constexpr int kRxDrainPerPass = 4;
+
+  // The ONE path an inbound line takes, whichever transport produced
+  // it: `data`/`len` is one complete line, delimiter already stripped by
+  // the transport that framed it. A line whose first bytes are the
+  // literal "RUN:" prefix goes to the old-style cleartext bridge
+  // (handleRun(), below); everything else -- including the v6 grammar's
+  // own space-separated "RUN <name> ... #<id>" verb -- is fed to
+  // `handler`, followed by the separate "\n" feed() needs to see the
+  // line as complete.
+  //
+  // `handler` is the caller's own WireHandler, never a fixed one: each
+  // transport has its own (wireHandler_/wireHandlerRadio_/
+  // wireHandlerWifi_), each with its own expectedNext_, so a sequence
+  // gap on one transport can never nack another's next command. That
+  // per-transport handler is the ONLY thing that ever differed between
+  // the three poll branches this replaces -- they were otherwise
+  // identical, which is exactly why the "RUN:" carve-out had to be
+  // written out three times to stay true on all three wires.
+  void routeLine(Wire::WireHandler& handler, const uint8_t* data, size_t len);
+
+  // This fiber's own clock reading -- the ONE place clock_'s microsecond
+  // counter is reduced to the millisecond scale everything above it
+  // (the telemetry cadence, the WiFi debug period, RunBridge's dedupe
+  // window) actually works in. Was four separate `nowMicros() / 1000`
+  // conversions, one per caller.
+  uint32_t clockNow();  // [ms]
 
   // tickDrive()'s (shims.cpp) service hook, registered once via
   // registerTickServiceHook() when run() starts -- a plain
@@ -355,56 +409,29 @@ class Protocol {
   // emitQueue_'s slot text bytes: RadioTransport::kMaxPayloadBytes (the
   // cap emitLine() already clips to) plus one for the NUL this ring
   // adds itself -- a clipped line always fits. Slot count matches
-  // runQueue_'s own: generous enough for a burst of result lines
+  // RunBridge's own ring: generous enough for a burst of result lines
   // between drain passes without becoming a large static allocation.
   static constexpr size_t kEmitTextBytes = RadioTransport::kMaxPayloadBytes + 1;
   static constexpr int kEmitSlots = 8;
   EmitQueue<kEmitSlots, static_cast<int>(kEmitTextBytes)> emitQueue_;
 
-  // ---- the old-style cleartext RUN bridge, preserved unchanged from
-  // before the v5 retirement (see this file's own top-of-file comment)
-  // except for HOW a dequeued command reaches TypeScript: not a
-  // MessageBus event to a second, forked fiber (deleted) but
-  // dispatchJob() dequeuing and calling invokeRunDispatch() directly, on
-  // THIS fiber. -----------------------
-  // RUN:<name>[:<arg>...] (cleartext, e.g. "RUN:pivot:180") normally
-  // parks the payload text in runQueue_ below for dispatchJob() to drain
-  // in arrival order. "abort"/"clearestop" bypass that queue entirely --
-  // see this method's own definition (protocol.cpp) for why: a queued
-  // abort would sit behind the very job it is meant to stop.
+  // ---- the old-style cleartext RUN bridge --------------------------
+  // RUN:<name>[:<arg>...] (cleartext, e.g. "RUN:pivot:180") goes to
+  // runBridge_ below, which sanitizes it, suppresses a host's own
+  // retransmits, and either parks it for dispatchJob() to drain in
+  // arrival order or -- for "abort"/"clearestop" -- stages it straight
+  // back for immediate dispatch. This method is the thin seam between
+  // that object and the transports: read the clock, offer the payload,
+  // and make the one TypeScript call a bypass asks for.
   void handleRun(const uint8_t* data, size_t dataLen);
 
-  // RUN payload storage: a real ring with occupancy (run_queue.h), not a
-  // bare write cursor -- a slot stays in flight from enqueue() until
-  // dispatchJob() reads and releases it, so a burst arriving during a
-  // long job's dispatch can no longer overwrite payload not yet
-  // consumed. Overflow is counted and readable (diagValue ordinal 30)
-  // instead of silent.
-  static constexpr size_t kRunTextBytes = 48;  // name + args + NUL
-  static constexpr int kRunSlots = 8;
-  RunQueue<kRunSlots, static_cast<int>(kRunTextBytes)> runQueue_;
-
-  // The text of whichever RUN command dispatchJob()/invokeRunDispatch()
-  // most recently copied in, for currentRunText() (public, above) to
-  // return. The one buffer both call sites write, always through
-  // setCurrentRunText().
-  char currentRunText_[kRunTextBytes] = {};
-
-  // RUN repeat suppression -- see handleRun's own comment. Hosts repeat
-  // commands to survive the single-slot inbound buffer, and without
-  // this a repeated RUN runs the test once per copy. Compared on the
-  // whole payload, so RUN:pivot:180 does not suppress RUN:pivot:-180.
-  // Suppress a host's own RETRANSMITS, not deliberate repeats. The
-  // queue below fixes loss; this fixes duplicate EXECUTION, which is a
-  // different failure -- a host repeating a command over a lossy radio
-  // would otherwise run the tour once per copy. 3000 ms was far wider
-  // than any retransmit burst and made sending one command twice in a
-  // row impossible, which is exactly the shape a parameter sweep
-  // sends. 400 ms still swallows a burst and gives deliberate repeats
-  // back.
-  static constexpr int32_t kRunDedupe = 400;  // [ms]
-  char lastRunText_[kRunTextBytes] = {};
-  uint32_t lastRun_ = 0;   // [ms] arrival time of the last accepted RUN
+  // Parking, dedupe and hand-off for the cleartext RUN bridge, with the
+  // run_queue.h ring inside it -- host-portable and host-tested on its
+  // own (run_bridge.h). Its overflow count is readable as diagValue
+  // ordinal 28. Ordinal 28 is diagValue()'s own numbering, which is a
+  // SEPARATE namespace from the config ordinals SET/GET use -- 28 there
+  // is `jerk`, and diagValue() has no ordinal 30 at all.
+  RunBridge runBridge_;
 
   // ---- identity, assembled once the fiber actually runs ---------------
   // WireAdapter must stay CODAL-free (host-testable), so this CODAL-
@@ -427,95 +454,53 @@ class Protocol {
   // running fiber, well after that singleton is assigned).
   static uint32_t wireNow();  // [ms]
 
-  // ---- ticket 005: the v6 wire transport seam --------------------------
-  // The one Sink WireHandler writes every reply line through (Sink's own
-  // contract, wire_handler.h). `data`/`length` always include a
-  // trailing '\n' -- WireHandler::writeLine() supplies it on every
-  // call -- so this strips that one byte before handing off to
-  // SerialTransport::writeLine(), which appends its OWN trailing
-  // delimiter; passing both through would double the newline.
-  class SerialSink : public Wire::Sink {
-   public:
-    explicit SerialSink(SerialTransport& transport) : transport_(transport) {}
-    void write(const char* data, size_t length) override {
-      const size_t contentLen = length > 0 ? length - 1 : 0;
-      transport_.writeLine(reinterpret_cast<const uint8_t*>(data),
-                           contentLen);
-    }
-
-   private:
-    SerialTransport& transport_;
-  };
-
-  // The Sink wireHandlerRadio_ writes every v6 reply line through --
-  // mirrors SerialSink exactly, including WHY the trailing '\n' is
-  // stripped here: RadioTransport::sendLine() appends its own trailing
-  // delimiter, same convention SerialTransport::writeLine() follows,
-  // so passing both through would double it.
-  class RadioSink : public Wire::Sink {
-   public:
-    explicit RadioSink(RadioTransport& transport) : transport_(transport) {}
-    void write(const char* data, size_t length) override {
-      const size_t contentLen = length > 0 ? length - 1 : 0;
-      // sendLine()'s bool return (ticket 002's re-entrancy guard) is
-      // deliberately ignored here, not an oversight: a telemetry/ack
-      // line dropped under contention with Protocol::emitLine() (the
-      // TS fiber's own sendLine() caller) self-heals for free via the
-      // next frame's seq gap, and retrying here would just reintroduce
-      // the contention the guard exists to avoid (see sprint.md's
-      // Design Rationale -- do not "fix" this into matching
-      // emitLine()'s retry).
-      (void)transport_.sendLine(reinterpret_cast<const uint8_t*>(data),
-                                contentLen);
-    }
-
-   private:
-    RadioTransport& transport_;
-  };
-
-  // The Sink wireHandlerWifi_ writes every v6 reply line through --
-  // mirrors RadioSink, including the trailing-'\n' strip (WifiLink::
-  // sendLine() frames the datagram with its own '\n'). A line dropped
-  // because the link is down, no host is known, or the bounded send
-  // queue is full is dropped silently here, by the same reasoning
-  // RadioSink gives: it self-heals through the host's own retransmit.
-  class WifiSink : public Wire::Sink {
-   public:
-    explicit WifiSink(WifiLink& link) : link_(link) {}
-    void write(const char* data, size_t length) override {
-      const size_t contentLen = length > 0 ? length - 1 : 0;
-      (void)link_.sendLine(reinterpret_cast<const uint8_t*>(data), contentLen);
-    }
-
-   private:
-    WifiLink& link_;
-  };
+  // ---- the v6 wire transport seam --------------------------------------
+  // All three transports are reached through ONE Sink class
+  // (TransportSink, transport_sink.h) rather than one hand-copied Sink
+  // apiece. Everything a Sink does here -- decide how much of the
+  // written line is content, hand those bytes to the transport, which
+  // appends its own single delimiter -- is identical for all three; the
+  // only difference is the write call itself, which is what these three
+  // one-line adapters supply. The content decision (and, in particular,
+  // that the terminator is CHECKED before it is dropped) lives in
+  // transport_sink.h, host-portable and host-tested by
+  // tests/host/test_transport_sink.py.
+  //
+  // A dropped line is accepted silently in all three cases: radio
+  // refuses while its link is disabled, and WiFi drops while the link
+  // is down, no host is known, or its bounded send queue is full. Both
+  // self-heal -- a lost telemetry frame through the next frame's seq
+  // gap, a lost reply through the host's own retransmit.
+  static void writeSerial(SerialTransport& transport, const uint8_t* data,
+                          size_t length) {
+    transport.writeLine(data, length);
+  }
+  static void writeRadio(RadioTransport& transport, const uint8_t* data,
+                         size_t length) {
+    (void)transport.sendLine(data, length);
+  }
+  static void writeWifi(WifiLink& link, const uint8_t* data, size_t length) {
+    (void)link.sendLine(data, length);
+  }
 
   RadioTransport radioTransport_;
   SerialTransport transport_;
   WifiUartCodal wifiUart_;
   CodalFiberLauncher launcher_;
-  CodalClock clock_;  // PING's t=<ms> equivalent is now wireNow(); this
-                      // instance now backs only handleRun()'s own dedupe
-                      // timing and wireNow() itself (via protocol()).
+  CodalClock clock_;  // read through clockNow() (above), never directly:
+                      // the RUN dedupe's timing, the telemetry cadence,
+                      // the WiFi debug period and wireNow() all take
+                      // their reading from that one method.
   bool running_ = false;
 
-  // The v6 radio link is OPT-IN: false until setupRadio() flips it.
+  // The v6 radio link's own OPT-IN flag lives on RadioTransport
+  // (enable()/enabled(), radio_transport.h), not here. This class
+  // asks radioTransport_.enabled() where it needs the answer and
+  // otherwise leaves the refusal to the transport, which returns false
+  // from sendLine()/tryReceiveLine() while disabled -- one object owns
+  // "may the radio transmit or receive right now", instead of a bool
+  // here that every new call site had to remember to check.
   //
-  // This is what lets a student's program use MakeCode's own `radio.*`
-  // blocks (a joystick controller, say). RadioTransport frames raw
-  // RadioRelay fragments with NO PXT radio packet header, on a fixed
-  // band -- see radio_transport.h's top comment -- so the two cannot
-  // share the air. Whichever one comes up first owns the radio.
-  //
-  // Every path that would reach RadioTransport must be gated on this,
-  // not just the RX poll: RadioTransport lazily calls ensureRadioReady()
-  // from BOTH tryReceiveLine() and sendLine(), so an ungated emitLine()
-  // or telemetry emission would claim the radio just as surely as the
-  // poll does. run()'s radio poll, emitLine()'s radio write, and run()'s
-  // wireHandlerRadio_.emitTelemetry() are the three sites.
-  bool radioEnabled_ = false;
-
   // The WiFi link is OPT-IN the same way (enableWifi()); wifiBegun_
   // records that serviceWifi() has already handed wifiLink_ its config
   // on this fiber.
@@ -535,8 +520,9 @@ class Protocol {
   // wireHandler_ -- NOT a second WireAdapter (see this file's own
   // top-of-file comment for why) -- but each keeps its own
   // expectedNext_.
-  SerialSink serialSink_{transport_};
-  RadioSink radioSink_{radioTransport_};
+  TransportSink<SerialTransport> serialSink_{transport_, &Protocol::writeSerial};
+  TransportSink<RadioTransport> radioSink_{radioTransport_,
+                                           &Protocol::writeRadio};
   WireAdapter wireAdapter_{Wire::Identity(), &Protocol::wireNow};
   Wire::WireHandler wireHandler_{wireAdapter_, serialSink_};
   Wire::WireHandler wireHandlerRadio_{wireAdapter_, radioSink_};
@@ -547,7 +533,7 @@ class Protocol {
   // each transport keeps its own expectedNext_, so a sequence gap on
   // WiFi can never nack serial's or radio's next command.
   WifiLink wifiLink_{wifiUart_, &Protocol::wireNow};
-  WifiSink wifiSink_{wifiLink_};
+  TransportSink<WifiLink> wifiSink_{wifiLink_, &Protocol::writeWifi};
   Wire::WireHandler wireHandlerWifi_{wireAdapter_, wifiSink_};
   uint8_t wifiRxBuf_[WifiLink::kMaxLineBytes + 1];
   // Sized for the worst-case `DBG:wifi ...` line: fixed text plus two

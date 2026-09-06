@@ -68,28 +68,20 @@ class SerialTransport {
   // Writes `len` bytes from `buf`, then a single 0x0A delimiter.
   // Callers (Protocol) never include the delimiter themselves.
   //
-  // Two-writer guard (sprint 004 ticket 006, code review R-19/R-20 aka
-  // WIRE-03/WIRE-04): two fibers call this today -- the TS fiber via
-  // Protocol::emitLine(), and the protocol fiber via the serial
-  // WireHandler's own replies/keepalives (Protocol::SerialSink::write())
-  // -- and this predates ticket 006 itself; the review is what caught
-  // it, unfixed, already present. Each call issues two back-to-back
-  // uBit.serial.send(..., SYNC_SLEEP) calls that block and yield the
-  // caller, exactly the window the other caller could interleave bytes
-  // into. Unlike RadioTransport::sendLine()'s guard (ticket 002), where
-  // a second caller drops immediately and only Protocol::emitLine()
-  // retries once, BOTH callers here get a bounded retry: a caller that
-  // finds the guard already held sleeps 2 ms and checks again, up to a
-  // small fixed attempt cap, because serial has no caller whose loss is
-  // "fine" the way telemetry's self-healing seq gap makes radio's drop
-  // acceptable (see sprint.md's Design Rationale). If the retry cap is
-  // exhausted, or either uBit.serial.send() call itself reports a
-  // failure, the attempt is counted in a drop counter (read via
-  // diagValue(26)/probe(26), shims.cpp) and this function returns
-  // having given up silently -- callers do not check a return value or
-  // retry themselves; the bounded retry and the drop accounting are
-  // both fully internal to this call, unlike RadioTransport's
-  // caller-driven retry-once.
+  // Single writer: the protocol fiber. Every caller -- a v6 reply, a
+  // telemetry frame, a line another fiber handed to
+  // Protocol::emitLine() and that fiber later drained off the emit ring
+  // -- reaches this from Protocol::serviceOnce(), on Protocol's own
+  // fiber. That matters because each call issues two back-to-back
+  // uBit.serial.send(..., SYNC_SLEEP) calls that block and YIELD (see
+  // serial_transport.cpp's own note): with one writer a yield mid-line
+  // simply resumes; with two it would interleave their bytes. Nothing
+  // here serializes writers, because there are none to serialize.
+  //
+  // No return value: a caller cannot do anything useful with a failure
+  // this deep. If either uBit.serial.send() reports one, the line is
+  // counted in a drop counter (read via diagValue(26)/probe(26),
+  // shims.cpp) and this returns having given up silently.
   void writeLine(const uint8_t* buf, size_t len);
 
   // Non-blocking: lets a caller interleave cadence-driven work --
@@ -107,10 +99,11 @@ class SerialTransport {
   // are retained internally as a head start on the next call.
   bool tryReadLine(uint8_t* outBuf, size_t outCap, size_t* outLen);
 
-  // Count of writeLine() calls dropped since boot (ticket 006): either
-  // the two-writer guard's retry cap was exhausted before this call got
-  // a turn, or one of writeLine()'s own uBit.serial.send() calls itself
-  // reported a failure. Exposed to the wire protocol's numeric DIAG
+  // Count of writeLine() calls dropped since boot: one of that call's
+  // own uBit.serial.send() calls reported a failure. Kept -- it answers
+  // a real, still-open question ("did a line ever fail to go out")
+  // that has nothing to do with how many fibers write.
+  // Exposed to the wire protocol's numeric DIAG
   // surface via diagValue(26) (shims.cpp) / probe(26) (bench) -- a
   // bench operator watches this stay at 0 during a normal run the same
   // way the existing counters (i2cFaultCount, cycleOverrunCount, etc.)
@@ -122,15 +115,6 @@ class SerialTransport {
   // `outCap`; outCap only bounds the final copy-out (see tryReadLine()).
   uint8_t partial_[kMaxLineBytes] = {0};
   size_t partialLen_ = 0;
-
-  // Two-writer guard for writeLine() (ticket 006): true from the moment
-  // a caller enters the guarded body until it returns. A second caller
-  // arriving while this is already true does NOT drop immediately the
-  // way RadioTransport::sending_ does -- it sleeps and retries, bounded
-  // (see writeLine()'s own doc comment and serial_transport.cpp's
-  // kMaxSendAttempts). Only the caller that actually set this clears
-  // it, on its own way out.
-  bool sending_ = false;
 
   // Backing counter for dropCount() above.
   uint32_t dropCount_ = 0;

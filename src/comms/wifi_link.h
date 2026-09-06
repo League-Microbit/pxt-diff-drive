@@ -43,7 +43,7 @@
 //   socket:    AT+CIPSTART=4,"UDP","255.255.255.255",7655,7654,2
 //              AT+CIPSTART=3,"UDP","224.0.0.251",5353,5353,0 (tolerant)
 //   ready:     demux +IPD frames; one AT+CIPSEND per outbound line;
-//              re-announce over mDNS every kMdnsPeriodMs
+//              re-announce over mDNS every kMdnsPeriod
 //
 // Join time from a fresh RST is 6-170 s on this module (bench section
 // 7) -- nothing above waits on it; the robot boots, drives, and answers
@@ -83,7 +83,7 @@ class WifiUart {
 
 class WifiLink {
  public:
-  typedef uint32_t (*NowMsFn)();
+  typedef uint32_t (*NowFn)();  // -> [ms] on the composition root's own clock
 
   enum State : uint8_t {
     kDisabled = 0,   // begin() never called, or empty SSID
@@ -128,16 +128,16 @@ class WifiLink {
   static constexpr int kMaxTcpLinks = 3;  // client ids 0, 1, 2
 
   // Timings (the wifi-link note, section 5.1 / 6.1 / 7; nezha-upy wifi_at.py).
-  static constexpr uint32_t kCommandTimeoutMs = 4000;
-  static constexpr uint32_t kJoinTimeoutMs = 15000;
-  static constexpr uint32_t kJoinQueryMs = 1500;
+  static constexpr uint32_t kCommandTimeout = 4000;   // [ms]
+  static constexpr uint32_t kJoinTimeout = 15000;     // [ms]
+  static constexpr uint32_t kJoinQueryTimeout = 1500;  // [ms]
   static constexpr int kJoinQueryAttempts = 6;  // ~9 s of CWJAP? polling
-  static constexpr uint32_t kBackoffDelayMs = 5000;
-  static constexpr uint32_t kPeerSilenceMs = 60000;  // forget a silent host
-  static constexpr uint32_t kMdnsPeriodMs = 60000;   // re-announce cadence (record TTL is 120 s)
-  static constexpr uint32_t kTelemetryMinIntervalMs = 50;  // the wifi-link note, section 7.1 floor
+  static constexpr uint32_t kBackoffDelay = 5000;     // [ms]
+  static constexpr uint32_t kPeerSilence = 60000;     // [ms] forget a silent host
+  static constexpr uint32_t kMdnsPeriod = 60000;      // [ms] re-announce cadence (record TTL is 120 s)
+  static constexpr uint32_t kTelemetryMinInterval = 50;  // [ms] the wifi-link note, section 7.1 floor
 
-  WifiLink(WifiUart& uart, NowMsFn nowMs);
+  WifiLink(WifiUart& uart, NowFn now);  // [ms] clock
 
   // Records the config and arms the state machine; does no I/O itself.
   // Calling it again restarts bring-up from kConfigure.
@@ -170,7 +170,7 @@ class WifiLink {
 
   // Telemetry gate (the wifi-link note, section 7.1, REQUIRED of every port):
   // periodic frames may only be queued when at least
-  // kTelemetryMinIntervalMs has passed since the last one AND the send
+  // kTelemetryMinInterval has passed since the last one AND the send
   // engine is IDLE (nothing queued, nothing in flight). Replies/acks
   // never consult this. Consumes the interval when it returns true.
   //
@@ -227,7 +227,7 @@ class WifiLink {
   static size_t buildMdnsAnnouncement(uint8_t* out, size_t cap,
                                       const char* hostname,
                                       const char* ownIp, uint16_t port,
-                                      uint32_t ttlSeconds,
+                                      uint32_t ttl,  // [s]
                                       const char* proto);
 
   // The service this robot advertises: `<hostname> robot link` on
@@ -280,12 +280,13 @@ class WifiLink {
     uint8_t data[kSlotBytes];
   };
 
-  uint32_t nowMs() const { return nowMs_(); }
+  uint32_t now() const { return now_(); }  // [ms]
 
   // AT command/await mechanics (one in flight at a time)
   enum Await : uint8_t { kPending, kMatched, kRejected, kTimedOut };
-  bool startCommand(const char* command, const char* expect, uint32_t timeoutMs);
-  void startAwait(const char* expect, uint32_t timeoutMs);
+  bool startCommand(const char* command, const char* expect,
+                    uint32_t timeout);  // [ms]
+  void startAwait(const char* expect, uint32_t timeout);  // [ms]
   Await pollAwait();
 
   // The ONE place UART bytes enter this class.
@@ -314,7 +315,7 @@ class WifiLink {
   int txCount() const { return txCount_; }  // (test introspection)
 
   WifiUart& uart_;
-  NowMsFn nowMs_;
+  NowFn now_;  // -> [ms]
   Config config_;
 
   State state_;
@@ -351,7 +352,7 @@ class WifiLink {
   char peerIp_[16];
   uint16_t peerPort_;
   bool peerKnown_;
-  uint32_t lastPeerHeardMs_;
+  uint32_t lastPeerHeard_;  // [ms]
   char reportedPeerIp_[16];
   uint16_t reportedPeerPort_;
 
@@ -387,11 +388,11 @@ class WifiLink {
   SendPhase sendPhase_;
   TxEntry inFlight_;
 
-  uint32_t lastTelemetryMs_;
+  uint32_t lastTelemetry_;  // [ms]
   bool telemetryEverSent_;
 
   bool mdnsSocketOpen_;
-  uint32_t lastMdnsMs_;
+  uint32_t lastMdnsAnnounce_;  // [ms]
   uint32_t mdnsAnnounceCount_;
 
   uint32_t dropCount_;

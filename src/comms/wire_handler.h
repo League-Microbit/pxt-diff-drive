@@ -247,7 +247,23 @@ enum class Result : uint8_t {
   kUnimplemented,  // -> err 6 #<id>   ERR_UNIMPLEMENTED
   kNotReady,       // -> err 8 #<id>   ERR_NOT_CONFIGURED
   kBusy,           // -> err 10 #<id>  ERR_BUSY
+  kWriteOnly,      // -> err 12 #<id>  ERR_WRITE_ONLY
 };
+
+// ERR_WRITE_ONLY (12): "that name exists, and it cannot be read." The
+// reference grammar numbers its own codes 1-11 (11, ERR_DUPLICATE_ID,
+// is deleted but still spent), so 12 is the first number free of that
+// range rather than one of the 5/7/9 holes inside it -- a hole there is
+// a code an older host may already have an opinion about.
+//
+// Why the distinction is worth a code of its own: an advertised field
+// answering the SAME err 1 a typo gets tells the operator nothing about
+// which of the two just happened. `rebase` is the one such field today
+// -- a write-triggered action with no stored value behind it, refused
+// rather than answered with a manufactured 0 (WireAdapter::onGet()) --
+// and before this code existed a host had no way to tell "you cannot
+// read that" from "there is no such thing".
+constexpr uint8_t kErrWriteOnly = 12;
 
 // TLM subscription modes (S6.1's wire token set). The handler only
 // decodes the wire token ("OFF"/"POSE"/"FULL"/"NOW"/"AUTO"/"BUFFER")
@@ -343,7 +359,16 @@ class Adapter {
   // ---- configuration -- pure delegation, no storage in this file
   // (protocol.md S7: which names are valid is entirely the adapter's
   // business) ----
-  virtual bool onGet(const char* name, float& out) const = 0;
+  // Reads one config field. Exactly three answers are legal, and they
+  // are distinguishable BECAUSE a bool could not tell the last two
+  // apart:
+  //   kOk        -- `out` holds the value; the caller emits `get`.
+  //   kUnknown   -- no such name (a typo).
+  //   kWriteOnly -- the name exists but has nothing readable behind it
+  //                 (a write-triggered action, not a stored value).
+  // A bare GET dumps only the kOk names; a named GET reports the other
+  // two as their own error codes.
+  virtual Result onGet(const char* name, float& out) const = 0;
   virtual Result onSet(const char* name, float value, uint32_t id) = 0;
   virtual size_t fieldCount() const = 0;  // for a bare GET
   virtual const char* fieldName(size_t index) const = 0;
@@ -378,6 +403,32 @@ class WireHandler {
   // the terminator." The handler sizes its buffer off this one
   // constant so the number is spelled exactly once.
   static constexpr size_t kMaxLineBytes = 240;
+
+  // The sequence space's ceiling. `expectedNext_` may REACH this value
+  // -- it is what "the last legal id has been accepted" looks like --
+  // but no inbound line may CARRY it, so `expectedNext_ = id + 1` can
+  // never wrap. Legal ids are therefore [1, kMaxSequenceId - 1].
+  //
+  // Without the reservation, accepting #4294967295 sets expectedNext_
+  // to 0: a value no id can ever equal or fall below, so every
+  // subsequent line nacks asking for id 0 (which is not legal either)
+  // and `replyAck(expectedNext_ - 1)` underflows on top. The session is
+  // then unrecoverable except by HELLO, having reported nothing about
+  // why. Reserving one id is the cheaper half of that trade.
+  static constexpr uint32_t kMaxSequenceId = 0xFFFFFFFFu;
+
+  // Whether an inbound line's `#<id>` may be executed at all. Public
+  // and static so a host test can drive the boundary directly: the
+  // states around it (expectedNext_ at the ceiling) are otherwise
+  // reachable only by sending four billion commands.
+  //
+  // The sequence space's OTHER illegal id, `0`, is not this
+  // predicate's business: dispatch() already answers it earlier, and
+  // differently (a bare nack, no err -- see its own comment there).
+  // This one is about the ceiling only.
+  static bool sequenceIdIsExecutable(uint32_t id) {
+    return id != kMaxSequenceId;
+  }
 
   WireHandler(Adapter& adapter, Sink& sink);
 
@@ -480,7 +531,10 @@ class WireHandler {
   // the content-filling loop is structurally forbidden to reach (its
   // bound stops one byte short of the NUL as well as the '\n'), so it
   // is always the LISTED NAMES that truncate if they would ever
-  // overflow `bufCap` -- never the terminator. Returns the number of
+  // overflow `bufCap` -- never the terminator. That reserve-two-bytes
+  // shape is now the one convention every line this class formats
+  // follows: emitHeader()/emitFrame() reserve the same two bytes and
+  // hand the terminator to terminateEmitBuf(). Returns the number of
   // bytes written, excluding the closing NUL. Public and static purely
   // so a host test can drive it directly with a synthetic, arbitrarily
   // long name list -- independent of kCommandTable, which today is far
@@ -712,6 +766,11 @@ class WireHandler {
   void rememberHeader(const Snapshot& snapshot);
   void emitHeader(const Snapshot& snapshot);  // "thdr <col>...\n"
   void emitFrame(const Snapshot& snapshot);   // "t <v>...\n"
+  // Writes the '\n' and the NUL that end every emitted telemetry line,
+  // into the two bytes the two functions above reserve by stopping
+  // their content at sizeof(emitBuf_) - 2. See its definition
+  // (wire_handler.cpp) for what a missing terminator costs downstream.
+  void terminateEmitBuf(size_t contentLength);
 
   Adapter& adapter_;
   Sink& sink_;

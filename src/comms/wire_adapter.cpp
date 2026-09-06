@@ -1,8 +1,9 @@
 // wire_adapter.cpp -- see wire_adapter.h for the class contract.
 #include "wire_adapter.h"
 
+#include "config_fields.h"
+
 #include <cmath>
-#include <cstring>
 
 namespace diffDrive {
 
@@ -119,189 +120,19 @@ bool engineMoveEndedByDeadline();
 
 namespace {
 
-// The `ConfigField` enum entries (`blocks/motion.ts`) mapped onto
-// setKernelValue()/getConfigValue()'s existing field ordinals
-// (shims.cpp) -- one wire NAME per field, replacing the old binary
-// CONFIG/SET_FIELD/GET_CONFIG verbs' bare ordinal one-for-one.
-// Declaration order matches ConfigField's own declaration order so a
-// bare GET's dump reads in the same order a human reading `blocks/motion.ts`
-// would expect. See each entry below for its own ordinal provenance.
-struct FieldEntry {
-  const char* name;  // wire key
-  int ordinal;        // shims.cpp's setKernelValue()/getConfigValue() field
-};
+// The wire's config surface -- every name a host can SET or GET -- is
+// one table of rows in config_fields.h, included above. This file
+// used to carry its own hand-kept copy of that list (`kFields`), which
+// had to agree with two switches in shims.cpp and with `ConfigField` in
+// blocks/motion.ts by nothing stronger than an author remembering; it
+// drifted. Nothing here restates the surface any more: findConfigField()
+// and kConfigFields[] ARE the list.
 
 // Named so the busy-refusal check in onSet() and the GET refusal in
-// onGet() (both below) don't repeat the bare integers the kFields[]
-// rows below also carry.
+// onGet() (both below) don't repeat the bare integers config_fields.h's
+// own rows also carry.
 constexpr int kOrdinalRebase = 32;
 constexpr int kOrdinalEstopClear = 33;
-
-constexpr FieldEntry kFields[] = {
-    {"max_duty", 0},           // ConfigField.MaxDuty
-    {"full_duty_velocity", 1}, // ConfigField.FullDutyVelocity
-    {"pid_kp", 2},             // ConfigField.Kp
-    {"pid_ki", 3},             // ConfigField.Ki
-    {"pid_i_max", 4},          // ConfigField.IMax
-    {"accel_kaff", 5},         // ConfigField.Kaff
-    {"pid_max", 6},            // ConfigField.PidMax
-    {"twist_hold_gain", 7},    // ConfigField.TwistHoldGain
-    {"v_floor", 8},            // ConfigField.VFloor (design S4.7:
-                               // renamed from speed_floor -- the ordinal
-                               // is UNCHANGED, but the setter now writes
-                               // MotionLimits::vFloor, not the kernel's
-                               // own vMin, which stays pinned at 0 (K5).
-                               // See shims.cpp's setKernelValue()/
-                               // getConfigValue() case 8.
-    {"pos_err_max", 9},        // ConfigField.PosErrMax
-    {"stall_speed", 10},       // ConfigField.StallSpeed
-    {"stall_demand", 11},      // ConfigField.StallDemand
-    {"stall_window", 12},      // ConfigField.StallWindow
-    {"lambda_enabled", 13},    // ConfigField.LambdaEnabled
-    {"crawl_pulse", 14},       // ConfigField.CrawlPulse
-    {"default_cruise", 15},    // ConfigField.DefaultCruise (sprint 007
-                               // ticket 003, closing R-11/BLK-03/API-03
-                               // -- see shims.cpp's engineDefaultCruise()/
-                               // Rig::defaultCruise_ for the field this
-                               // ordinal actually reaches).
-    {"rotational_slip", 16},   // ConfigField.RotationalSlip (sprint 007
-                               // ticket 005, closing R-14/API-06 -- see
-                               // motion_engine.h's setRotationalSlip()/
-                               // rotationalSlip_ for the validation and
-                               // the load-bearing derivation comment on
-                               // the 0.952 default).
-    {"stall_clear", 17},       // ConfigField.StallClear (sprint 007
-                               // ticket 001) -- a write-triggered action
-                               // wearing a config-field's clothes; see
-                               // shims.cpp's setKernelValue()/
-                               // getConfigValue() case 17 and
-                               // clearStall()'s own comment.
-    {"stop_distance", 18},     // ConfigField.StopDistance (design
-                               // S4.7: renamed from pivot_overrun -- the
-                               // ordinal is unchanged. Per-wheel
-                               // end-of-move coast, mm, now
-                               // MotionLimits::stopDistance
-                               // (motion_limits.h), consumed by the
-                               // shaper's own predictive-arrival math
-                               // every tick (S6.3) rather than
-                               // subtracted from the segment's target
-                               // at start time. See shims.cpp's
-                               // setKernelValue()/getConfigValue()
-                               // case 18.
-    {"accel", 19},             // ConfigField.Accel -- [mm/s^2] thin
-                               // forward to MotionLimits::setAccel()/
-                               // accel (this ticket: was MotionEngine::
-                               // setAAccelMmS2()/aAccelMmS2(), now
-                               // deleted -- always active, no legacy
-                               // mode, design S8).
-    {"decel", 20},             // ConfigField.Decel -- [mm/s^2] thin
-                               // forward to MotionLimits::setDecel()/
-                               // decel (this ticket: was MotionEngine::
-                               // setADecelMmS2()/aDecelMmS2()).
-    {"v_max", 21},             // ConfigField.VMax -- [mm/s] thin
-                               // forward to MotionLimits::setVMax()/
-                               // vMax, the ceiling
-                               // defaultCruiseForDistance() never
-                               // exceeds.
-    // 22, 23, 24, 25, 26, 27, 29, 31 (brake_frac, dist_taper, yaw_taper,
-    // dist_floor, turn_floor, ramp_ms, plateau_min_s, profile_exit) are
-    // REMOVED this ticket (design S4.7/S8): every one of these named a
-    // MotionEngine field the design deletes outright -- the taper
-    // window is now derived (v^2/(2*decel), per axis), the floor
-    // fraction is now absolute (v_floor/omega_floor), the ramp time is
-    // derived (cruise/accel), and the braking plan ends at the floor by
-    // construction (no plateau derate, no profile-exit distance). No
-    // row exists for these ordinals any more -- findField() (below)
-    // answers nullptr for any of their old names, which SET/GET both
-    // turn into `err 1` (ERR_UNKNOWN), same as any other unrecognized
-    // wire name, for one release (a stale bench script fails loudly
-    // instead of silently setting nothing).
-    {"jerk", 28},              // ConfigField.Jerk -- unchanged name/
-                               // ordinal, now backed by MotionLimits::
-                               // setJerk()/jerk instead of MotionEngine's
-                               // own (deleted) jerkMmS3_.
-    {"omega_max", 30},         // ConfigField.OmegaMax (this ticket:
-                               // renamed from max_yaw_rate -- the
-                               // ordinal is unchanged). [deg/s] thin
-                               // forward to MotionLimits::setOmegaMax()/
-                               // omegaMax.
-    {"rebase", kOrdinalRebase},        // zero the odometry frame -- a
-                               // write-triggered action wearing a
-                               // config-field's clothes, the same shape
-                               // the stall latch's own clear field
-                               // above already established. Backed by
-                               // shims.cpp's setKernelValue() calling
-                               // kernel.rebasePosition() plus the
-                               // encoder-frame zero and OTOS reseed
-                               // that keep both pose sources agreed at
-                               // the new zero -- see that file's own
-                               // case for the full sequence. Refused
-                               // (kBusy) while a motion is live (see
-                               // onSet() below) and refused on GET (see
-                               // onGet() below) -- deliberately absent
-                               // from the trailing ConfigField.<Name>
-                               // comment convention every other row
-                               // above carries: this field is wire-only,
-                               // not exposed through the block layer's
-                               // generic config dropdown.
-    {"estop_clear", kOrdinalEstopClear}, // sequenced e-stop clear,
-                               // same write-triggered shape as rebase
-                               // immediately above -- backed by
-                               // kernel.estopClear(). GET reads back the
-                               // live estop flag, a convenience readback
-                               // exactly like the stall latch's own
-                               // clear field's GET. Also wire-only, same
-                               // reason as rebase above.
-    {"omega_floor", 34},       // ConfigField.OmegaFloor (this ticket,
-                               // design S4.7, NEW ordinal): [deg/s]
-                               // thin forward to MotionLimits::
-                               // setOmegaFloor()/omegaFloor -- the pure-
-                               // turn counterpart to v_floor (ordinal 8),
-                               // replacing dist_floor/turn_floor's old
-                               // fraction-of-cruise scheme with an
-                               // absolute floor per axis (design S8).
-    {"arrive_dist", 35},       // ConfigField.ArriveDist (this ticket,
-                               // design S4.7, NEW ordinal): [mm] thin
-                               // forward to MotionLimits::
-                               // setArriveDist()/arriveDist -- the
-                               // distance-axis arrival window, replacing
-                               // the hard-coded 10-count margin.
-    {"arrive_yaw", 36},        // ConfigField.ArriveYaw (this ticket,
-                               // design S4.7, NEW ordinal): [deg] thin
-                               // forward to MotionLimits::
-                               // setArriveYaw()/arriveYaw -- the pure-
-                               // turn arrival window, replacing the
-                               // hard-coded 4-count margin.
-    {"lag", 37},               // ConfigField.Lag
-                               // (design S4.1/S6.1/S10.2, NEW ordinal):
-                               // [s] thin forward to MotionLimits::
-                               // setLag()/lag -- the drivetrain's own
-                               // first-order response lag, consumed by
-                               // the shaper's own predictive braking
-                               // plan and arrival test every tick
-                               // (S6.1 steps 1/5) alongside the kernel's
-                               // measured dominant-axis speed. See
-                               // shims.cpp's setKernelValue()/
-                               // getConfigValue() case (kLimitsFields).
-    {"straight_trim", 38},     // ConfigField.StraightTrim: [1] a
-                               // dimensionless per-robot bias on the
-                               // kernel's OWN twist-hold reference
-                               // (DiffDrive::Config::straightTrim), a
-                               // real stored kernel Config field --
-                               // handled by setKernelValue()/
-                               // getConfigValue() case 38 directly, NOT
-                               // routed through kLimitsFields (this is
-                               // not a MotionLimits member). Default 0;
-                               // no robot's value is baked here.
-};
-constexpr size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
-
-const FieldEntry* findField(const char* name) {
-  for (const auto& entry : kFields) {
-    if (std::strcmp(name, entry.name) == 0) return &entry;
-  }
-  return nullptr;
-}
 
 // LOCAL flags layout, mirroring radio-robot-lib's own DiffDriveAdapter
 // posture (diffdrive_adapter.cpp's computeFlags()): these bit numbers
@@ -577,21 +408,22 @@ Wire::Result WireAdapter::onMoveX(float distance, float rotation,
   // Same cruise <0 handling as onWheelsX() above; the ==0 substitution
   // itself now goes through resolveDefaultCruise() (SUC-003) instead
   // of the flat engineDefaultCruise() directly. D is
-  // engineDominantAxisTravel(distance, yaw), NOT |distance|
+  // engineDominantAxisTravel(distance, engineRotation), NOT |distance|
   // alone -- a pure pivot (distance == 0) still moves its wheels
-  // |yaw|*b/2 mm each, and resolving from |distance| alone
+  // |rotation|*b/2 mm each, and resolving from |distance| alone
   // would always see D == 0 there and refuse every default-speed pivot
   // once shaped mode is on (every pivot in a tour is exactly this
-  // call). `yaw` (the wire's `rotation` field converted to radians) is
-  // computed once, here, and reused below for
+  // call). `engineRotation` (this call's `rotation` argument on the
+  // ENGINE's own scale rather than the wire's) is computed once, here,
+  // and reused below for
   // the dispatch -- the wire's ONE milliradian->radian conversion seam
   // (motion-api.md S9.1, mradToRad()'s own comment above).
   if (cruise < 0.0f) return Wire::Result::kRange;
-  const float yaw = mradToRad(rotation);  // [rad]
+  const float engineRotation = mradToRad(rotation);  // [rad]
   const float resolvedCruise =
       cruise == 0.0f
           ? resolveDefaultCruise(
-                engineDominantAxisTravel(distance, yaw))
+                engineDominantAxisTravel(distance, engineRotation))
           : cruise;
   if (resolvedCruise <= 0.0f) return Wire::Result::kRange;
   // sprint 005 ticket 004: resolve any still-pending PREVIOUS motion
@@ -602,7 +434,7 @@ Wire::Result WireAdapter::onMoveX(float distance, float rotation,
   // there, but is kept identical for one uniform rule (resolve-before-
   // dispatch, always) rather than a rule with silent exceptions.
   if (now_ != nullptr) forceResolvePending(Wire::DoneReason::kAborted);
-  engineMoveX(distance, yaw, resolvedCruise, timeout);
+  engineMoveX(distance, engineRotation, resolvedCruise, timeout);
   if (now_ != nullptr) {
     // GOAL-DIRECTED: this class's own resolvePendingReason() also reads
     // engineMoveActive() for this one -- see wire_adapter.h.
@@ -931,26 +763,33 @@ Wire::DoneReason WireAdapter::lastDoneReason() const {
   return lastDoneReason_;
 }
 
-bool WireAdapter::onGet(const char* name, float& out) const {
-  const FieldEntry* entry = findField(name);
-  if (entry == nullptr) return false;
+Wire::Result WireAdapter::onGet(const char* name, float& out) const {
+  const ConfigFieldDescriptor* entry = findConfigField(name);
+  if (entry == nullptr) return Wire::Result::kUnknown;
   // rebase has no stored value and no boolean latch worth reading back
   // (unlike estop_clear immediately below, whose GET mirrors the live
   // estop flag the same convenience-readback way the stall latch's own
-  // clear field already does) -- refuse outright (the same `false`
-  // this method already returns for an unrecognized name entirely, wire
-  // err 1) rather than manufacture a reading that would always answer 0
-  // with no information in it.
-  if (entry->ordinal == kOrdinalRebase) return false;
+  // clear field already does) -- refuse rather than manufacture a
+  // reading that would always answer 0 with no information in it.
+  //
+  // The refusal is kWriteOnly, NOT the kUnknown an absent name gets.
+  // Refusing was always the right call; answering it with the SAME code
+  // a typo produces was the defect -- `rebase` is advertised by
+  // fieldName(), so a host that reads the field list and then asks for
+  // one of its entries was being told the name does not exist.
+  // estop_clear is deliberately NOT given this treatment: it has a real
+  // read path (the live estop flag), so it answers kOk like any stored
+  // field.
+  if (entry->ordinal == kOrdinalRebase) return Wire::Result::kWriteOnly;
   // config values cross the shim boundary as x1000-scaled ints
   // (shims.cpp convention).
   out = static_cast<float>(getConfigValue(entry->ordinal)) * 0.001f;
-  return true;
+  return Wire::Result::kOk;
 }
 
 Wire::Result WireAdapter::onSet(const char* name, float value, uint32_t id) {
   (void)id;
-  const FieldEntry* entry = findField(name);
+  const ConfigFieldDescriptor* entry = findConfigField(name);
   if (entry == nullptr) return Wire::Result::kUnknown;
   // rebase/estop_clear both touch state an already-in-flight motion is
   // relying on: rebase changes what the position-error math a live move
@@ -989,10 +828,14 @@ Wire::Result WireAdapter::onSet(const char* name, float value, uint32_t id) {
   return Wire::Result::kOk;
 }
 
-size_t WireAdapter::fieldCount() const { return kFieldCount; }
+size_t WireAdapter::fieldCount() const {
+  return static_cast<size_t>(kConfigFieldCount);
+}
 
 const char* WireAdapter::fieldName(size_t index) const {
-  return index < kFieldCount ? kFields[index].name : "";
+  return index < static_cast<size_t>(kConfigFieldCount)
+             ? kConfigFields[index].name
+             : "";
 }
 
 Wire::Result WireAdapter::onTlm(Wire::TlmMode mode) {

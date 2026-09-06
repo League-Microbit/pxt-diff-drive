@@ -23,7 +23,7 @@ bool tickDrive();
 
 // Runs the ONE registered RUN dispatch action (test.ts's onRun()/
 // onRunCommand() handlers all share it), on the caller's own fiber --
-// see invokeRunDispatch() below. Returns false with nothing registered
+// see handleRun()/dispatchJob() below. Returns false with nothing registered
 // yet (no onRun() handler has ever been called), a silent no-op.
 bool runDispatch();
 
@@ -142,21 +142,6 @@ constexpr size_t kOldRunPrefixLen = 4;
 constexpr uint32_t kTelemetryEmitPeriod = 50;  // [ms]
 constexpr uint32_t kPollInterval = 5;  // [ms]
 
-// Bypass names for handleRun() below: these two skip runQueue_ entirely
-// and dispatch immediately, regardless of what else is running -- see
-// handleRun()'s own comment. `name` is the payload up to (not including)
-// its first ':', or the whole payload if there is none, matching how
-// the TS dispatcher itself splits a command into name + arguments.
-bool isBypassRunName(const char* text) {
-  size_t nameLen = 0;
-  while (text[nameLen] != '\0' && text[nameLen] != ':') ++nameLen;
-  auto matches = [&](const char* name) {
-    return std::strlen(name) == nameLen &&
-           std::memcmp(text, name, nameLen) == 0;
-  };
-  return matches("abort") || matches("clearestop");
-}
-
 }  // namespace
 
 void Protocol::emitLine(const char* text) {
@@ -201,30 +186,24 @@ void Protocol::emitLineNow(const char* text, size_t len) {
   if (wifiEnabled_) {
     (void)wifiLink_.sendLine(reinterpret_cast<const uint8_t*>(text), len);
   }
-  // RadioTransport::sendLine() now guards its shared scratch buffers
-  // against the protocol fiber's own RadioSink::write() calls (ticket
-  // 002); false means the guard fired and this line was dropped
-  // untouched. This is the one caller whose loss is user-visible (a
-  // test's own recorded result, e.g. an OCAL: corner fix), so it gets
-  // exactly one fiber_sleep(2)-and-retry -- not a loop -- before giving
-  // up silently, per sprint.md's Design Rationale.
-  // Gate 2 of 3 (see radioEnabled_'s own comment, protocol.h): without
-  // this, the first debug line a student emits would call sendLine(),
-  // which lazily calls ensureRadioReady() and claims the radio out from
-  // under MakeCode's own radio blocks. Serial above is unconditional --
-  // serial is always v6.
-  if (!radioEnabled_) return;
-  if (!radioTransport_.sendLine(reinterpret_cast<const uint8_t*>(text),
-                                len)) {
-    vfpSafeSleep(2);
-    (void)radioTransport_.sendLine(reinterpret_cast<const uint8_t*>(text),
-                                   len);
-  }
+  // Radio mirror. No enable check here: RadioTransport owns that gate
+  // itself and returns false, having touched nothing, while its link is
+  // disabled (RadioTransport::enable()'s own doc comment,
+  // radio_transport.h) -- which is what keeps a student's first debug
+  // line from claiming the radio out from under MakeCode's own radio
+  // blocks. Serial above is unconditional: serial is always v6.
+  //
+  // No retry either. This fiber is the only writer sendLine() has, so a
+  // false return can no longer mean "another writer had the buffers" --
+  // it means the link is off, and sending the same line twice to a
+  // disabled radio achieves nothing.
+  (void)radioTransport_.sendLine(reinterpret_cast<const uint8_t*>(text), len);
 }
 
 // Drains emitQueue_ into emitLineNow(), oldest line first. Copies each
 // line out to a local, on-this-fiber's-stack buffer before calling
-// emitLineNow() -- that call can yield (the radio retry above), and
+// emitLineNow() -- that call can yield (uBit.serial.send(SYNC_SLEEP)
+// blocks once CODAL's TX ring fills, see serial_transport.cpp), and
 // holding a pointer into the ring's own storage across a yield would
 // let a concurrent enqueue() from another fiber overwrite it before
 // this fiber finishes using it.
@@ -255,6 +234,21 @@ int protocolRunDropCount() {
 int protocolEmitDropCount() {
   return static_cast<int>(protocol().emitDropCount());
 }
+int protocolRunMalformedCount() {
+  return static_cast<int>(protocol().runMalformedCount());
+}
+int protocolRadioRxFrameCount() {
+  return static_cast<int>(protocol().radioRxFrameCount());
+}
+int protocolRadioRxAcceptedCount() {
+  return static_cast<int>(protocol().radioRxAcceptedCount());
+}
+int protocolRadioRxOverrunDropCount() {
+  return static_cast<int>(protocol().radioRxOverrunDropCount());
+}
+int protocolRadioRxOversizeDropCount() {
+  return static_cast<int>(protocol().radioRxOversizeDropCount());
+}
 
 void Protocol::setupRadio(uint8_t channel, uint8_t group) {
   // Order matters: configure, THEN enable. Both setters only store while
@@ -265,10 +259,10 @@ void Protocol::setupRadio(uint8_t channel, uint8_t group) {
   // RadioTransport::setChannel()) is never exercised by this call.
   radioTransport_.setChannel(channel);
   radioTransport_.setGroup(group);
-  radioEnabled_ = true;
+  radioTransport_.enable();
 }
 
-void Protocol::enableRadio() { radioEnabled_ = true; }
+void Protocol::enableRadio() { radioTransport_.enable(); }
 
 void Protocol::enableWifi() { wifiEnabled_ = true; }
 
@@ -308,13 +302,13 @@ void Protocol::serviceWifi() {
     config.port = kWifiPort;
     config.hostPort = kWifiHostPort;
     wifiLink_.begin(config);
-    lastWifiDbg_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
+    lastWifiDbg_ = clockNow();
     emitWifiDebug();
   }
 
   wifiLink_.service();
 
-  const uint32_t now = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
+  const uint32_t now = clockNow();  // [ms]
   if (wifiLink_.pollStateChanged() ||
       (!wifiLink_.ready() &&
        static_cast<int32_t>(now - (lastWifiDbg_ + kWifiDebugPeriod)) >= 0)) {
@@ -337,104 +331,70 @@ void Protocol::serviceWifi() {
     emitWifiDebug();
   }
 
-  // Inbound: one datagram is one line. Bounded per pass so a host
-  // blasting lines cannot starve the rest of serviceOnce().
-  for (int i = 0; i < WifiLink::kRxSlots; ++i) {
+  // Inbound: one datagram is one line. Bounded per pass by the same
+  // kRxDrainPerPass every transport uses, so a host blasting lines
+  // cannot starve the rest of serviceOnce(). (WifiLink parks at most
+  // kRxSlots datagrams, which is the same number today; the bound
+  // spelled here is the servicing budget, not the parking capacity.)
+  for (int i = 0; i < kRxDrainPerPass; ++i) {
     size_t len = 0;
     if (!wifiLink_.tryReceiveLine(wifiRxBuf_, WifiLink::kMaxLineBytes, &len)) break;
-    if (len >= kOldRunPrefixLen &&
-        std::memcmp(wifiRxBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
-      handleRun(wifiRxBuf_ + kOldRunPrefixLen, len - kOldRunPrefixLen);
-    } else {
-      wireHandlerWifi_.feed(reinterpret_cast<const char*>(wifiRxBuf_), len);
-      wireHandlerWifi_.feed("\n", 1);
-    }
+    routeLine(wireHandlerWifi_, wifiRxBuf_, len);
   }
+}
+
+// The ONE inbound path -- see this method's own doc comment
+// (protocol.h). Serial, radio and WiFi all arrive here; the only thing
+// that differs between them is which WireHandler the caller passes.
+void Protocol::routeLine(Wire::WireHandler& handler, const uint8_t* data,
+                         size_t len) {
+  if (len >= kOldRunPrefixLen &&
+      std::memcmp(data, kOldRunPrefix, kOldRunPrefixLen) == 0) {
+    // Old-style cleartext RUN, preserved unchanged -- see protocol.h's
+    // own top-of-file comment for why it is detected here by literal
+    // prefix rather than through a verb registry (the v5 registry that
+    // used to do this is gone).
+    handleRun(data + kOldRunPrefixLen, len - kOldRunPrefixLen);
+    return;
+  }
+  // Every other line -- including the v6 grammar's own space-separated
+  // "RUN <name> ... #<id>" verb -- goes to the v6 wire stack. feed()
+  // reassembles regardless of chunking; the trailing '\n' it needs to
+  // recognize the line as complete is fed as a second, separate call.
+  handler.feed(reinterpret_cast<const char*>(data), len);
+  handler.feed("\n", 1);
 }
 
 // ---- the old-style cleartext RUN bridge ------------------------------
 
 void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
-  if (data == nullptr || dataLen == 0) return;
-  // Strip one trailing '\r' (raw-terminal artifact, same tolerance the
-  // old cleartext line parser gave colon-less lines), then copy the payload
-  // verbatim. Anything outside printable ASCII -- or too long for a
-  // slot -- is malformed: drop silently. The name/argument split is NOT
-  // done here: this layer stays a transport for the text, and the TS
-  // layer owns the vocabulary.
-  if (data[dataLen - 1] == '\r') --dataLen;
-  if (dataLen == 0 || dataLen >= kRunTextBytes) return;
-  char text[kRunTextBytes];
-  for (size_t i = 0; i < dataLen; ++i) {
-    const uint8_t c = data[i];
-    if (c < 0x20 || c > 0x7E) return;
-    text[i] = static_cast<char>(c);
-  }
-  text[dataLen] = '\0';
-  if (text[0] == ':') return;   // empty name -- nothing to dispatch on
+  // Sanitizing, repeat suppression and parking all live in runBridge_
+  // (run_bridge.h/.cpp, host-portable and host-tested there). This
+  // fiber supplies the clock reading and makes the one call the bridge
+  // cannot: the dispatch into TypeScript.
+  const uint32_t now = clockNow();  // [ms]
+  if (runBridge_.offer(data, dataLen, now) != RunBridge::Offer::kBypass) return;
 
-  // Dedupe repeats of the SAME command. The robot's inbound wireless
-  // path is a single-slot buffer, so hosts repeat commands to survive
-  // loss -- a repeated RUN does not hit the test programs' own re-entry
-  // guard (which has already cleared by the time a retransmit lands):
-  // measured on vevov, one 3x-repeated RUN:4 ran three consecutive
-  // 180 deg pivots.
-  //
-  // Suppression is by (text, arrival time) here at the point of
-  // arrival, NOT at handling time, which is what makes it immune to
-  // that queueing. Two commands that differ only in their arguments
-  // are different text, so they are not each other's repeats. A
-  // deliberate re-run of the same command just needs to be spaced past
-  // the window.
-  const uint32_t now = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
-  if (std::strcmp(lastRunText_, text) == 0 &&
-      static_cast<int32_t>(now - lastRun_) < kRunDedupe) {
-    lastRun_ = now;   // extend across a burst of repeats
-    return;
-  }
-  std::memcpy(lastRunText_, text, dataLen + 1);
-  lastRun_ = now;
-
-  // Abort/clearestop bypass runQueue_ entirely and dispatch RIGHT NOW,
-  // on whatever fiber called handleRun() -- run()'s own loop normally,
-  // but (crucially) also the service hook nested inside a running job's
-  // own tick loop, which is the ONLY way an abort sent while a job is
-  // mid-tour can ever be noticed: dispatchJob() refuses to start a
-  // SECOND job while motionOwner_ is not kNone, so if abort went through
-  // the same queued path as everything else it would sit behind the
-  // very job it is meant to stop. Ungated on motionOwner_ deliberately
-  // -- both handlers this dispatches to (test.ts's "abort"/"clearestop")
-  // are trivial, non-blocking, and safe to invoke reentrant from inside
-  // a job's own call chain.
-  if (isBypassRunName(text)) {
-    invokeRunDispatch(text);
-    return;
-  }
-
-  if (runQueue_.enqueue(text, static_cast<int>(dataLen)) < 0) {
-    // Every slot is still in flight. Refusing is the point: the old
-    // cursor would have overwritten one, and the handler holding it
-    // would then have run a command nobody sent. The refusal is
-    // counted and readable rather than silent, so a host that
-    // out-runs the robot can find out.
-    return;
-  }
-  // dispatchJob() drains runQueue_ itself, in arrival order -- nothing
-  // else to do here once the enqueue above has accepted the command.
+  // "abort"/"clearestop" dispatch RIGHT NOW, on whatever fiber called
+  // handleRun() -- run()'s own loop normally, but (crucially) also the
+  // service hook nested inside a running job's own tick loop, which is
+  // the ONLY way an abort sent while a job is mid-tour can ever be
+  // noticed: dispatchJob() refuses to start a SECOND job while
+  // motionOwner_ is not kNone, so if abort went through the same queued
+  // path as everything else it would sit behind the very job it is
+  // meant to stop. Ungated deliberately -- both handlers this
+  // dispatches to (test.ts's "abort"/"clearestop") are trivial,
+  // non-blocking, and safe to invoke reentrant from inside a job's own
+  // call chain. The payload is already staged in runBridge_ for
+  // runCommandText() to read back at the handler's own entry.
+  runDispatch();
 }
 
 void Protocol::dispatchJob() {
   if (motionOwner_ != MotionOwner::kNone) return;
-  const int slot = runQueue_.peek();
-  if (slot < 0) return;  // nothing queued
-
-  // Copy the text out and release the slot BEFORE dispatching -- the
-  // call below can run for as long as the job itself does (a whole
-  // tour), and releasing first frees runQueue_'s capacity for a burst
-  // arriving during that whole span instead of holding one slot hostage
-  // for it.
-  setCurrentRunText(runQueue_.at(slot));
-  runQueue_.release(slot);
+  // Stages the oldest parked payload for currentRunText() and frees its
+  // slot; false means nothing is queued.
+  if (!runBridge_.dispatchOne()) return;
 
   motionOwner_ = MotionOwner::kJob;
   wireAdapter_.setExternalOwner(MotionOwner::kJob);
@@ -489,17 +449,9 @@ void protocolReleaseBlockOwnership() {
   protocol().releaseBlockOwnership();
 }
 
-void Protocol::invokeRunDispatch(const char* text) {
-  setCurrentRunText(text);
-  runDispatch();
+const char* Protocol::currentRunText() const {
+  return runBridge_.currentText();
 }
-
-void Protocol::setCurrentRunText(const char* text) {
-  std::strncpy(currentRunText_, text, kRunTextBytes - 1);
-  currentRunText_[kRunTextBytes - 1] = '\0';
-}
-
-const char* Protocol::currentRunText() const { return currentRunText_; }
 
 void Protocol::serviceHookEntry() {
   Protocol& p = protocol();
@@ -556,7 +508,22 @@ void Protocol::paintStackCanary() {
 void Protocol::paintStackCanary() {}
 #endif
 
-uint32_t Protocol::runDropCount() const { return runQueue_.dropped(); }
+uint32_t Protocol::runDropCount() const { return runBridge_.dropCount(); }
+uint32_t Protocol::runMalformedCount() const {
+  return runBridge_.malformedCount();
+}
+uint32_t Protocol::radioRxFrameCount() const {
+  return radioTransport_.rxCounters().frames;
+}
+uint32_t Protocol::radioRxAcceptedCount() const {
+  return radioTransport_.rxCounters().accepted;
+}
+uint32_t Protocol::radioRxOverrunDropCount() const {
+  return radioTransport_.rxCounters().overrunDropped;
+}
+uint32_t Protocol::radioRxOversizeDropCount() const {
+  return radioTransport_.rxCounters().oversizeDropped;
+}
 uint32_t Protocol::emitDropCount() const { return emitQueue_.dropped(); }
 
 // Same boundary, opposite direction: shims.cpp's runCommandText shim
@@ -577,16 +544,20 @@ Wire::Identity Protocol::buildIdentity() {
   return identity;
 }
 
+uint32_t Protocol::clockNow() {  // [ms]
+  return static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+}
+
 uint32_t Protocol::wireNow() {  // [ms]
-  // Reuses this Protocol instance's own clock_ (unchanged member, still
-  // backing handleRun()'s dedupe timing too) via the protocol()
-  // singleton accessor -- the only way a plain, non-capturing function
-  // pointer (WireAdapter::NowMsFn) can reach back into this specific
-  // instance's state. Safe: this is only ever CALLED from inside
-  // wireAdapter_'s own methods, which only run once the fiber is
-  // already executing commands, well after protocol()'s singleton
-  // pointer is assigned (see protocol()'s own definition below).
-  return static_cast<uint32_t>(protocol().clock_.nowMicros() / 1000ull);
+  // Reaches this Protocol instance's own clockNow() (above) through the
+  // protocol() singleton accessor -- the only way a plain,
+  // non-capturing function pointer (WireAdapter::NowMsFn) can reach
+  // back into this specific instance's state. Safe: this is only ever
+  // CALLED from inside wireAdapter_'s own methods, which only run once
+  // the fiber is already executing commands, well after protocol()'s
+  // singleton pointer is assigned (see protocol()'s own definition
+  // below).
+  return protocol().clockNow();
 }
 
 // ---- Protocol loop -----------------------------------------------------
@@ -624,69 +595,52 @@ void Protocol::serviceOnce() {
   // that is already dispatching.
   dispatchJob();
 
-  size_t len = 0;
-  if (transport_.tryReadLine(lineBuf_, sizeof(lineBuf_), &len)) {
-    if (len >= kOldRunPrefixLen &&
-        std::memcmp(lineBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
-      // Old-style cleartext RUN, preserved unchanged -- see this
-      // file's own top-of-file comment (protocol.h) for why it's
-      // detected here by literal prefix rather than through a verb
-      // registry (the v5 registry that used to do this is gone).
-      handleRun(lineBuf_ + kOldRunPrefixLen, len - kOldRunPrefixLen);
-    } else {
-      // Every other line -- including the v6 grammar's own
-      // space-separated "RUN <name> ... #<id>" verb -- goes to the
-      // v6 wire stack. feed() reassembles regardless of chunking; the
-      // trailing '\n' it needs to recognize the line as complete is
-      // fed as a second, separate call.
-      wireHandler_.feed(reinterpret_cast<const char*>(lineBuf_), len);
-      wireHandler_.feed("\n", 1);
-    }
+  // Serial: drain up to kRxDrainPerPass lines, not one. One per pass
+  // meant one per 24 ms while a job ran (the tick hook is the only
+  // caller then), and serial at 115200 delivers ~276 bytes into a
+  // 255-byte ring in that window -- so a host writing two commands
+  // back-to-back overflowed the ring, and CODAL drops those bytes with
+  // no signal at all. Draining what has already arrived is what keeps
+  // the ring from being the thing that fills.
+  for (int n = 0; n < kRxDrainPerPass; ++n) {
+    size_t len = 0;
+    if (!transport_.tryReadLine(lineBuf_, sizeof(lineBuf_), &len)) break;
+    routeLine(wireHandler_, lineBuf_, len);
   }
 
-  // Radio command plane (single-fragment RX): mirrors the serial
-  // branch's own dual-path logic above exactly. Radio speaks the full
-  // v6 grammar (ack/nack, TLM, STATUS, the motion verbs, etc.) through
-  // its OWN WireHandler (wireHandlerRadio_), with the old-style literal
-  // "RUN:" prefix preserved as a fallback, unchanged, exactly as
-  // protocol.h's own top-of-file comment describes. This call also
-  // lazily brings the radio up on its first invocation
-  // (RadioTransport::tryReceiveLine() calls ensureRadioReady()
-  // internally) -- the same "unconditionally from this fiber's boot
-  // path" cost the old banner/TLM radio mirror used to pay, just via
-  // the receive side now that there is no v6 reply mirror to pay it
-  // instead. Radio's RX path stays a single 64-byte fragment slot with
-  // no multi-fragment reassembly: a v6 line whose encoding does not fit
-  // one fragment is out of scope here.
-  // Gate 1 of 3 (see radioEnabled_'s own comment, protocol.h). This
-  // poll is what used to bring the radio up at boot, unconditionally,
-  // for every program -- which is exactly why a student's joystick
-  // program could never work. tryReceiveLine() calls
-  // ensureRadioReady() internally, so NOT calling it at all is what
-  // leaves the radio free for MakeCode's own radio blocks.
-  size_t radioLen = 0;
-  if (radioEnabled_ &&
-      radioTransport_.tryReceiveLine(rxLineBuf_, sizeof(rxLineBuf_),
-                                     &radioLen)) {
-    if (radioLen >= kOldRunPrefixLen &&
-        std::memcmp(rxLineBuf_, kOldRunPrefix, kOldRunPrefixLen) == 0) {
-      // Old-style cleartext RUN, preserved unchanged as a fallback --
-      // see protocol.h's own top-of-file comment for why it's
-      // detected here by literal prefix rather than through the v6
-      // grammar's own verb lookup.
-      handleRun(rxLineBuf_ + kOldRunPrefixLen,
-               radioLen - kOldRunPrefixLen);
-    } else {
-      // Every other line -- including the v6 grammar's own
-      // space-separated "RUN <name> ... #<id>" verb -- goes to
-      // radio's own v6 wire stack. wireHandlerRadio_ keeps its own
-      // independent expectedNext_ (wifi-link.md:373),
-      // so a gap on this transport can never nack wireHandler_'s
-      // (serial's) next command, or vice versa.
-      wireHandlerRadio_.feed(reinterpret_cast<const char*>(rxLineBuf_),
-                             radioLen);
-      wireHandlerRadio_.feed("\n", 1);
+  // Radio command plane (single-fragment RX): the same one inbound path
+  // the serial read above takes, differing only in which WireHandler it
+  // is given. Radio speaks the full v6 grammar (ack/nack, TLM, STATUS,
+  // the motion verbs, etc.) through its OWN WireHandler
+  // (wireHandlerRadio_, its own expectedNext_ -- so a gap on this
+  // transport can never nack serial's next command, or vice versa),
+  // with the old-style literal "RUN:" prefix preserved as a fallback,
+  // unchanged, exactly as protocol.h's own top-of-file comment
+  // describes.
+  //
+  // No enable check here: this call is the one that would bring the
+  // radio up (it calls ensureRadioReady() internally), and
+  // RadioTransport now refuses it itself while its link is disabled --
+  // NOT touching the radio at all is what leaves it free for MakeCode's
+  // own radio blocks, and that refusal is now the transport's own
+  // (RadioTransport::enable(), radio_transport.h). Radio's RX path
+  // stays a single fragment slot with no multi-fragment reassembly: a
+  // v6 line whose encoding does not fit one fragment is out of scope
+  // here.
+  //
+  // Bounded by the same kRxDrainPerPass as serial. Radio holds ONE
+  // inbound line at a time, so a second pass usually finds nothing --
+  // but the datagram handler fires on its own event, so a line can
+  // land between two iterations here, and consuming it now is a slot
+  // freed before the next one arrives to find it busy (that drop is
+  // counted, radioRxClassify()).
+  for (int n = 0; n < kRxDrainPerPass; ++n) {
+    size_t radioLen = 0;
+    if (!radioTransport_.tryReceiveLine(rxLineBuf_, sizeof(rxLineBuf_),
+                                        &radioLen)) {
+      break;
     }
+    routeLine(wireHandlerRadio_, rxLineBuf_, radioLen);
   }
 
   // The WiFi transport, gated exactly like the radio: nothing touches
@@ -714,17 +668,19 @@ void Protocol::serviceOnce() {
   // NOT "restore" a periodic, rate-limited, gap-gated, or
   // telemetry-carried re-emission here -- that would reintroduce a
   // free-running beacon this design deliberately has none of.
-  const uint32_t now = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);  // [ms]
+  const uint32_t now = clockNow();  // [ms]
   if (static_cast<int32_t>(now - lastEmit_) >=
       static_cast<int32_t>(kTelemetryEmitPeriod)) {
     if (wireAdapter_.telemetryEnabled()) {
       const Wire::Snapshot& snapshot = wireAdapter_.buildSnapshot();
       wireHandler_.emitTelemetry(snapshot);
-      // Gate 3 of 3 (see radioEnabled_'s own comment, protocol.h):
-      // wireHandlerRadio_ sinks through radioSink_ into
-      // RadioTransport::sendLine(), which lazily enables the radio.
-      // Serial telemetry just above is unconditional.
-      if (radioEnabled_) {
+      // Asked of the transport, which owns the answer. sendLine() would
+      // refuse a disabled link on its own, so this gate is not what
+      // keeps the radio off the air -- it is what keeps
+      // wireHandlerRadio_ from formatting and, more to the point,
+      // advancing its own header state for frames that could never go
+      // anywhere. Serial telemetry just above is unconditional.
+      if (radioTransport_.enabled()) {
         wireHandlerRadio_.emitTelemetry(snapshot);
       }
       // WiFi frames are additionally gated by the link's own throttle
@@ -753,7 +709,7 @@ void Protocol::serviceOnce() {
   if (wireAdapter_.consumeOneShotTelemetry()) {
     const Wire::Snapshot& snapshot = wireAdapter_.buildSnapshot();
     wireHandler_.emitTelemetry(snapshot);
-    if (radioEnabled_) {
+    if (radioTransport_.enabled()) {
       wireHandlerRadio_.emitTelemetry(snapshot);
     }
     if (wifiEnabled_ && wifiLink_.telemetryAllowed()) {
@@ -792,7 +748,7 @@ void Protocol::run() {
   // wireHandler_'s own dispatch.
   wireHandler_.sendBanner();
 
-  lastEmit_ = static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
+  lastEmit_ = clockNow();
 
   // Register this fiber's own servicing as tickDrive()'s service hook --
   // see serviceHookEntry()'s own comment (protocol.h) for what it does
@@ -864,8 +820,8 @@ void startProtocol() { protocol(); }
 //
 // This is the ONLY thing that turns the v6 radio link on. Until a
 // program calls it, the radio is never enabled at all and MakeCode's
-// own `radio.*` blocks own the air -- see radioEnabled_'s comment in
-// protocol.h.
+// own `radio.*` blocks own the air -- see RadioTransport::enable()'s
+// own comment (radio_transport.h).
 //%
 void setupRadio(int channel, int group) {
   protocol().setupRadio(static_cast<uint8_t>(channel),

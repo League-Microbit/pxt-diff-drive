@@ -18,28 +18,28 @@ namespace {
 struct AtStep {
   const char* command;
   const char* expect;
-  uint32_t timeoutMs;
+  uint32_t timeout;  // [ms]
   bool tolerant;
 };
 
 const AtStep kConfigureSteps[] = {
     {"AT+RST", "ready", 6000, true},
     {"AT", "OK", 2000, true},  // absorbs boot-banner stragglers
-    {"ATE0", "OK", WifiLink::kCommandTimeoutMs, true},
-    {"AT+CIPMODE=0", "OK", WifiLink::kCommandTimeoutMs, true},
-    {"AT+CIPSERVER=0", "OK", WifiLink::kCommandTimeoutMs, true},
-    {"AT+CIPCLOSE=5", "OK", WifiLink::kCommandTimeoutMs, true},
-    {"AT+CIPCLOSE", "OK", WifiLink::kCommandTimeoutMs, true},
-    {"AT+CWMODE=1", "OK", WifiLink::kCommandTimeoutMs, false},
-    {"AT+CIPMUX=1", "OK", WifiLink::kCommandTimeoutMs, false},
-    {"AT+CIPDINFO=1", "OK", WifiLink::kCommandTimeoutMs, true},
+    {"ATE0", "OK", WifiLink::kCommandTimeout, true},
+    {"AT+CIPMODE=0", "OK", WifiLink::kCommandTimeout, true},
+    {"AT+CIPSERVER=0", "OK", WifiLink::kCommandTimeout, true},
+    {"AT+CIPCLOSE=5", "OK", WifiLink::kCommandTimeout, true},
+    {"AT+CIPCLOSE", "OK", WifiLink::kCommandTimeout, true},
+    {"AT+CWMODE=1", "OK", WifiLink::kCommandTimeout, false},
+    {"AT+CIPMUX=1", "OK", WifiLink::kCommandTimeout, false},
+    {"AT+CIPDINFO=1", "OK", WifiLink::kCommandTimeout, true},
 };
 constexpr uint8_t kConfigureStepCount =
     sizeof(kConfigureSteps) / sizeof(kConfigureSteps[0]);
 
 const char kMdnsAddress[] = "224.0.0.251";
 constexpr uint16_t kMdnsPort = 5353;
-constexpr uint32_t kMdnsTtlSeconds = 120;
+constexpr uint32_t kMdnsTtl = 120;  // [s]
 
 void copyBounded(char* dst, size_t cap, const char* src) {
   size_t i = 0;
@@ -181,18 +181,18 @@ bool WifiLink::IpdParser::feed(char c) {
 // WifiLink
 // ---------------------------------------------------------------------------
 
-WifiLink::WifiLink(WifiUart& uart, NowMsFn nowMs)
-    : uart_(uart), nowMs_(nowMs), config_(), state_(kDisabled), step_(0),
+WifiLink::WifiLink(WifiUart& uart, NowFn now)  // [ms] clock
+    : uart_(uart), now_(now), config_(), state_(kDisabled), step_(0),
       joinQueryAttempt_(0), restartCount_(0), stateChanged_(false),
       awaiting_(false), deadline_(0), awaitMatched_(false),
       awaitRejected_(false), payloadRemaining_(0), payloadLink_(-1),
       statusLen_(0), ownIpCapturing_(false), ownIpLen_(0), peerPort_(0),
-      peerKnown_(false), lastPeerHeardMs_(0), reportedPeerPort_(0),
+      peerKnown_(false), lastPeerHeard_(0), reportedPeerPort_(0),
       rxHead_(0), rxCount_(0), tcpOpenMask_(0), replyLink_(kProtocolLink),
       tcpConnectEdge_(false), tcpServerOpen_(false), telemetryMode_(false),
       txHead_(0), txCount_(0), sendPhase_(kIdle),
-      lastTelemetryMs_(0), telemetryEverSent_(false), mdnsSocketOpen_(false),
-      lastMdnsMs_(0), mdnsAnnounceCount_(0), dropCount_(0), sentCount_(0),
+      lastTelemetry_(0), telemetryEverSent_(false), mdnsSocketOpen_(false),
+      lastMdnsAnnounce_(0), mdnsAnnounceCount_(0), dropCount_(0), sentCount_(0),
       receivedCount_(0), promptRetryDeadline_(0), lastReplyLen_(0),
       stageLen_(0), stagePos_(0) {
   expectBuf_[0] = '\0';
@@ -260,7 +260,7 @@ void WifiLink::enterBackoff() {
   txCount_ = 0;
   txHead_ = 0;
   sendPhase_ = kIdle;
-  deadline_ = nowMs() + kBackoffDelayMs;
+  deadline_ = now() + kBackoffDelay;
   enterState(kBackoff);
 }
 
@@ -278,19 +278,19 @@ void WifiLink::traceReply(char c) {
   lastReply_[lastReplyLen_] = '\0';
 }
 
-void WifiLink::startAwait(const char* expect, uint32_t timeoutMs) {
+void WifiLink::startAwait(const char* expect, uint32_t timeout) {  // [ms]
   expect_.reset(expect);
   rejectError_.reset("ERROR");
   rejectFail_.reset("FAIL");
   rejectBusy_.reset("busy");
   awaitMatched_ = false;
   awaitRejected_ = false;
-  deadline_ = nowMs() + timeoutMs;
+  deadline_ = now() + timeout;
   awaiting_ = true;
 }
 
 bool WifiLink::startCommand(const char* command, const char* expect,
-                            uint32_t timeoutMs) {
+                            uint32_t timeout) {  // [ms]
   const int n = snprintf(commandBuf_, sizeof(commandBuf_), "%s\r\n", command);
   if (n <= 0 || static_cast<unsigned>(n) >= sizeof(commandBuf_)) return false;
   if (!uart_.write(reinterpret_cast<const uint8_t*>(commandBuf_),
@@ -300,7 +300,7 @@ bool WifiLink::startCommand(const char* command, const char* expect,
   copyBounded(lastCommand_, sizeof(lastCommand_), command);
   lastReply_[0] = '\0';
   lastReplyLen_ = 0;
-  startAwait(expect, timeoutMs);
+  startAwait(expect, timeout);
   return true;
 }
 
@@ -314,7 +314,7 @@ WifiLink::Await WifiLink::pollAwait() {
     awaiting_ = false;
     return kRejected;
   }
-  if (static_cast<int32_t>(nowMs() - deadline_) >= 0) {
+  if (static_cast<int32_t>(now() - deadline_) >= 0) {
     awaiting_ = false;
     return kTimedOut;
   }
@@ -358,7 +358,7 @@ void WifiLink::feedByte(uint8_t c) {
       // still counts as heard-from (the wifi-link note, section 6.1).
       if (ipd_.ip()[0] != '\0') copyBounded(peerIp_, sizeof(peerIp_), ipd_.ip());
       if (ipd_.port() != 0) peerPort_ = ipd_.port();
-      lastPeerHeardMs_ = nowMs();
+      lastPeerHeard_ = now();
       peerKnown_ = (peerIp_[0] != '\0' && peerPort_ != 0);
     }
     ipd_.reset();
@@ -480,7 +480,7 @@ void WifiLink::finishPayload() {
 
 bool WifiLink::peerKnown() {
   if (!peerKnown_) return false;
-  if (static_cast<int32_t>(nowMs() - (lastPeerHeardMs_ + kPeerSilenceMs)) >= 0) {
+  if (static_cast<int32_t>(now() - (lastPeerHeard_ + kPeerSilence)) >= 0) {
     peerKnown_ = false;
     peerIp_[0] = '\0';
     peerPort_ = 0;
@@ -514,7 +514,7 @@ void WifiLink::serviceConfigure() {
   }
   const AtStep& s = kConfigureSteps[step_];
   if (!awaiting_) {
-    startCommand(s.command, s.expect, s.timeoutMs);
+    startCommand(s.command, s.expect, s.timeout);
     return;
   }
   const Await outcome = pollAwait();
@@ -536,7 +536,7 @@ void WifiLink::serviceJoin() {
       // The expect token must outlive the await, and commandBuf_ is
       // reused by startCommand() -- so it gets its own member buffer.
       snprintf(expectBuf_, sizeof(expectBuf_), "+CWJAP:\"%s\"", config_.ssid);
-      startCommand("AT+CWJAP?", expectBuf_, kJoinQueryMs);
+      startCommand("AT+CWJAP?", expectBuf_, kJoinQueryTimeout);
       return;
     }
     const Await outcome = pollAwait();
@@ -559,7 +559,7 @@ void WifiLink::serviceJoin() {
     char cmd[kCommandBuffer];
     snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"", config_.ssid,
              config_.password);
-    startCommand(cmd, "OK", kJoinTimeoutMs);
+    startCommand(cmd, "OK", kJoinTimeout);
     return;
   }
   const Await outcome = pollAwait();
@@ -574,7 +574,7 @@ void WifiLink::serviceJoin() {
 void WifiLink::serviceAddress() {
   if (step_ == 0) {
     if (!awaiting_) {
-      startCommand("AT+CWDHCP=1,1", "OK", kCommandTimeoutMs);
+      startCommand("AT+CWDHCP=1,1", "OK", kCommandTimeout);
       return;
     }
     if (pollAwait() == kPending) return;
@@ -590,7 +590,7 @@ void WifiLink::serviceAddress() {
     ownIpLen_ = 0;
     ownIpCapturing_ = false;
     ownIpTag_.reset("ip:\"");
-    startCommand("AT+CIPSTA?", "OK", kCommandTimeoutMs);
+    startCommand("AT+CIPSTA?", "OK", kCommandTimeout);
     return;
   }
   if (pollAwait() == kPending) return;
@@ -610,7 +610,7 @@ void WifiLink::serviceSocket() {
                static_cast<unsigned>(config_.port));
       char cmd[kCommandBuffer];
       copyBounded(cmd, sizeof(cmd), commandBuf_);
-      startCommand(cmd, "OK", kCommandTimeoutMs);
+      startCommand(cmd, "OK", kCommandTimeout);
       return;
     }
     const Await outcome = pollAwait();
@@ -632,7 +632,7 @@ void WifiLink::serviceSocket() {
              static_cast<unsigned>(kMdnsPort), static_cast<unsigned>(kMdnsPort));
     char cmd[kCommandBuffer];
     copyBounded(cmd, sizeof(cmd), commandBuf_);
-    startCommand(cmd, "OK", kCommandTimeoutMs);
+    startCommand(cmd, "OK", kCommandTimeout);
     return;
   }
   if (step_ == 1) {
@@ -640,7 +640,7 @@ void WifiLink::serviceSocket() {
     if (outcome == kPending) return;
     mdnsSocketOpen_ = (outcome == kMatched);
     if (!config_.tcpServer) {
-      lastMdnsMs_ = nowMs() - kMdnsPeriodMs;  // announce on the first ready pass
+      lastMdnsAnnounce_ = now() - kMdnsPeriod;  // announce on the first ready pass
       enterState(kReady);
       return;
     }
@@ -658,7 +658,7 @@ void WifiLink::serviceSocket() {
                static_cast<unsigned>(config_.port));
       char cmd[kCommandBuffer];
       copyBounded(cmd, sizeof(cmd), commandBuf_);
-      startCommand(cmd, "OK", kCommandTimeoutMs);
+      startCommand(cmd, "OK", kCommandTimeout);
       return;
     }
     const Await outcome = pollAwait();
@@ -672,11 +672,11 @@ void WifiLink::serviceSocket() {
   // closes one after 180 s of silence). Tolerant: an unsupported verb
   // just leaves the default in place.
   if (!awaiting_) {
-    startCommand("AT+CIPSTO=0", "OK", kCommandTimeoutMs);
+    startCommand("AT+CIPSTO=0", "OK", kCommandTimeout);
     return;
   }
   if (pollAwait() == kPending) return;
-  lastMdnsMs_ = nowMs() - kMdnsPeriodMs;  // announce on the first ready pass
+  lastMdnsAnnounce_ = now() - kMdnsPeriod;  // announce on the first ready pass
   enterState(kReady);
 }
 
@@ -697,8 +697,8 @@ void WifiLink::serviceReady() {
         awaiting_ = true;
         awaitMatched_ = false;
         awaitRejected_ = false;
-        if (promptRetryDeadline_ == 0) promptRetryDeadline_ = nowMs() + 200;
-        if (static_cast<int32_t>(nowMs() - promptRetryDeadline_) >= 0) {
+        if (promptRetryDeadline_ == 0) promptRetryDeadline_ = now() + 200;
+        if (static_cast<int32_t>(now() - promptRetryDeadline_) >= 0) {
           ++dropCount_;
           sendPhase_ = kIdle;
           awaiting_ = false;
@@ -712,7 +712,7 @@ void WifiLink::serviceReady() {
       sendPhase_ = kAwaitSendOk;
       lastReply_[0] = '\0';
       lastReplyLen_ = 0;
-      startAwait("SEND OK", kCommandTimeoutMs);
+      startAwait("SEND OK", kCommandTimeout);
     } else if (outcome != kPending) {
       ++dropCount_;
       sendPhase_ = kIdle;
@@ -730,15 +730,15 @@ void WifiLink::serviceReady() {
   // Idle: periodic mDNS announcement, at lower priority than protocol
   // traffic (only when the queue is empty).
   if (mdnsSocketOpen_ && txCount_ == 0 && ownIp_[0] != '\0' &&
-      static_cast<int32_t>(nowMs() - (lastMdnsMs_ + kMdnsPeriodMs)) >= 0) {
+      static_cast<int32_t>(now() - (lastMdnsAnnounce_ + kMdnsPeriod)) >= 0) {
     queueMdnsAnnouncement();
-    lastMdnsMs_ = nowMs();
+    lastMdnsAnnounce_ = now();
   }
   if (txCount_ > 0) popNextSend();
 }
 
 void WifiLink::serviceBackoff() {
-  if (static_cast<int32_t>(nowMs() - deadline_) < 0) return;
+  if (static_cast<int32_t>(now() - deadline_) < 0) return;
   enterState(kConfigure);
 }
 
@@ -833,12 +833,12 @@ bool WifiLink::telemetryAllowed() {
   const bool tcpTarget = link >= 0 && link < kMaxTcpLinks && (tcpOpenMask_ & (1u << link));
   if (!tcpTarget && !peerKnown()) return false;
   if (txCount_ != 0 || sendPhase_ != kIdle) return false;  // engine must be idle
-  const uint32_t now = nowMs();
+  const uint32_t timestamp = now();  // [ms]
   if (telemetryEverSent_ &&
-      static_cast<int32_t>(now - (lastTelemetryMs_ + kTelemetryMinIntervalMs)) < 0) {
+      static_cast<int32_t>(timestamp - (lastTelemetry_ + kTelemetryMinInterval)) < 0) {
     return false;
   }
-  lastTelemetryMs_ = now;
+  lastTelemetry_ = timestamp;
   telemetryEverSent_ = true;
   return true;
 }
@@ -857,7 +857,7 @@ void WifiLink::popNextSend() {
   }
   char cmd[kCommandBuffer];
   copyBounded(cmd, sizeof(cmd), commandBuf_);
-  if (!startCommand(cmd, ">", kCommandTimeoutMs)) {
+  if (!startCommand(cmd, ">", kCommandTimeout)) {
     ++dropCount_;  // TX ring full at this instant -- drop, never stall
     return;
   }
@@ -869,8 +869,8 @@ void WifiLink::popNextSend() {
 // The module has no mDNS of its own (neither the ESP-AT dialect it runs
 // nor Ai-Thinker's newer Combo AT manual lists one), so the robot
 // multicasts a complete, unsolicited DNS-SD response itself: one packet,
-// five records, re-sent every kMdnsPeriodMs so browsers' caches (record
-// TTL kMdnsTtlSeconds) never expire. It answers no queries -- a browser
+// five records, re-sent every kMdnsPeriod so browsers' caches (record
+// TTL kMdnsTtl) never expire. It answers no queries -- a browser
 // that starts listening sees the robot at the next announcement.
 //
 // Wire format (RFC 1035 / 6762 / 6763), names compressed with pointers
@@ -904,7 +904,7 @@ struct Packer {
     for (size_t i = 0; i < n; ++i) u8(static_cast<uint8_t>(s[i]));
   }
   void pointer(size_t offset) { u16(static_cast<uint16_t>(0xC000 | offset)); }
-  void rrHeader(uint16_t type, bool cacheFlush, uint32_t ttl) {
+  void rrHeader(uint16_t type, bool cacheFlush, uint32_t ttl) {  // [s]
     u16(type);
     u16(static_cast<uint16_t>(0x0001 | (cacheFlush ? 0x8000 : 0)));
     u32(ttl);
@@ -939,7 +939,8 @@ bool parseIpv4(const char* text, uint8_t* octets) {
 
 size_t WifiLink::buildMdnsAnnouncement(uint8_t* out, size_t cap, const char* hostname,
                                        const char* ownIp, uint16_t port,
-                                       uint32_t ttlSeconds, const char* proto) {
+                                       uint32_t ttl,  // [s]
+                                       const char* proto) {
   uint8_t ip[4];
   if (hostname == nullptr || hostname[0] == '\0' || !parseIpv4(ownIp, ip)) return 0;
 
@@ -963,7 +964,7 @@ size_t WifiLink::buildMdnsAnnouncement(uint8_t* out, size_t cap, const char* hos
   p.label("_services"); p.label("_dns-sd"); p.label("_udp");
   const size_t localOff = p.len;
   p.label("local"); p.u8(0);
-  p.rrHeader(12, false, ttlSeconds);
+  p.rrHeader(12, false, ttl);
   size_t rd = p.rdlenStart();
   const size_t serviceOff = p.len;
   p.label(serviceType()); p.label(proto); p.pointer(localOff);
@@ -971,7 +972,7 @@ size_t WifiLink::buildMdnsAnnouncement(uint8_t* out, size_t cap, const char* hos
 
   // 2. _robotlink._udp.local PTR <instance>._robotlink._udp.local
   p.pointer(serviceOff);
-  p.rrHeader(12, false, ttlSeconds);
+  p.rrHeader(12, false, ttl);
   rd = p.rdlenStart();
   const size_t instanceOff = p.len;
   p.label(instance); p.pointer(serviceOff);
@@ -979,7 +980,7 @@ size_t WifiLink::buildMdnsAnnouncement(uint8_t* out, size_t cap, const char* hos
 
   // 3. <instance> SRV 0 0 <port> <host>.local
   p.pointer(instanceOff);
-  p.rrHeader(33, true, ttlSeconds);
+  p.rrHeader(33, true, ttl);
   rd = p.rdlenStart();
   p.u16(0); p.u16(0); p.u16(port);
   const size_t hostOff = p.len;
@@ -988,14 +989,14 @@ size_t WifiLink::buildMdnsAnnouncement(uint8_t* out, size_t cap, const char* hos
 
   // 4. <instance> TXT
   p.pointer(instanceOff);
-  p.rrHeader(16, true, ttlSeconds);
+  p.rrHeader(16, true, ttl);
   rd = p.rdlenStart();
   p.label(txtName); p.label(txtRole); p.label(txtLink); p.label(txtPort);
   p.rdlenEnd(rd);
 
   // 5. <host>.local A <ip>
   p.pointer(hostOff);
-  p.rrHeader(1, true, ttlSeconds);
+  p.rrHeader(1, true, ttl);
   rd = p.rdlenStart();
   for (int i = 0; i < 4; ++i) p.u8(ip[i]);
   p.rdlenEnd(rd);
@@ -1012,7 +1013,7 @@ void WifiLink::queueMdnsAnnouncement() {
     if (txCount_ >= kTxSlots) return;
     TxEntry& e = tx_[(txHead_ + txCount_) % kTxSlots];
     const size_t n = buildMdnsAnnouncement(e.slot.data, kSlotBytes, config_.hostname,
-                                           ownIp_, config_.port, kMdnsTtlSeconds,
+                                           ownIp_, config_.port, kMdnsTtl,
                                            protos[i]);
     if (n == 0) return;
     e.link = kMdnsLink;

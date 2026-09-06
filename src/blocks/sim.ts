@@ -44,8 +44,6 @@ namespace diffDrive {
     // consecutive, re-anchored to "now" after a gap.
     const kSimTickPeriod = 24  // [ms]
     let simTickDeadline = 0    // [ms] 0 = no tick has run yet
-    let simCycleCount = 0
-    let simTickOverrunCount = 0
 
     function simIntegrate(): void {
         const now = control.millis()
@@ -361,7 +359,6 @@ namespace diffDrive {
     //% shim=diffDrive::tickDrive
     export function _tickDrive(): boolean {
         simIntegrate()
-        simCycleCount += 1
         const stillCommanded = simMoveActive || simVel != 0 || simYawRate != 0
 
         const now = control.millis()
@@ -374,8 +371,6 @@ namespace diffDrive {
         const wait = deadline - control.millis()
         if (wait > 0) {
             basic.pause(wait)
-        } else {
-            simTickOverrunCount += 1
         }
         return stillCommanded
     }

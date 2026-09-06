@@ -14,6 +14,12 @@
  */
 
 enum ConfigField {
+    // GENERATED from src/comms/config_fields.h by
+    // tools/gen_config_field_enum.py -- do not hand-edit. Add or rename
+    // a field in that header and re-run the generator; the block layer
+    // and the wire then cannot disagree about what an ordinal means.
+    // The gaps below (22-27, 29, 31) are retired field numbers: an
+    // ordinal is a wire contract and is never reused.
     //% block="max duty %"
     MaxDuty = 0,
     //% block="full-duty wheel speed"
@@ -58,20 +64,14 @@ enum ConfigField {
     Decel = 20,
     //% block="max speed mm/s"
     VMax = 21,
-    // 22, 23, 24, 25, 26, 27, 29, 31 (BrakeFrac/DistTaper/YawTaper/
-    // DistFloor/TurnFloor/RampMs/PlateauMinS/ProfileExit) are REMOVED
-    // (design S4.7/S8): the
-    // taper window, the floor fraction, the ramp time and the plateau/
-    // profile-exit derate are all superseded by MotionLimits +
-    // VelocityShaper -- see Accel/Decel/VMax/Jerk/OmegaMax/VFloor/
-    // OmegaFloor above and below. No enum member exists for these
-    // ordinals any more; `set config` can no longer be asked for one at
-    // compile time, and the matching wire names answer `err 1` for one
-    // release (wire_adapter.cpp's kFields).
     //% block="jerk"
     Jerk = 28,
     //% block="max turn rate deg/s"
     OmegaMax = 30,
+    //% block="zero the pose frame"
+    Rebase = 32,
+    //% block="clear e-stop latch"
+    EstopClear = 33,
     //% block="turn rate floor deg/s"
     OmegaFloor = 34,
     //% block="arrive distance mm"
@@ -81,7 +81,9 @@ enum ConfigField {
     //% block="response lag (s)"
     Lag = 37,
     //% block="straight trim"
-    StraightTrim = 38
+    StraightTrim = 38,
+    //% block="go-to timeout ms"
+    GoToTimeout = 39
 }
 
 //% color=#0f9c5a icon="" block="DiffDrive"
@@ -352,9 +354,11 @@ namespace diffDrive {
         const pivotS = 180 / defaultYawRate
         const straightS = chordCm / defaultSpeed
         const timeout = Math.round((pivotS + straightS) * 1000) + 1500  // [ms]
-        // Must precede _goToR() immediately -- see
-        // Rig::pendingGoToDeadline_'s comment (shims.cpp) for the
-        // one-shot handoff contract this pair relies on. _setGoToYawRate()
+        // Must precede _goToR() immediately -- see Rig::goToDeadline's
+        // comment (shims.cpp) for the last-writer-wins ordering this
+        // pair relies on (it is also the wire's own `goto_timeout`
+        // config field, so this call is what overwrites any value a
+        // bench host set). _setGoToYawRate()
         // is the analogous pre-arm for the pivot phase's own rate
         // ceiling (engineGoToRArmed() reconciles it against goalSpeed
         // the same way _startMove() reconciles its own two rate

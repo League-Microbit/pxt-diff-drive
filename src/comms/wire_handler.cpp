@@ -219,7 +219,7 @@ bool parseTlmMode(const char* field, TlmMode& mode) {
 // matter where inside its own range the clamp threshold sits, EVERY
 // field whose real magnitude reached that line clamped to the exact
 // same wrong constant (4294.967040) -- fullDutyVelocity (10795.0) was
-// simply the first of today's 18 kFields entries to cross it, not a
+// simply the first of the day's 18 config-table entries to cross it, not a
 // field-specific defect (confirmed by reading every seeded Config value
 // in shims.cpp's ensure()).
 //
@@ -652,6 +652,17 @@ void WireHandler::dispatch(char* verb, char** fields, size_t fieldCount,
   // everything before it.
   const size_t dataFieldCount = fieldCount - 1;
 
+  if (!sequenceIdIsExecutable(id)) {
+    // The one id the sequence space reserves for itself (see
+    // kMaxSequenceId, wire_handler.h): executing it would leave
+    // expectedNext_ nowhere to go but 0. Refused as a decode failure --
+    // the sequence does not advance and the nack names the id the host
+    // should actually send -- rather than silently wrapping. kRange
+    // (not kUnknown/kBadArg) because the line's SHAPE is fine; the one
+    // number in it is outside its declared bound.
+    handleDecodeFailure(id, resultCode(Result::kRange));
+    return;
+  }
   if (id < expectedNext_) {
     // A stale retransmit -- the host never saw our ack for something we
     // already accepted. Do NOT re-execute (a resent command must not
@@ -703,6 +714,12 @@ void WireHandler::dispatch(char* verb, char** fields, size_t fieldCount,
   // of whether the ADAPTER goes on to refuse the content on its own
   // merits (protocol.md S8.2).
   // In-order and decoded: whatever was outstanding has now arrived.
+  // `id + 1` cannot wrap: the guard at the top of this function has
+  // already refused the one id for which it could (kMaxSequenceId), so
+  // expectedNext_ saturates AT that value instead of rolling to 0.
+  // Reaching it is a terminal state for the session -- every later line
+  // is below it and re-acks without executing -- and HELLO is the cure,
+  // the same reset a reconnecting host already sends.
   expectedNext_ = id + 1;
   gapOutstanding_ = false;
   replyAck(id);
@@ -769,6 +786,7 @@ uint8_t WireHandler::resultCode(Result result) {
     case Result::kUnimplemented: return 6;
     case Result::kNotReady: return 8;
     case Result::kBusy: return 10;
+    case Result::kWriteOnly: return kErrWriteOnly;
   }
   return 1;  // unreachable with every enumerator handled above; kept so
              // a FUTURE enumerator trips -Wswitch instead of silently
@@ -1102,7 +1120,11 @@ void WireHandler::execGet(char** fields, size_t fieldCount, uint32_t id,
     for (size_t i = 0; i < total; ++i) {
       const char* name = adapter_.fieldName(i);
       float value = 0.0f;
-      if (!adapter_.onGet(name, value)) continue;
+      // Anything but kOk -- unknown, or readable-by-nothing -- is
+      // simply absent from the dump, exactly as before: a bare GET
+      // lists what can be read, and has no id-bearing answer to hang
+      // an error on anyway.
+      if (adapter_.onGet(name, value) != Result::kOk) continue;
       formatConfigValue(value, formatted, sizeof(formatted));
       snprintf(buf, sizeof(buf), "get %s %s\n", name, formatted);
       writeLine(buf);
@@ -1126,7 +1148,7 @@ void WireHandler::execGet(char** fields, size_t fieldCount, uint32_t id,
   //     name is `err 1`. Same config plane, same mistake (a typo'd
   //     field name), and one verb tells you while the other shrugs.
   //  2. The information exists and was thrown away. Adapter::onGet
-  //     returns bool; the handler KNEW the name was unknown and
+  //     reports the outcome; the handler KNEW the name was unknown and
   //     declined to report it. Not a case we cannot detect -- one we
   //     detected and stayed quiet about.
   //  3. On a lossy link the silence is ambiguous in the worst way. An
@@ -1142,8 +1164,16 @@ void WireHandler::execGet(char** fields, size_t fieldCount, uint32_t id,
   // verification capture. The failure mode is that it does not look
   // like a failure. Bare `GET #id` is untouched: it dumps the declared
   // field list and has no unknown name to report.
-  if (!adapter_.onGet(name, value)) {
-    errCode = resultCode(Result::kUnknown);
+  //
+  // A field that EXISTS but cannot be read answers its own code
+  // (kWriteOnly -> err 12) rather than borrowing kUnknown's. The two
+  // are different mistakes -- one is a typo, the other is asking a
+  // write-triggered action for a value it never stores -- and a host
+  // that cannot tell them apart re-sends the name looking for a
+  // spelling error that was never there.
+  const Result outcome = adapter_.onGet(name, value);
+  if (outcome != Result::kOk) {
+    errCode = resultCode(outcome);
     return;
   }
   formatConfigValue(value, formatted, sizeof(formatted));
@@ -1556,8 +1586,11 @@ void WireHandler::rememberHeader(const Snapshot& snapshot) {
 
 void WireHandler::emitHeader(const Snapshot& snapshot) {
   size_t pos = 0;
+  // Content stops two bytes short of the buffer, not one: the last two
+  // are RESERVED for the terminator and the NUL that always follow.
+  // See terminateEmitBuf() for why that reservation is the whole point.
   auto append = [&](const char* text) {
-    while (*text != '\0' && pos < sizeof(emitBuf_) - 1) {
+    while (*text != '\0' && pos < sizeof(emitBuf_) - 2) {
       emitBuf_[pos++] = *text++;
     }
   };
@@ -1566,15 +1599,15 @@ void WireHandler::emitHeader(const Snapshot& snapshot) {
     append(" ");
     append(snapshot.columns[i].name);
   }
-  append("\n");
-  emitBuf_[pos] = '\0';
+  terminateEmitBuf(pos);
   writeLine(emitBuf_);
 }
 
 void WireHandler::emitFrame(const Snapshot& snapshot) {
   size_t pos = 0;
+  // Same two-byte reservation as emitHeader() above.
   auto append = [&](const char* text) {
-    while (*text != '\0' && pos < sizeof(emitBuf_) - 1) {
+    while (*text != '\0' && pos < sizeof(emitBuf_) - 2) {
       emitBuf_[pos++] = *text++;
     }
   };
@@ -1594,9 +1627,31 @@ void WireHandler::emitFrame(const Snapshot& snapshot) {
     }
     append(numBuf);
   }
-  append("\n");
-  emitBuf_[pos] = '\0';
+  terminateEmitBuf(pos);
   writeLine(emitBuf_);
+}
+
+// The terminator half of emitHeader()/emitFrame(), written once so the
+// two cannot drift apart on it -- and written UNCONDITIONALLY, into
+// space the appenders above have already reserved by stopping at
+// sizeof(emitBuf_) - 2.
+//
+// This used to be a plain `append("\n")` sharing the content path's own
+// bound, which silently did nothing once the content reached the last
+// writable byte: the line then went out unterminated, and a sink that
+// strips a trailing delimiter without checking for one took a real
+// data byte instead -- turning `... -12345` into `... -1234`, a
+// plausible wrong number rather than a visibly truncated line. The
+// widest projected telemetry frame this project can emit measures 239
+// bytes including the terminator, one byte inside the buffer, so the
+// next column added to it would have crossed that line.
+//
+// Content is truncated instead. A truncated line is visibly wrong to a
+// host; a silently mis-terminated one is not. buildHelpLine() has
+// always done it this way; these two now match it.
+void WireHandler::terminateEmitBuf(size_t contentLength) {
+  emitBuf_[contentLength] = '\n';
+  emitBuf_[contentLength + 1] = '\0';
 }
 
 }  // namespace Wire
