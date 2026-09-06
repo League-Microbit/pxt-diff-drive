@@ -1,4 +1,4 @@
-// differential_drive.cpp — DiffDrive::DifferentialDrive implementation.
+// diffdrive.cpp — DiffDrive::DifferentialDrive implementation.
 // Vendored from League-Robotics/radio-robot
 // src/firm/diffdrive/differential_drive.cpp (namespace/include changes
 // only) — see src/DESIGN.md §2 for the full provenance statement,

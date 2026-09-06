@@ -5,11 +5,11 @@
 // motion obligation), kJob (a dispatched RUN job), and kBlock (the
 // block program's own fiber -- a student's move()/goTo()/driveTwist()/
 // startDrive(), or a MessageBus button handler calling one of those
-// directly). Before kBlock existed, a block-motion call reached the
-// engine unconditionally, with no arbitration at all -- it could
-// supersede a live wire move, and the wire's own completion channel
-// then resolved that superseded move as an ordinary stop, indistinct
-// from one the host itself caused.
+// directly). kBlock is the one that must be arbitrated rather than let
+// through: an unarbitrated block-motion call supersedes a live wire
+// move, and the wire's completion channel then resolves that
+// superseded move as an ordinary stop, indistinct from one the host
+// itself caused.
 //
 // This header holds only the type and the pure take/release rule for
 // kBlock -- host-portable (no pxt.h, no CODAL type) so
@@ -67,21 +67,19 @@ inline void releaseBlockOwnership(MotionOwner* owner) {
 //
 // If the caller IS the dispatching fiber AND `*owner` is already kJob,
 // this is that job's own move: let it through UNCHANGED -- take
-// nothing, touch nothing. dispatchJob() itself already owns the kJob
+// nothing, touch nothing. dispatchJob() itself owns the kJob
 // take/release pair bracketing the whole call (protocol.cpp), so there
 // is no new ownership here to release later. The `*owner == kJob`
 // conjunct is defensive, not load-bearing: structurally, the ONLY way
 // a motion entry point runs on Protocol's own fiber at all is via a
 // dispatched job's call chain, which already set kJob before invoking
 // it -- but requiring it explicitly means a caller that broke that
-// invariant would fall through to the ordinary rule below instead of
+// invariant falls through to the ordinary rule below instead of
 // bypassing it unconditionally.
 //
 // Otherwise, fall through to the ordinary kBlock take/refuse rule
-// above: refused, never silently superseding a live kWire/kJob move,
-// EXACTLY as before. This is the case that preserves the correct
-// refusal a genuine block call (a button, a script) arriving while a
-// job or wire motion holds the drivetrain -- verified on hardware.
+// above, which is what refuses a genuine block call (a button, a
+// script) arriving while a job or wire motion holds the drivetrain.
 inline bool tryTakeMotionOwnership(MotionOwner* owner,
                                     bool isDispatchingFiber) {
   if (isDispatchingFiber && *owner == MotionOwner::kJob) return true;

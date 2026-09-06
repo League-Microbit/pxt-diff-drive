@@ -23,18 +23,13 @@
 //   3. tools/gen_config_field_enum.py -- generates blocks/motion.ts's
 //      `ConfigField` enum from these rows, because PXT compiles a fixed
 //      TypeScript file set and cannot read a C++ table at build time.
-//      Every row therefore carries a `ConfigField.<Name>: "<label>"`
-//      comment line directly above it, giving the generator that row's
-//      TS member name and its `//% block=` dropdown label. The
-//      generator refuses to run if a row is missing one. Re-run it
-//      (and commit its output) whenever a row here is added, renamed,
-//      or removed; tests/tools/test_gen_config_field_enum.py fails if
-//      the checked-in enum and a fresh generation disagree.
-//
-// Ten of these ordinals (the motion-shaping fields) are additionally
-// routed through shims.cpp's own kLimitsFields table over MotionLimits;
-// that is an implementation detail of the behaviour half and changes
-// nothing about the rows here.
+//      The `ConfigField.<Name>: "<label>"` line above every row is that
+//      generator's INPUT, not prose: it supplies the TS member name and
+//      the `//% block=` dropdown label, and the generator refuses to run
+//      if a row is missing one. Re-run it and commit its output whenever
+//      a row is added, renamed or removed;
+//      tests/tools/test_gen_config_field_enum.py fails if the
+//      checked-in enum and a fresh generation disagree.
 //
 // Ordinals are a stable wire contract: a removed field's number is
 // retired, never reused, so a stale bench script gets `err 1` rather
@@ -132,12 +127,11 @@ constexpr ConfigFieldDescriptor kConfigFields[] = {
     // ConfigField.StraightTrim: "straight trim"
     {"straight_trim", 38, "1"},
     // The deadline the NEXT go-to gets, backed by Rig::goToDeadline --
-    // which is where the block layer's own engineSetGoToDeadline()
-    // shim writes it too (it exists because every `//%` shim stays at
-    // <=4 params, not because the value is private). It was a bespoke
-    // handoff field until sprint 033 ticket 004 made it this row; see
-    // that field's comment in shims.cpp for what a wire caller can and
-    // cannot rely on (a block-issued go-to overwrites it).
+    // which the block layer's own engineSetGoToDeadline() shim writes
+    // too (that shim exists because every `//%` shim stays at <=4
+    // params, not because the value is private). See that field's
+    // comment in shims.cpp for what a wire caller can and cannot rely
+    // on: a block-issued go-to overwrites it.
     // ConfigField.GoToTimeout: "go-to timeout ms"
     {"goto_timeout", 39, "ms"},
 };

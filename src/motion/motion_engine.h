@@ -1,75 +1,34 @@
-// motion_engine.h -- diffDrive::MotionEngine: the two-primitive reduction
-// this project's motion surface is built on. Canonical spec (read-only,
-// a different repo -- this project conforms to its grammar, it does not
-// vendor its C++): radio-robot-lib/docs/design/motion-api.md S2
-// ("Everything is constant-ratio wheel segments") and S2.1 ("b is the
-// effective track width") are the whole design; read those two sections
-// first.
+// motion_engine.h -- diffDrive::MotionEngine: TWO PRIMITIVES and the
+// reductions onto them. wheelsX() commands per-wheel DISTANCE,
+// ratio-locked to a cruise ceiling so both wheels finish together;
+// wheelsV() commands per-wheel VELOCITY, held for a `duration` that IS
+// the kernel's own lease. moveX()/moveV()/goToR()/goToW() reduce onto
+// those two; each clears any in-flight command first, so exactly one of
+// Segment/Hold is ever live. Canonical spec (read-only, a different
+// repo -- this project conforms to its grammar, it does not vendor its
+// C++): radio-robot-lib/docs/design/motion-api.md S2 and S2.1.
 //
-// Host-portable by construction: this file and motion_engine.cpp include
-// nothing but <cstdint>/<cmath>, diffdrive.h, segment.h, velocity_shaper.h
-// and motion_limits.h -- no pxt.h, no CODAL type, anywhere -- so the
-// native host test harness (tests/host/) links and exercises this class
-// with no micro:bit involved. Both call paths this codebase has -- the
-// TypeScript block API (`blocks/`) via shims.cpp's engine* forwards, and
-// the wire adapter (wire_adapter.cpp) via the same forwards -- share
-// this one implementation instead of duplicating the math.
+// SIGN CONVENTION: CCW-positive. A positive twist/rotation turns LEFT
+// and increases camera yaw; the left wheel is the slower one in a left
+// turn. Never re-derived from cable order here --
+// tests/host/test_motion_engine_primitives.py pins it, so a future
+// cable-order "fix" fails a test instead of shipping.
 //
-// SPRINT 029 ("motion profile unification", docs/design/
-// motion-profile-unification.md): this class used to carry two
-// mutually-unaware shaping algorithms (a legacy elapsed-time ramp/taper
-// and a constant-a braking-speed solve, selected by whether
-// aAccelMmS2_/aDecelMmS2_ were nonzero) across a 360-line serviceMove().
-// Both are GONE. There is now exactly one shaping object
-// (VelocityShaper, velocity_shaper.h), one limits object (MotionLimits,
-// motion_limits.h, reachable via limits()), and one plan object per
-// in-flight command (Segment, segment.h, for position-mode moves; the
-// Hold struct below, for continuous drive). service() (renamed from
-// serviceMove()) is the ~40-line tick that runs whichever of the two is
-// live -- design S5's pseudocode, implemented verbatim in
-// motion_engine.cpp. See motion-profile-unification.md S12 for the
-// design decisions this rewrite makes (floor is a profile concept now,
-// not a kernel one; legacy shaping is deleted, not flagged; wheelsX()
-// is closed-loop like moveX(); a segment starts from the floor, not
-// from zero) and src/DESIGN.md S3 for the maintained summary.
+// GEOMETRY: b = effectiveTrackWidth() = trackWidth / rotationalSlip
+// (S2.1), a METHOD and never a stored field, so a config read-back can
+// never report a derived number as though it had been measured.
+// `trackWidth` is the one caliper-reachable number and is NEVER
+// "corrected" to make a turn land; all rotational scrub correction
+// belongs in `rotationalSlip`, which keeps a bad turn diagnosable
+// instead of merely compensated.
 //
-// TWO PRIMITIVES (motion-api.md S1/S2): wheelsX() (per-wheel commanded
-// DISTANCE, ratio-locked to a cruise ceiling so both wheels finish
-// together) and wheelsV() (per-wheel commanded VELOCITY, held for
-// `duration` -- `duration` IS the kernel's own lease, backstopping an
-// abandoned hold_ the same way it always has). Everything else in the
-// six-operation Motion API reduces onto these two plus the geometry they
-// both depend on; see each method's own doc comment below for units and
-// contract. Both clear any in-flight command first (motion-api.md S6:
-// "wheels_* clears the planner" -- exactly one of Segment/Hold is ever
-// live, a new command replaces both).
-//
-// MOVE ENGINE (motion-api.md S3.3-S3.5), restated as the three
-// reductions moveX()/moveV()/goToR()/goToW() below build a Segment and
-// hand it to service(). See each method's own comment for the exact
-// reduction; SIGN CONVENTION and the pivot-first split threshold are
-// unchanged from the code this class was extracted from.
-//
-// GEOMETRY (motion-api.md S2.1): `effectiveTrackWidth()` is a METHOD,
-// deliberately never a stored field, computed as `trackWidth /
-// rotationalSlip` every time it is asked for -- so a config read-back
-// can never report a derived number as though it had been measured.
-// `trackWidth` itself is NEVER "corrected" to make a turn land -- it is
-// the one independently-verifiable number in the robot's geometry (a
-// caliper reaches it). All rotational scrub correction belongs in
-// `rotationalSlip`, separately measurable against camera truth; keeping
-// the two apart is what lets a bad turn be diagnosed instead of merely
-// compensated (S2.1, and this project's own standing rule -- see this
-// repo's CLAUDE.md/sprint.md Success Criteria).
-//
-// SIGN CONVENTION, unchanged from the code this class is extracted from
-// and from motion-api.md S2.1: CCW-positive. A positive twist/rotation
-// turns LEFT and increases camera yaw; the left wheel is the slower one
-// in a left turn. This is NOT re-derived from cable order anywhere in
-// this file -- see tests/host/test_motion_engine_primitives.py's own
-// explicit sign-convention tests, written so a future cable-order "fix"
-// fails a test instead of shipping (this project has shipped that exact
-// bug and patched it four times downstream).
+// Host-portable by construction: no pxt.h and no CODAL type in this
+// file or motion_engine.cpp, so the native host test harness
+// (tests/host/) links and exercises this class with no micro:bit
+// involved. ONE implementation, TWO callers: the TypeScript block API
+// arrives through shims.cpp's startMove()/engineGoToRArmed() forwards,
+// the wire adapter (wire_adapter.cpp) through engineMoveX() and its
+// siblings.
 #pragma once
 
 #include <cstdint>
@@ -157,15 +116,12 @@ class MotionEngine {
   // wrong number.
   float rotationalSlip() const { return rotationalSlip_; }
 
-  // Sprint 007 ticket 005 (closes R-14/API-06): the setter this field
-  // never had -- UC-013 (calibrating a non-reference chassis) had no
-  // knob to reach `rotationalSlip_` except `set track width`, which the
-  // doctrine above forbids using for this. Same ">0, else silently keep
-  // the prior value" validation style setGeometry() already applies to
-  // trackWidth/travelCalib (shims.cpp) -- inlined directly on the setter
-  // here rather than at a shims.cpp call site, since rotationalSlip has
-  // no dedicated wire-shaped wrapper the way trackWidth/travelCalib
-  // share setGeometry().
+  // The knob UC-013 (calibrating a non-reference chassis) reaches for
+  // instead of `set track width`, which the doctrine above forbids
+  // using for rotation. Validation is inlined here -- ">0, else
+  // silently keep the prior value", the style setGeometry() applies to
+  // trackWidth/travelCalib -- because rotationalSlip has no wire-shaped
+  // wrapper of its own to carry it.
   void setRotationalSlip(float slip) {
     if (slip > 0.0f) rotationalSlip_ = slip;
   }
@@ -188,13 +144,9 @@ class MotionEngine {
   // from limits_ alone, so it can never drift from whatever accel/decel
   // shaping is currently configured. `distance` is clamped to >= 0
   // before the square root so a negative or degenerate leg length can
-  // never produce NaN. this ticket: previously read
-  // aDecelMmS2_/vMaxMmS_/brakeFrac_ and carried its own "legacy mode"
-  // (aDecelMmS2_ == 0) escape hatch; both are gone -- limits_.decel is
-  // never 0 (MotionLimits' own default is 400), so this always resolves
-  // through the real formula now. See this ticket's own report for the
-  // wire-layer consequence (shims.cpp's engineADecelMmS2()/
-  // resolveMoveXCruise() now always takes the distance-aware branch).
+  // never produce NaN. There is no escape hatch: limits_.decel is never
+  // 0 (MotionLimits' own default is 400), so this always resolves
+  // through the formula above.
   float defaultCruiseForDistance(float distance) const;  // [mm] -> [mm/s]
 
   // [mm] SUC-003 input helper for defaultCruiseForDistance() above: the
@@ -255,28 +207,21 @@ class MotionEngine {
   // lease, no reinterpretation. velocity = mean(left, right), twist =
   // half-differential (right - left) -- CCW-positive, per this file's
   // header comment. Clears any in-flight command first (motion-api.md
-  // S6: "wheels_* clears the planner"). this ticket: no
-  // longer drives the kernel synchronously -- arms `hold_` (target v,
-  // twist, deadline) and resets the shaper; service() slews toward the
-  // hold through the shaper every tick and issues the actual
-  // kernel_.drive() call (design S4.4/S5). This costs one service() tick
-  // (~24 ms) of extra latency before the first nonzero command lands,
-  // identical to every other entry point now (design S6.5) -- see
-  // shims.cpp's isDriving()/commandLooksActive() for how the
+  // S6: "wheels_* clears the planner"). Drives nothing synchronously:
+  // this arms `hold_` (target v, twist, deadline) and resets the
+  // shaper, and service() slews toward the hold and issues the actual
+  // kernel_.drive() call. So the first nonzero command lands one
+  // service() tick (~24 ms) later, as it does at every entry point --
+  // see shims.cpp's isDriving()/commandLooksActive() for how the
   // continuous-drive tick loop stays alive across that first tick.
   void wheelsV(float left, float right, uint32_t duration);  // [mm/s] [mm/s] [ms]
 
   // wheels_x(left, right, cruise, timeout): move each wheel a commanded
   // DISTANCE [mm] at a ratio locked to `cruise` [mm/s] (the DOMINANT
   // wheel's ceiling, motion-api.md S3.1) so both wheels finish together.
-  // this ticket (design S12, S4.4's table): now a Segment,
-  // CLOSED-LOOP on encoders like moveX() -- the dead-reckoned lease this
-  // primitive used to compute (dominant/cruise, capped by timeout) is
-  // gone; `timeout` is now the segment's own real deadline backstop
-  // (motion-api.md S3.1: "timeout is a required backstop, not the stop
-  // condition" -- previously true only of moveX()'s shaping layer, now
-  // true of this primitive directly, since the two primitives had no
-  // other reason to differ in how they end). A zero-magnitude command
+  // A Segment, CLOSED-LOOP on encoders like moveX(): `timeout` is the
+  // segment's real deadline backstop, never its stop condition
+  // (motion-api.md S3.1). A zero-magnitude command
   // (both wheels commanding no distance) or a non-positive cruise
   // commands nothing NEW -- but it is not purely inert: it also stops
   // any motion already in progress (stages kernel_.neutral()), including
@@ -356,29 +301,23 @@ class MotionEngine {
   // The single per-tick advance (design S5, motion-profile-
   // unification.md): dispatches whichever of seg_/hold_ is active,
   // through shaper_, at most one kernel_.drive()/neutral() per call.
-  // Renamed from serviceMove() (this ticket) -- no other
-  // behavior change to this method's OWN contract: callers still invoke
-  // it once per control cycle while isDriving()/isMoveActive(), and it
-  // still owns nothing about odometry (callers update that themselves
-  // around this call, exactly as before).
+  // Callers invoke it once per control cycle while isDriving()/
+  // isMoveActive(), and it owns nothing about odometry -- callers
+  // update that themselves around this call.
   bool service();
 
   // True iff a position-mode Segment (MOVE_X/GO_TO_R/GO_TO_W/WHEELS_X)
-  // is in flight -- unchanged contract from before this ticket: a
-  // continuous wheelsV() hold does NOT make this true (see isDriving()
-  // below for the union of both).
+  // is in flight; a continuous wheelsV() hold does NOT make this true
+  // (see isDriving() below for the union of both).
   bool isMoveActive() const { return seg_.active; }
 
   // True iff EITHER a Segment or a continuous Hold is currently driving
-  // the wheels -- this ticket addition, not itself part of
-  // the design doc's pseudocode: wheelsV()/wheelsX()/moveX() no longer
-  // call kernel_.drive() synchronously (design S6.5's lazy-start applies
-  // uniformly), so a caller that used to infer "something is driving"
-  // from the kernel's own Output.appliedDutyLeft/Right immediately after
-  // arming a hold would see stale zero duty for one extra tick. This is
-  // the accessor shims.cpp's commandLooksActive() now reads instead of
-  // isMoveActive() for exactly that reason -- see that function's own
-  // comment.
+  // the wheels. Because no entry point calls kernel_.drive()
+  // synchronously (design S6.5's lazy start), a caller inferring
+  // "something is driving" from the kernel's own
+  // Output.appliedDutyLeft/Right immediately after arming a hold would
+  // see stale zero duty for one extra tick -- so shims.cpp's
+  // commandLooksActive() reads THIS instead of isMoveActive().
   bool isDriving() const { return seg_.active || hold_.active; }
 
   // True iff the MOST RECENT Segment to go inactive ended because ITS
@@ -414,44 +353,29 @@ class MotionEngine {
 
   uint32_t wrongWayCount() const { return wrongWayCount_; }
 
-  // ---- settle-tick decision (sprint 008 ticket 004) ----
-  // Extracted verbatim from shims.cpp::tickDrive()'s former inline loop
-  // -- see that call site's own comment, carried forward here, for the
-  // full bench history this guards against (commit 3e919e5,
-  // 2026-08-20): kernel_.neutral() only STAGES a zero command; delivery
-  // to the motors happens on the kernel's NEXT step(), and that one
-  // extra step's own encoder read can land mid-spin-down, freezing
-  // Output.velocityLeft/Right at a nonzero value forever unless the
-  // kernel keeps stepping until both wheels are MEASURED at rest.
+  // ---- settle-tick decision ----
   // Steps the kernel up to kSettleMaxSteps times, breaking as soon as
   // BOTH wheels' measured velocity (Output.velocityLeft/Right) reads
-  // within kSettleRestCountsPerS of zero -- byte-for-byte the same
-  // bounded-iteration/break-on-rest decision the loop it replaces made,
-  // just relocated here.
+  // within kSettleRestCountsPerS of zero. Needed because
+  // kernel_.neutral() only STAGES a zero command: delivery to the
+  // motors happens on the kernel's NEXT step(), and that one extra
+  // step's own encoder read can land mid-spin-down, freezing
+  // Output.velocityLeft/Right at a nonzero value forever unless the
+  // kernel keeps stepping until both wheels are MEASURED at rest
+  // (bench-measured 2026-08-20, commit 3e919e5).
   //
-  // Deliberately does NOT fold anything into odometry, and knows
-  // nothing about Rig-local x/y/heading -- odometry ownership stays
-  // with the CALLER (shims.cpp's tickDrive()), which must call its own
-  // odomUpdate()-equivalent itself, once, immediately after this
-  // returns, exactly as the loop it replaces did.
-  //
-  // Never issues a new kernel_.drive()/neutral() command of its own --
-  // it only steps the kernel and reads Output back, so a settled (or
-  // already-neutral) input produces no additional nonzero duty. Callers
-  // must invoke this from their own single ticker only (tickDrive() is
-  // this codebase's one caller) -- this method starts no fiber and
-  // creates no new caller of its own, so the "exactly one fiber ticks a
-  // move" invariant is unaffected by this extraction.
+  // Issues no kernel_.drive()/neutral() of its own -- it only steps the
+  // kernel and reads Output back -- and folds nothing into odometry:
+  // odometry ownership stays with the CALLER (shims.cpp's tickDrive(),
+  // this codebase's one caller and its own single ticker), which
+  // updates it once, immediately after this returns.
   void settleToRest();
 
-  // The ONE settable shaping surface (design S4.4): accel/decel/jerk/
-  // vMax/omegaMax ceilings, vFloor/omegaFloor floors, and the arrival
-  // windows (stopDistance/arriveDist/arriveYaw) all live on the returned
-  // MotionLimits. Replaces the thirteen fields/thirteen setters this
-  // ticket deletes (distTaper_, yawTaper_, distFloor_, turnFloor_,
-  // rampMs_, brakeFrac_, plateauMinS_, profileExitMmS_, pivotOverrunMm_,
-  // aAccelMmS2_, aDecelMmS2_, vMaxMmS_, jerkMmS3_, maxYawRateDegS_) --
-  // see motion_limits.h for each surviving field's own comment.
+  // The ONE settable shaping surface: accel/decel/jerk/vMax/omegaMax
+  // ceilings, vFloor/omegaFloor floors, and the arrival windows
+  // (stopDistance/arriveDist/arriveYaw) all live on the returned
+  // MotionLimits -- see motion_limits.h for each field's own comment.
+  // This engine holds no shaping knob of its own.
   MotionLimits& limits() { return limits_; }
   const MotionLimits& limits() const { return limits_; }
 
@@ -461,24 +385,18 @@ class MotionEngine {
   // `navigator.cpp:237-240`'s measured `turn_first_angle`). 50 deg.
   static constexpr float kTurnFirstAngle = 0.8726646f;
 
-  // settleToRest()'s own bound/threshold (sprint 008 ticket 004
-  // extraction) -- byte-for-byte shims.cpp's former loop cap and its
-  // former local `kRest`, just relocated and named. [steps] / [counts/s,
-  // ~2 mm/s].
+  // settleToRest()'s own bound and rest threshold. [steps] /
+  // [counts/s, ~2 mm/s].
   static constexpr int kSettleMaxSteps = 12;
   static constexpr float kSettleRestCountsPerS = 25.0f;
 
   // [counts] a pivot/blended-arc's yaw axis must have moved at least
   // this far, in EITHER direction, before wrongWay() (segment.h) is
-  // trusted at all -- a cold wheel's brief start-up skew can read
-  // backward before real rotation begins, and evaluating direction
-  // against that noise (rather than genuine motion) is what let a
-  // start-up skew read as a reversed pivot even though the margin
-  // there (segment.h's own kWrongWayMargin, 12 counts) already floors
-  // out small noise. Chosen well above that floor so a real skew of a
-  // few tens of counts cannot trip a false abort, while still catching
-  // a genuinely reversed wheel within a small fraction of any real
-  // pivot's own target.
+  // trusted at all: a cold wheel's brief start-up skew reads backward
+  // before real rotation begins, and segment.h's own kWrongWayMargin
+  // (12 counts) floors out only small noise. 40 sits well above that,
+  // so a real skew of a few tens of counts cannot trip a false abort,
+  // and well below any real pivot's own target.
   static constexpr float kMinYawProgressBeforeWrongWay = 40.0f;
 
   // [mm/s] [mm/s] the pair a caller reads back from axisLimits() below
@@ -556,55 +474,31 @@ class MotionEngine {
 
   // Clears BOTH seg_ and hold_ without touching the kernel -- the
   // shared tail of endMove() and of every primitive/reduction's own
-  // "clear the planner" contract (motion-api.md S6). this ticket: now clears hold_ too (the old cancelMove() only ever cleared
-  // move_, since wheelsV() had no engine-tracked state of its own
-  // before this ticket) -- "exactly one of Segment/Hold is ever live, a
-  // new command replaces both" (design S4.4).
+  // "clear the planner" contract (motion-api.md S6). Clears BOTH,
+  // because exactly one of Segment/Hold is ever live and a new command
+  // replaces either.
   void cancelMove();
 
   DiffDrive::DifferentialDrive& kernel_;
   const DiffDrive::Clock& clock_;
 
-  // vevov-measured travel calibration. Generic kits calibrate via
-  // setTravelCalib()/setTrackWidth() (shims.cpp's setGeometry() block).
-  //
-  // CAMERA-MEASURED 2026-08-25 on the playfield, and this REPLACES the
-  // 0.8102 that stood here. That entry came from a single tape
-  // measurement (2026-08-19: commanded 80 cm, odometry believed 798 mm,
-  // tape measured 825 mm -> 0.7837 * 825/798 = 0.8102) which raised the
-  // constant. This measurement says the raise was in the WRONG
-  // DIRECTION: the robot travels ~2.8% LESS than it believes, not more.
-  // The new value lands within 0.5% of the 0.7837 that 2026-08-19
-  // replaced, so this is close to a revert of that change.
-  //
-  // Why trust this over the tape: twelve `RUN:straight` legs at three
-  // distances (30/55/85 cm), both directions, each bracketed by
-  // overhead-AprilCam fixes taken AT REST. `RUN:straight` is the clean
-  // probe -- test.ts documents it as wheels-only, with no OTOS, no world
-  // frame and no heading correction, so nothing is quietly steering it.
-  // The camera's own scale was verified in the same session against
-  // three fixed field-tag pairs of known separation: +0.13%, -0.09%,
-  // -0.11%. A tape over 80 cm cannot beat that.
-  //
-  //   commanded 85 cm -> odometry believed 85.10 cm (control is fine,
-  //   0.1%) -> camera measured 82.7 cm.
-  //
-  // SCALE, not offset -- which is what makes this constant the right
-  // knob. Fitting shortfall = a + b*distance over the three distances
-  // gives b = 3.07% with a = -0.20 cm; forcing the physically-motivated
-  // zero intercept gives 2.7608% with residuals under 0.21 cm. A
-  // stopping/deadline overshoot would have shown up as a constant `a`
-  // and left `b` near zero, and would NOT have been fixable here.
-  //   0.8102 * (1 - 0.027608) = 0.7878
+  // CAMERA-MEASURED vevov 2026-08-25 on the playfield: twelve
+  // `RUN:straight` legs at 30/55/85 cm, both directions, each bracketed
+  // by overhead-AprilCam fixes taken AT REST (commanded 85 cm ->
+  // odometry believed 85.10 cm -> camera measured 82.7 cm). The error
+  // is SCALE, not offset, which is what makes this constant the right
+  // knob: a zero-intercept fit of shortfall against distance gives
+  // 2.7608% with residuals under 0.21 cm, where a stopping or deadline
+  // overshoot would have fitted as a constant term instead and would
+  // NOT be fixable here.
   //
   // KNOCK-ON FOR ROTATION, which must not be "fixed" twice: heading is
-  // (wheel travel)/track, so this scale error propagated into rotation
-  // identically. Isolated camera-truthed 90 deg pivots measured
-  // camera/encoder 0.9805 BEFORE this change; 0.9805/0.9724 = 1.0093,
-  // so once travel is right the robot should OVER-rotate by ~0.9% and
-  // that residual -- not the raw 0.9805 -- is what rotationalSlip_
-  // below would have to answer for. Re-measure rotation after this
-  // lands before touching that constant.
+  // (wheel travel)/track, so the same scale error propagated into
+  // rotation. Camera-truthed 90 deg pivots read camera/encoder 0.9805
+  // against the pre-correction travel scale, leaving ~0.9% of
+  // over-rotation -- that residual, never the raw 0.9805, is what
+  // rotationalSlip_ below answers for. Generic kits calibrate via
+  // setTravelCalib()/setTrackWidth() (shims.cpp's setGeometry() block).
   float travelCalib_ = 0.7878f;  // [mm/deg] wheel travel per shaft degree
 
   // [mm] MEASURED track (stakeholder tape, 2026-08-19). This is the
@@ -636,12 +530,6 @@ class MotionEngine {
   // experiment and "fixing" 0.952 to match is exactly the bridge this
   // comment exists to block -- the dropped middle step (109.8 -> 120.0)
   // is what separates the two numbers.
-  //
-  // REPLACES 1.040, which came from a single camera pivot on 2026-08-19
-  // and had the sign of the effect BACKWARDS (it said the robot
-  // over-rotated; it under-rotates). The OTOS agreed with the camera to
-  // 1.005 across ten pivots, so the sensor was never the problem -- this
-  // constant was.
   float rotationalSlip_ = 0.952f;
 
   // ---- move/hold state (design S4.4) ----

@@ -316,17 +316,10 @@ namespace diffDrive {
     //% block="start go to x %x cm y %y cm"
     //% group="GoTo" weight=350
     export function startGoTo(x: number, y: number): void {
-        // Calls goToR() directly (the //%-exposed engineGoToRArmed/
-        // engineSetGoToDeadline shim pair -- split in two, sprint 015
-        // ticket 006, because a single five-parameter shim crashes the
-        // PXT packager with TS9200; see sim.ts's _setGoToDeadline()/
-        // _goToR() comments) instead of reducing to (distance, yaw) and
-        // going through startMove()/moveX(): moveX()'s own >=50 deg
-        // split reissues an arc-length/arc-angle pair as
-        // pivot-then-straight, which lands at a DIFFERENT point than
-        // the arc that pair was computed for. goToR() owns its own
-        // bearing-then-chord split and short-arc wrap instead
-        // (motion_engine.cpp), reaching (x, y) exactly.
+        // goToR() owns the pivot-vs-arc split; never reduce to
+        // (distance, yaw) and go through startMove(), whose own >=50 deg
+        // split would land elsewhere. Two shims, not one: see shims.cpp's
+        // engineSetGoToDeadline() for the TS9200 arity rule.
         if (x == 0 && y == 0) return
         const goalX = Math.round(x * 10)  // [mm]
         const goalY = Math.round(y * 10)  // [mm]

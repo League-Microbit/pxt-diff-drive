@@ -1,6 +1,6 @@
-// differential_drive.h — DiffDrive::DifferentialDrive: a self-contained
+// diffdrive.h — DiffDrive::DifferentialDrive: a self-contained
 // differential-drive wheel kernel. ONE class, TWO files (this header +
-// differential_drive.cpp), and NOTHING else: the only include is
+// diffdrive.cpp), and NOTHING else: the only include is
 // <cstdint>, and the four small interfaces below are the package's OWN
 // ports — the complete surface a host platform implements to run it.
 //

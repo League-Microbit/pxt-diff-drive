@@ -57,18 +57,13 @@ namespace diffDrive {
     // ================= remote test trigger (RUN verb) =================
 
     // The dispatcher below is invoked DIRECTLY by the firmware's own
-    // protocol fiber (via _registerRunDispatch(), sim.ts) once per
-    // dequeued RUN command -- not raised as a MessageBus event for a
-    // second, forked fiber to pick up. That is what makes an abort sent
-    // while a job is mid-tour land immediately rather than waiting
-    // behind it: the fiber that would otherwise be forked to run this
-    // callback IS the same fiber servicing the wire, so there is no
-    // second fiber to wait for. runCommandText() (no argument -- the
-    // firmware tracks "whichever command is current" itself, unlike the
-    // old event-value-as-slot-number scheme) reads the text back; the
-    // by-name lookup and dispatch logic below is unchanged. The wire
-    // therefore still reads as what it does -- RUN:pivot:180, not a
-    // magic number -- and arguments still ride along as text.
+    // protocol fiber (via _registerRunDispatch(), sim.ts), inline, once
+    // per dequeued RUN command. So an abort sent while a job is mid-tour
+    // lands immediately rather than queueing behind it, and abort/
+    // clearestop can arrive nested inside a running handler's tick loop.
+    // runCommandText() takes no argument -- the firmware tracks which
+    // command is current -- and arguments ride along as text, so the
+    // wire reads as what it does: RUN:pivot:180, not a magic number.
     function wireRunDispatch(): void {
         if (runWired) return
         runWired = true

@@ -107,6 +107,7 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   // Peak consecutive-identical-encoder-read streak observed while the
   // wheel was driven (cumulative since boot) -- direct latch evidence:
   // streaks are ticks (~24 ms each), so 13 means ~300 ms frozen.
+  // Exposed via diagValue() ordinals 21 (left) and 22 (right).
   uint32_t maxDrivenStreak_ = 0;
   uint32_t glitchCount_ = 0;       // rejected implausible encoder reads
   // Rebaseline-on-discontinuity events (sprint 006 ticket 005,
@@ -117,11 +118,9 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   // discontinuities. Exposed via diagValue() ordinal 27.
   uint32_t rebaselineCount_ = 0;
  private:
-  // Two-strike raw-counts plausibility gate, extracted to
-  // encoder_glitch_armor.h (host-portable, host-tested directly --
-  // see that header and tests/host/test_encoder_glitch_armor.py). Owns
-  // the lastGoodRaw_/lastRejectedRaw_/rejectPending_/primed_ state this
-  // member used to hold inline.
+  // Two-strike raw-counts plausibility gate; owns the
+  // lastGoodRaw_/lastRejectedRaw_/rejectPending_/primed_ state. Lives in
+  // encoder_glitch_armor.h -- host-portable and host-tested directly.
   EncoderGlitchArmor glitchArmor_;
 
   float dutyCarry_ = 0.0f;         // [-1,1] sigma-delta remainder

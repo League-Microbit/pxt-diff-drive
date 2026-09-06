@@ -6,10 +6,11 @@ namespace diffDrive {
     // says where the robot actually ended up, and the NEXT move is
     // planned from that fix. It never steers a move in flight.
     //
-    // Every read here is a live I2C burst, so these must be called from
-    // the same fiber that calls driveTick() -- never concurrently with
-    // one (an OTOS transaction landing inside the Nezha encoder's
-    // select->read window destroys that encoder sample).
+    // worldX/worldY/worldHeading/worldTrackingReady are CACHE reads
+    // (otosGet), no bus. The five that DO touch it -- startWorldTracking,
+    // readWorld, seedPose, calibrateWorldSensor, setWorldSensorOffset --
+    // must run on the fiber that calls driveTick(): an OTOS transaction
+    // inside the Nezha encoder's select->read window destroys that sample.
 
     /**
      * Start the OTOS sensor. Returns true if it answered.

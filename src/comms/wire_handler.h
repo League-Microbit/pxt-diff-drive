@@ -1,95 +1,71 @@
 // wire_handler.h -- Wire::WireHandler: protocol v6's ASCII line-grammar
-// mechanics (radio-robot-lib/docs/design/protocol.md S2, S2.1, S3.1,
-// S3.2) PLUS the reliability layer (S8, S8.9 -- the canonical spec; this
-// project conforms to that grammar, it does not vendor radio-robot-lib's
-// C++). feed() reassembles arbitrary byte blocks into '\n'-terminated
-// lines, tokenizes each line in place on runs of ' ' (no allocation, no
-// std::string -- S3.2), enforces case-as-direction (S2.1: commands
-// UPPERCASE, replies lowercase, verb lookup case-SENSITIVE), and
-// dispatches every verb this project currently implements: the seven
-// unsequenced exemptions (HELLO, PING, ESTOP, HELP, ID, VER, STATUS --
-// S8.3) plus the five non-motion sequenced verbs (GET, SET, TLM, STOP,
-// RUN).
+// mechanics plus the reliability layer (radio-robot-lib/docs/design/
+// protocol.md S2, S2.1, S3.1, S3.2, S8, S8.9 -- the canonical spec;
+// this project conforms to that grammar, it does not vendor
+// radio-robot-lib's C++). feed() reassembles arbitrary byte blocks into
+// '\n'-terminated lines, tokenizes each line in place on runs of ' '
+// (no allocation, no std::string -- S3.2), enforces case-as-direction
+// (S2.1: commands UPPERCASE, replies lowercase, verb lookup
+// case-SENSITIVE), and dispatches the seven unsequenced verbs (HELLO,
+// PING, ESTOP, HELP, ID, VER, STATUS -- S8.3) plus the sequenced ones
+// (GET, SET, TLM, STOP, RUN and the six motion verbs).
 //
-// The rule that draws that line, added 2026-08-27: A VERB CARRIES A
-// SEQUENCE ID IFF DUPLICATE EXECUTION OR REORDERING COULD CAUSE HARM,
-// i.e. iff it changes state. Queries (ID/VER/STATUS) and liveness/
-// orientation verbs (HELLO/PING/HELP) are idempotent, so sequencing
-// them bought nothing and cost a silent drop of the bare form plus a
-// payload-less stale ack on a resend. GET is a deliberate exception:
-// read-only but still sequenced, to keep the config plane symmetric
-// with SET (stakeholder direction).
+// A VERB CARRIES A SEQUENCE ID IFF ITS CORRECTNESS DEPENDS ON ITS
+// POSITION IN THE STREAM -- either executing it twice changes the
+// robot, or answering it out of order gives a wrong answer. ID/VER/
+// STATUS answer session constants and HELLO/PING/HELP are liveness/
+// orientation verbs, so all seven are position-independent and
+// maximally forgiving of trailing content. GET is read-only but
+// ORDERED by SET, so it stays sequenced.
 //
-// HELP joined the unsequenced set on 2026-08-27 by stakeholder
-// direction. It is a human-typed diagnostic verb -- the FIRST thing an
-// operator types into a raw relay session -- and requiring a `#<id>`
-// on it meant a bare `HELP` was silently dropped, which is exactly the
-// wrong answer for the one verb whose entire job is telling a confused
-// operator what to do next. It is forgiving like PING: any arity, with
-// or without an id, always answers.
+// ---- The reliability layer (S8) ----
 //
-// ---- The reliability layer (S8), in one paragraph ----
-//
-// Every sequenced verb carries a MANDATORY trailing id, `#<n>`, that is
-// also a strictly incrementing sequence number starting at 1. Handler
-// state is EXACTLY one value -- expectedNext_ (next id expected;
-// gapOutstanding_ is GONE, 2026-08-26, S8.5: its only reader was the
-// deleted telemetry ack piggyback) -- deliberately no
-// clock and no timer anywhere (S8.1): feed() stays a pure function of
-// its input bytes plus this small state. dispatch() resolves the id
-// FIRST, against expectedNext_, classifying every inbound id into
-// exactly one of three cases (S8.1's table):
+// Every sequenced verb carries a MANDATORY trailing `#<n>`, strictly
+// incrementing from 1. Handler state is expectedNext_ plus
+// gapOutstanding_ (a reply predicate -- see its own comment below);
+// deliberately no clock and no timer anywhere (S8.1), so feed() stays a
+// pure function of its input bytes plus that small state. dispatch()
+// resolves the id FIRST, against expectedNext_ (S8.1's table):
 //   - id == expectedNext_ : decode the verb's own fields FIRST (S8.9);
 //     only if decoding succeeds does the sequence advance
 //     (expectedNext_ = id + 1) and `ack <id> <lastDone> <reason>` go
-//     out. A decode failure at this point -- unrecognized verb, wrong
-//     arity, or an unparseable field -- does NOT advance the sequence:
-//     it replies `nack <expectedNext_> <lastDone> <reason>` (still
-//     naming the SAME id, since it was never accepted) plus
-//     `err <code> #<id>`; a stalled stream keeps re-nacking because
-//     every subsequent inbound line re-triggers the same nack (S8.1 --
-//     there is no periodic re-nack, 2026-08-26, S8.5) until a
-//     well-formed line finally supplies
-//     that same id (S8.9 -- "decode failure is a NAK", the central
-//     2026-08-22 change: a corrupted leg of a multi-leg routine is
-//     resent, not silently skipped).
+//     out. A decode failure -- unrecognized verb, wrong arity, an
+//     unparseable field -- does NOT advance: it replies
+//     `nack <expectedNext_> <lastDone> <reason>` (naming the SAME id,
+//     since it was never accepted) plus `err <code> #<id>`, and every
+//     subsequent inbound line re-triggers that nack until a well-formed
+//     line finally supplies that id. There is no periodic re-nack. A
+//     corrupted leg of a multi-leg routine is resent, not silently
+//     skipped.
 //   - id < expectedNext_ : a stale retransmit -- the host never saw our
-//     ack for something we already accepted. Do NOT re-execute (a
-//     resent WHEELS_V must not drive the wheels twice, once motion
-//     verbs land); reply `ack <expectedNext_ - 1> <lastDone> <reason>`,
-//     the already-accepted id, not the resent one. `#0` is not
-//     special-cased anywhere in this file: since expectedNext_ starts
-//     at (and never goes below) 1, an inbound `#0` is unconditionally
-//     `< expectedNext_` and falls into this bucket with zero extra code.
-//   - id > expectedNext_ : a numeric gap -- discard, do NOT execute, and
-//     do not even look up the verb; reply
-//     `nack <expectedNext_> <lastDone> <reason>`. A gap stalls the
-//     stream ON PURPOSE: every
-//     subsequent command, however well-formed, is nacked identically
-//     until the missing id arrives.
-// A merits rejection -- the verb decoded fine but the Adapter refuses it
-// on its own terms (e.g. an out-of-range value) -- is a DIFFERENT case
-// from a decode failure: it ACKS and ADVANCES (the line arrived intact),
-// paired with `err <code> #<id>` on top of that ack. Decode failure and
-// merits rejection are the two cases S8.9 keeps sharply distinct.
+//     ack for something we already accepted. Do NOT re-execute; reply
+//     `ack <expectedNext_ - 1>`, the already-accepted id, not the
+//     resent one. `#0` needs no special case here: expectedNext_ starts
+//     at (and never goes below) 1, so an inbound `#0` is
+//     unconditionally below it.
+//   - id > expectedNext_ : a numeric gap -- discard, do NOT execute, do
+//     not even look up the verb, and reply `nack <expectedNext_>`. A
+//     gap stalls the stream ON PURPOSE until the missing id arrives.
+// A MERITS rejection -- the verb decoded fine but the Adapter refuses
+// its content -- is a DIFFERENT case: it ACKS and ADVANCES (the line
+// arrived intact), paired with `err <code> #<id>` on top of that ack.
+// S8.9 keeps decode failure and merits rejection sharply distinct.
 //
 // `<lastDone>`/`<reason>` are read FRESH off Adapter::lastDone()/
-// lastDoneReason() every time an ack/nack is formatted (S8.8) -- there
-// is no cached copy anywhere in this class. `err <code> #<id>` orders
-// code first, id last (S8.6) -- the id is always a line's LAST token,
-// commands and replies alike.
+// lastDoneReason() every time an ack/nack is formatted (S8.8) -- no
+// cached copy anywhere in this class. `err <code> #<id>` orders code
+// first, id last (S8.6): the id is always a line's LAST token, commands
+// and replies alike.
 //
-// HELLO/ESTOP/PING (S8.3) never carry an id at all and are maximally
-// forgiving of trailing content -- see dispatch()'s own comment. HELLO
-// additionally resets expectedNext_ (a (re)connecting
-// host's own resync point) but does NOT touch the Adapter's
-// lastDone()/lastDoneReason() -- that state is Adapter-owned and a
-// handler-level reset has no business reaching into it (S8.8).
+// HELLO additionally resets expectedNext_ (a (re)connecting host's own
+// resync point) but does NOT touch the Adapter's lastDone()/
+// lastDoneReason() -- that state is Adapter-owned and a handler-level
+// reset has no business reaching into it (S8.8).
 //
 // Angles (rotation, omega) are milliradian integers on the wire
-// (motion-api.md S9.1) -- decoded here with the ordinary signed-integer
-// field parser, same as any other field; the degrees-at-the-API
-// conversion is a LANGUAGE BINDING's job, not this file's.
+// (motion-api.md S9.1), decoded here with the ordinary signed-integer
+// field parser; the degrees-at-the-API conversion is a LANGUAGE
+// BINDING's job, not this file's.
 //
 // Host-portable by construction: no pxt.h, no CODAL type, anywhere in
 // this file or wire_handler.cpp. See tests/host/wire_grammar_shim.cpp
@@ -114,13 +90,9 @@ class Sink {
 // Everything HELLO/ID/VER read off. Every pointer is borrowed: the
 // adapter owns the storage (a string literal or a robot-config field)
 // and must keep it alive at least until the identity() call that
-// requested it returns. Mirrors radio-robot-lib's own Protocol::Identity
-// (adapter.h) -- drivetrain/profile/version join name/serial, which
-// ID/VER read alongside HELLO's own banner fields. ID now reads `name`
-// too (a fourth, appended wire field) -- see wire_handler.cpp's
-// execId() for the wire-format reasoning and protocol.cpp's own
-// kProfile comment for why `name`, not `profile`, is this struct's
-// authoritative board-identity field.
+// requested it returns. `name` (read from silicon) is the authoritative
+// board-identity field, NOT `profile` (build provenance) -- see
+// protocol.cpp's own kProfile comment.
 struct Identity {
   const char* name = "";
   const char* serial = "";
@@ -143,62 +115,38 @@ struct StatusFields {
   bool otos = false;
   bool wedge = false;
   uint32_t flags = 0;
-  // Sprint 004 ticket 004: the I2C fault counter, closing
-  // status-lost-diag-numeric-surface.md -- the retired DIAG verb's own
-  // most-important numeric field (a wedged/unpowered Nezha brick shows
-  // up here as a climbing count, not just a boolean "wedge" flag).
+  // The I2C fault counter: a wedged or unpowered Nezha brick shows up
+  // here as a climbing count, not merely as the boolean `wedge` flag.
   // Sourced by WireAdapter::status() from the SAME diagValue(8) call
-  // the telemetry `i2cf` column also reads, so the two can never
-  // disagree (sprint.md's own Design Rationale). Decimal on the wire
-  // (execStatus()'s `i2cf=%ld`), unlike `flags`' hex -- a raw fault
-  // count has no bitfield meaning to pack.
+  // the telemetry `i2cf` column reads, so the two can never disagree.
+  // Decimal on the wire (execStatus()'s `i2cf=%ld`), unlike `flags`'
+  // hex -- a raw fault count has no bitfield meaning to pack.
   int32_t i2cf = 0;
-  // Sprint 010 ticket 003: the kernel's own heartbeat counter, closing
-  // unpowered-nezha-brick-wedges-program-at-boot.md's 2026-08-24
-  // correction -- a robot nothing has ever ticked and a robot with a
-  // genuinely unreachable brick used to report the IDENTICAL STATUS
-  // line (ready=0 connL=0 connR=0 i2cf=0), because ready/connL/connR/
-  // i2cf are all only ever written from inside step()/collect(), which
-  // never ran either way. `cyc` is the discriminator: 0 means "this
-  // kernel has never ticked" (every other field's 0 is meaningless,
-  // not a fault), nonzero means the kernel is running and every other
-  // field means what it says. Sourced by WireAdapter::status() from the
-  // SAME diagValue(16) call the telemetry `cyc` column already reads
-  // (src/comms/wire_adapter.cpp), so the two can never disagree -- mirrors
-  // `i2cf` immediately above, sprint 004 ticket 004's identical
-  // same-source guarantee. Unsigned and decimal on the wire
-  // (execStatus()'s `cyc=%lu`): a cycle count never goes negative and
-  // has no bitfield meaning to pack.
+  // The kernel's own heartbeat counter, and the discriminator between
+  // "this kernel has never ticked" and "the brick is unreachable": both
+  // used to report an IDENTICAL STATUS line (ready=0 connL=0 connR=0
+  // i2cf=0), because ready/connL/connR/i2cf are only ever written from
+  // inside step()/collect(), which never ran either way. cyc == 0 means
+  // every other field's 0 is meaningless, not a fault; nonzero means
+  // the kernel is running and every other field means what it says.
+  // Same single-source guarantee as `i2cf` above -- diagValue(16),
+  // shared with the telemetry `cyc` column. Unsigned decimal on the
+  // wire: a cycle count never goes negative.
   uint32_t cyc = 0;
   const char* tlm = "off";
 };
 
 // One named, already-scaled telemetry value (protocol.md S5.2: `thdr
-// <col>...` then `t <v>...`). Mirrors radio-robot-lib's own
-// Column shape (src/protocol/adapter.h:113-139) -- this project's own
-// value type, not a vendored copy. `value` is always an
-// already-scaled plain integer -- this class has no opinion on what a
-// column MEANS or how it was derived, only how it prints: `hex` picks
-// lowercase hex with no `0x` prefix (flags-shaped columns); everything
-// else prints signed base-10.
-// Sprint 004 ticket 007 (remediating ticket 005's thrown exception):
-// this struct's default member initializers below are legal C++20 but
-// disqualify it from being a C++11 aggregate -- and BOTH real embedded
-// build targets compile at -std=c++11 (baked into the pxt-microbit
-// target's own yotta/CMake toolchain files), while tests/host/ compiles
-// at -std=c++20 (test_kernel_harness.py), which is why 253 host tests
-// passed against `columns_[i++] = {"name", value, hex};` call sites
-// (WireAdapter::buildSnapshot(), src/comms/wire_adapter.cpp) that could not
-// actually be compiled for the robot. Explicit `Column() = default;`
-// plus this 3-argument converting constructor fix that WITHOUT dropping
-// the NSDMIs (dropping them would leave every default-constructed
-// `Column columns_[kMaxSnapshotColumns]` -- wire_adapter.h -- holding
-// indeterminate values until every element is filled) and WITHOUT
-// touching any of the ~20 already-correct call sites (each already
-// passes exactly these 3 positional arguments, matching this
-// constructor's signature exactly). See
-// host-tests-compile-newer-standard-than-target.md (sprint 008) for the
-// systemic gap this is one confirmed instance of.
+// <col>...` then `t <v>...`). `value` is always an already-scaled plain
+// integer -- this type has no opinion on what a column MEANS, only on
+// how it prints: `hex` picks lowercase hex with no `0x` prefix
+// (flags-shaped columns); everything else prints signed base-10.
+//
+// Explicit ctor: the NSDMIs make this a non-aggregate under the target's
+// -std=c++11, so the `{"name", value, hex}` call sites need one; the
+// C++20 host would compile without it. Dropping the NSDMIs instead
+// would leave every default-constructed `Column columns_[...]` holding
+// indeterminate values until every element is filled.
 struct Column {
   const char* name = "";
   int32_t value = 0;
@@ -210,23 +158,14 @@ struct Column {
 };
 
 // One telemetry frame's worth of columns (protocol.md S5.2). `columns`
-// is BORROWED: the caller (WireAdapter::buildSnapshot(), ticket 004)
-// owns the backing array and must keep it alive only for the duration
-// of the emitTelemetry(snapshot) call it is passed to -- WireHandler
-// copies what it needs for its own header memo (see kMaxHeaderColumns/
-// kMaxHeaderNameBytes below) and formats the rest immediately, keeping
-// no borrowed pointer alive past that one call. Mirrors radio-robot-
-// lib's own Snapshot shape (adapter.h:113-139).
-//
-// Shares Column's exact NSDMI shape immediately above, and is therefore
-// ALSO not a C++11 aggregate for the identical reason (sprint 004
-// ticket 007) -- but unlike Column, no site anywhere in src/ or
-// tests/host/ ever brace-initializes a Snapshot (every site
-// default-constructs one, then assigns `.columns`/`.count`
-// field-by-field), so this is a latent structural twin of Column's
-// defect, not a live one. Deliberately left unfixed here: there is no
-// call site it would protect, and adding constructors it doesn't need
-// would be scope creep against this ticket's own two confirmed defects.
+// is BORROWED: the caller owns the backing array and must keep it alive
+// only for the duration of the emitTelemetry(snapshot) call it is
+// passed to -- WireHandler copies what it needs for its own header memo
+// (kMaxHeaderColumns/kMaxHeaderNameBytes below) and formats the rest
+// immediately, keeping no borrowed pointer alive past that one call.
+// Shares Column's NSDMI shape and is therefore also a non-aggregate
+// under -std=c++11, but no site anywhere brace-initializes a Snapshot,
+// so it needs no constructor of its own.
 struct Snapshot {
   const Column* columns = nullptr;
   size_t count = 0;
@@ -254,15 +193,12 @@ enum class Result : uint8_t {
 // reference grammar numbers its own codes 1-11 (11, ERR_DUPLICATE_ID,
 // is deleted but still spent), so 12 is the first number free of that
 // range rather than one of the 5/7/9 holes inside it -- a hole there is
-// a code an older host may already have an opinion about.
-//
-// Why the distinction is worth a code of its own: an advertised field
-// answering the SAME err 1 a typo gets tells the operator nothing about
-// which of the two just happened. `rebase` is the one such field today
-// -- a write-triggered action with no stored value behind it, refused
-// rather than answered with a manufactured 0 (WireAdapter::onGet()) --
-// and before this code existed a host had no way to tell "you cannot
-// read that" from "there is no such thing".
+// a code an older host may already have an opinion about. Without it,
+// an advertised field answering the SAME err 1 a typo gets tells the
+// operator nothing about which of the two just happened. `rebase` is
+// the one such field today: a write-triggered action with no stored
+// value behind it, refused rather than answered with a manufactured 0
+// (WireAdapter::onGet()).
 constexpr uint8_t kErrWriteOnly = 12;
 
 // TLM subscription modes (S6.1's wire token set). The handler only
@@ -281,21 +217,16 @@ enum class TlmMode : uint8_t {
 // The reliability layer's completion-reason vocabulary (S8.8): the
 // reasons a motion can finish, plus kNone for "nothing has completed
 // yet" -- the wire spelling "none" is what lastDone() == 0 pairs with.
-// Every sequenced verb's ack/nack piggybacks this pair (S8.8), not only
-// the motion ones.
+// Every sequenced verb's ack/nack piggybacks this pair, not only the
+// motion ones.
 //
-// kStall (sprint 005 ticket 004, closing wire-motion-completion-
-// signal.md/R-23): purely additive -- no existing wire consumer reads
-// it, since nothing ever produced it before this ticket. Wire spelling
-// "stall", matching the kernel's own stall-latch semantics
-// (`stallHalted`/`stall_clear`, sprint 007 ticket 001) rather than
-// inventing a second notion of "stalled" -- see
-// diffDrive::WireAdapter::resolvePendingReason() (wire_adapter.cpp) for
-// where this is actually produced. Deliberately NOT folded into
-// kAborted (a stalled drivetrain and a superseded command are different
-// failure classes a host needs to tell apart) or kEstop (stall is
-// drivetrain-local, not the same safety condition) -- sprint.md's own
-// Design Rationale.
+// kStall's wire spelling matches the kernel's own stall latch
+// (`stallHalted`/`stall_clear`) rather than inventing a second notion
+// of "stalled"; it is deliberately NOT folded into kAborted (a stalled
+// drivetrain and a superseded command are different failure classes a
+// host needs to tell apart) or kEstop (stall is drivetrain-local, not
+// the same safety condition). Produced by
+// diffDrive::WireAdapter::resolvePendingReason().
 enum class DoneReason : uint8_t {
   kNone,     // -> "none"    -- lastDone() == 0, nothing completed yet
   kStop,     // -> "stop"    -- the stop condition was met, or stop() ended it
@@ -408,24 +339,18 @@ class WireHandler {
   // -- it is what "the last legal id has been accepted" looks like --
   // but no inbound line may CARRY it, so `expectedNext_ = id + 1` can
   // never wrap. Legal ids are therefore [1, kMaxSequenceId - 1].
-  //
   // Without the reservation, accepting #4294967295 sets expectedNext_
-  // to 0: a value no id can ever equal or fall below, so every
-  // subsequent line nacks asking for id 0 (which is not legal either)
-  // and `replyAck(expectedNext_ - 1)` underflows on top. The session is
-  // then unrecoverable except by HELLO, having reported nothing about
-  // why. Reserving one id is the cheaper half of that trade.
+  // to 0: a value no id can equal or fall below, so every subsequent
+  // line nacks asking for id 0 (not legal either) and
+  // `replyAck(expectedNext_ - 1)` underflows on top.
   static constexpr uint32_t kMaxSequenceId = 0xFFFFFFFFu;
 
   // Whether an inbound line's `#<id>` may be executed at all. Public
   // and static so a host test can drive the boundary directly: the
-  // states around it (expectedNext_ at the ceiling) are otherwise
-  // reachable only by sending four billion commands.
-  //
-  // The sequence space's OTHER illegal id, `0`, is not this
-  // predicate's business: dispatch() already answers it earlier, and
-  // differently (a bare nack, no err -- see its own comment there).
-  // This one is about the ceiling only.
+  // states around it are otherwise reachable only by sending four
+  // billion commands. The sequence space's OTHER illegal id, `0`, is
+  // not this predicate's business -- dispatch() answers it earlier, and
+  // differently.
   static bool sequenceIdIsExecutable(uint32_t id) {
     return id != kMaxSequenceId;
   }
@@ -453,25 +378,18 @@ class WireHandler {
   //     with no newline at all (bounded by the fixed line buffer and
   //     the overflow rule above; never overflows, never allocates).
   //
-  // A characterization note on embedded NULs, carried over from
-  // radio-robot-lib's own protocol.md S9.4: every wire-touching
-  // comparison here (verb lookup, tokenizing) runs on a NUL-terminated
-  // C string, per the no-allocation, no-std::string constraint (S3.2).
-  // A NUL byte anywhere inside a line therefore acts as an early
-  // terminator for THIS line only -- e.g. "PING\0extra\n" dispatches
-  // exactly like a bare "PING\n", silently discarding "extra" with no
-  // malformed-count increment -- rather than being rejected outright.
-  // This is a known, pinned characterization (see
-  // test_embedded_nul_immediately_after_verb_matches_bare_verb in
-  // tests/host/test_wire_grammar.py), not a bug: a real fix would mean
-  // abandoning C-string comparisons throughout the parser, in tension
-  // with the no-std::string firmware constraint this file is written
-  // to. The one place this class does NOT just let the C-string view
-  // win silently: a line whose first non-space byte IS the embedded
-  // NUL (e.g. "\0PING\n") would otherwise leave the tokenizer's own
-  // internal token array uninitialized (a real memory-safety hazard,
-  // not just a surprising parse) -- wire_handler.cpp's onLineComplete()
-  // guards this explicitly and counts it malformed instead.
+  // Embedded NULs (radio-robot-lib's protocol.md S9.4): every
+  // wire-touching comparison here runs on a NUL-terminated C string,
+  // per the no-allocation, no-std::string constraint (S3.2), so a NUL
+  // anywhere inside a line acts as an early terminator for THAT line --
+  // "PING\0extra\n" dispatches exactly like a bare "PING\n", silently
+  // discarding "extra" with no malformed-count increment. A pinned
+  // characterization, not a bug: a real fix would mean abandoning
+  // C-string comparisons throughout the parser. The one exception -- a
+  // line whose first non-space byte IS the NUL -- would otherwise leave
+  // the tokenizer's own token array uninitialized (a real memory-safety
+  // hazard, not just a surprising parse), so onLineComplete() guards it
+  // explicitly and counts it malformed instead.
   void feed(const char* data, size_t length);
 
   // HELLO's reply, byte-identical to the unsolicited boot banner a
@@ -479,68 +397,55 @@ class WireHandler {
   // "device NEZHA2 robot <name> <serial>\n".
   void sendBanner();
 
-  // The telemetry frame (protocol.md S5.2): emits, in order, as THREE
+  // The telemetry frame (protocol.md S5.2): emits, in order, as TWO
   // separate Sink::write() calls (never concatenated into one) --
   //   1. `thdr <col>...\n`, but only when a fresh header is DUE (see
   //      below);
   //   2. `t <v>...\n`, always, one value per column in `snapshot`, in
   //      the same order as the most recently emitted header.
-  // NOTHING ELSE (2026-08-26, protocol.md S8.5): the ack/nack keepalive
-  // that used to ride as a third write is DELETED -- an ack/nack is only
-  // ever a direct reply to an inbound sequenced line, never a beacon. A
-  // subscriber that wants to know whether its last command landed sends
-  // a command (e.g. STATUS) and reads that command's own ack.
+  // NOTHING ELSE (protocol.md S8.5): an ack/nack is only ever a direct
+  // reply to an inbound sequenced line, never a beacon. A subscriber
+  // that wants to know whether its last command landed sends a command
+  // (e.g. STATUS) and reads that command's own ack.
+  //
   // A fresh header is DUE when: this is the very first call ever made
   // on this instance; the column set changed since the last header
   // (count, any column's name, OR any column's hex-ness -- a memo that
   // compared only names/count would miss a hex-ness-only flip); or
-  // kHeaderRefreshFrames calls have elapsed since the last header,
-  // whichever comes first. That last case is what keeps a late-
-  // attaching listener over a lossy broadcast radio from being
-  // permanently locked out of decoding (sprint.md SUC-004) -- it has
-  // nothing to do with the column set changing at all.
+  // kHeaderRefreshFrames calls have elapsed, whichever comes first.
+  // That last case is what keeps a late-attaching listener over a lossy
+  // broadcast radio from being permanently locked out of decoding; it
+  // has nothing to do with the column set changing at all.
   //
   // `snapshot`'s backing array is borrowed only for the duration of
   // this call; this class copies what it needs of it (the header memo)
   // and touches nothing else afterward.
   void emitTelemetry(const Snapshot& snapshot);
 
-  // emitReliability() is GONE (2026-08-26, protocol.md S8.5): the
-  // periodic/piggybacked ack-nack keepalive it carried is deleted
-  // outright, per stakeholder direction ("an ack or a nack is only a
-  // response to a message, not a beacon"). The only remaining origin of
-  // every ack/nack is dispatch()'s own per-inbound-line reply (S8.1);
-  // a lost ack/nack heals via the host's own retransmit or poll.
-
   // Lines dropped as: an unrecognized verb or one this file does not
   // (yet) implement, wrong arity, an unparseable field, a sequenced
   // verb whose mandatory id was missing or malformed, or an overlong
-  // line (discarded to the next '\n'). This INCLUDES a decode failure on
-  // an in-order sequenced id (protocol.md S8.9) -- unlike a numeric gap
-  // (id > expectedNext_) or a stale retransmit (id < expectedNext_),
-  // NEITHER of which is ever counted here, since neither one's content
-  // is ever even inspected. A lowercase-led inbound verb -- another
-  // robot's reply overheard on a shared channel, S2.1 -- is dropped
-  // silently and does NOT increment this, and neither does a
-  // blank/all-whitespace line.
+  // line. This INCLUDES a decode failure on an in-order sequenced id
+  // (S8.9) -- unlike a numeric gap or a stale retransmit, NEITHER of
+  // which is ever counted here, since neither one's content is even
+  // inspected. A lowercase-led inbound verb (another robot's reply
+  // overheard on a shared channel, S2.1) and a blank line are dropped
+  // silently and do NOT increment this.
   uint32_t malformedCount() const { return malformedCount_; }
 
   // Builds "help" plus a space-separated `name` for every entry in
   // `names` (`nameCount` entries) into `buf` (capacity `bufCap`),
   // followed by '\n'. The terminator is written LAST but into a byte
-  // the content-filling loop is structurally forbidden to reach (its
-  // bound stops one byte short of the NUL as well as the '\n'), so it
-  // is always the LISTED NAMES that truncate if they would ever
-  // overflow `bufCap` -- never the terminator. That reserve-two-bytes
-  // shape is now the one convention every line this class formats
-  // follows: emitHeader()/emitFrame() reserve the same two bytes and
-  // hand the terminator to terminateEmitBuf(). Returns the number of
-  // bytes written, excluding the closing NUL. Public and static purely
-  // so a host test can drive it directly with a synthetic, arbitrarily
-  // long name list -- independent of kCommandTable, which today is far
-  // too small to ever exercise the truncation path this proves safe.
-  // Longest `help ...` line emitBuild will produce before starting a
-  // new one. Deliberately well under kMaxLineBytes: see emitHelp().
+  // the content-filling loop is structurally forbidden to reach, so it
+  // is always the LISTED NAMES that truncate on overflow, never the
+  // terminator -- the same reserve-two-bytes shape emitHeader()/
+  // emitFrame() follow, handing the terminator to terminateEmitBuf().
+  // Returns bytes written, excluding the closing NUL. Public and static
+  // purely so a host test can drive it with a synthetic, arbitrarily
+  // long name list; kCommandTable is far too small to exercise the
+  // truncation path this proves safe. kHelpChunkBytes is the longest
+  // `help ...` line emitHelp() will produce before starting a new one,
+  // deliberately well under kMaxLineBytes.
   static constexpr size_t kHelpChunkBytes = 60;
   static size_t buildHelpLine(char* buf, size_t bufCap,
                                const char* const* names, size_t nameCount);
@@ -595,20 +500,18 @@ class WireHandler {
   // mutation of handler state. It answers exactly one question -- "does
   // this line's own content parse?" -- so dispatch() can decide
   // ack-vs-nack BEFORE anything with a wire or Adapter side effect runs
-  // (protocol.md S8.9). Returns false (a DECODE FAILURE) for wrong arity
-  // or an unparseable field; true otherwise. `fields`/`fieldCount` here
+  // (S8.9). Returns false (a DECODE FAILURE) for wrong arity or an
+  // unparseable field; true otherwise. `fields`/`fieldCount` here
   // EXCLUDE the id (already resolved and stripped by dispatch()).
   using DecodeFn = bool (WireHandler::*)(char** fields, size_t fieldCount);
 
-  // Every EXECUTE function runs ONLY after dispatch() has already
-  // decided the line decodes AND has already sent the `ack` for it -- so
-  // an execute function is free to write informational reply lines
-  // (id/ver/status/help/get/ret) directly to the sink; nothing it does
-  // can race the ack that must precede those lines on the wire. It
-  // reports any ADAPTER-level (merits) rejection through `errCode` (0 ==
-  // kOk == no err line; nonzero == the wire code dispatch() will emit as
-  // `err <errCode> #<id>` right after whatever this function itself
-  // already wrote).
+  // Every EXECUTE function runs ONLY after dispatch() has decided the
+  // line decodes AND has already sent its `ack` -- so it is free to
+  // write informational reply lines (id/ver/status/help/get/ret)
+  // straight to the sink; nothing it does can race the ack that must
+  // precede them. It reports any ADAPTER-level (merits) rejection
+  // through `errCode` (0 == kOk == no err line; nonzero == the wire
+  // code dispatch() emits as `err <errCode> #<id>` right after).
   using ExecuteFn = void (WireHandler::*)(char** fields, size_t fieldCount,
                                           uint32_t id, uint8_t& errCode);
 
@@ -621,26 +524,21 @@ class WireHandler {
   // HELLO/PING/ESTOP's own rows are trivial stand-ins (decodeAlwaysTrue/
   // execNoop) NEVER actually invoked through this table -- dispatch()
   // intercepts all three by verb identity before any id is even looked
-  // at (protocol.md S8.3). They are still present here purely so HELP's
-  // generated listing (execHelp()) walks ONE table for every verb name
-  // this file knows about and cannot drift from the dispatcher.
+  // at (S8.3). They are still present purely so HELP's generated
+  // listing (execHelp()) walks ONE table for every verb name this file
+  // knows about and cannot drift from the dispatcher.
   //
-  // WIRE-09 (code review 2026-08-23): deliberately declared with NO
-  // explicit size -- the definition in wire_handler.cpp supplies the
-  // bound, deduced from its own initializer list. An explicit `[18]`
-  // here (the old spelling) meant the count was spelled twice, and
-  // *removing* a row from the .cpp's initializer (or missing one while
-  // renaming) compiled SILENTLY: the array zero-filled the vacated
-  // slot, that entry's `name` read back nullptr, and the first inbound
-  // sequenced verb that walked the table into it hit
-  // `strcmp(verb, nullptr)` -- UB, a hard fault in practice, on every
-  // subsequent unrecognized-verb line or HELP call (the two paths that
-  // walk the whole table; see verify-wire.md's own scope correction --
-  // NOT every command, only those two). Leaving the size to be deduced
-  // makes a row COUNT change of either sign visible from the deduced
-  // bound; the constructor's own static_assert (wire_handler.cpp) pins
-  // the expected count so a future accidental removal fails to
-  // COMPILE instead of silently shipping.
+  // Deliberately declared with NO explicit size: the definition in
+  // wire_handler.cpp supplies the bound, deduced from its own
+  // initializer list. An explicit size meant the count was spelled
+  // twice, and *removing* a row from the .cpp's initializer compiled
+  // SILENTLY -- the array zero-filled the vacated slot, that entry's
+  // `name` read back nullptr, and the first line that walked the table
+  // into it hit `strcmp(verb, nullptr)`: UB, a hard fault in practice,
+  // on every later unrecognized-verb line or HELP call (the two paths
+  // that walk the whole table). The constructor's own static_assert
+  // (wire_handler.cpp) pins the expected count, so an accidental
+  // removal fails to COMPILE instead of silently shipping.
   static const VerbEntry kCommandTable[];
 
   // Field-token storage cap for one line, verb-exclusive (id excluded --
@@ -661,11 +559,10 @@ class WireHandler {
   static constexpr size_t kMaxRunArgs = 16;
 
   // RUN's stringified return value -- an ARRAY SIZE (content bytes plus
-  // the NUL terminator), sized so the WHOLE reply line -- "ret " + this
-  // text + " #<id>" at id's maximum width (a 10-digit uint32_t) + '\n'
-  // -- can never exceed kMaxLineBytes even before execRun()'s own
-  // sanitize pass, which can only shrink the text further, never grow
-  // it.
+  // the NUL), sized so the WHOLE reply line -- "ret " + this text +
+  // " #<id>" at id's maximum width + '\n' -- can never exceed
+  // kMaxLineBytes, even before execRun()'s own sanitize pass (which can
+  // only shrink the text).
   static constexpr size_t kMaxRunResultBytes =
       kMaxLineBytes - 4 /* "ret " */ - 12 /* " #4294967295" */;
 
@@ -694,24 +591,18 @@ class WireHandler {
 
   // ---- motion: WHEELS_X / WHEELS_V / MOVE_X / MOVE_V / GO_TO_R /
   // GO_TO_W (motion-api.md S9.1's wire mapping). Every decode function
-  // here is a plain arity + signed/unsigned-integer-field-parseability
-  // check, same DecodeFn contract as every other verb; every exec
-  // function re-parses the same fields (decode already proved they
-  // succeed) and forwards them to the Adapter as floats -- wire integer
-  // -> float for arithmetic convenience.
+  // here is a plain arity + integer-field-parseability check, same
+  // DecodeFn contract as every other verb; every exec re-parses the
+  // same fields (decode already proved they succeed) and forwards them
+  // to the Adapter as floats.
   //
-  // Sprint 008 (wire-timeout-hardening.md, R-06 + R-18): every one of
-  // these six exec functions now runs its own `timeout`/`duration`
-  // field through wire_handler.cpp's shared clampMotionTimeout() helper
-  // BEFORE calling the Adapter -- 0 is refused (Result::kRange, matching
-  // the existing `cruise <= 0` refusal precedent) and any value above
-  // 2^31-1 is silently clamped down to it. This is deliberately in the
-  // exec (not decode) phase: value-range refusal is a MERITS rejection
-  // (ack + err), not a decode failure (nack) -- the line itself parses
-  // fine; only its meaning is out of range, same class as the
-  // cruise/speed <0/==0 handling WireAdapter::onWheelsX() et al. already
-  // do. See wire_handler.cpp's kMaxMotionTimeout/clampMotionTimeout()
-  // for the full rationale. ----
+  // Every one of the six execs runs its own `timeout`/`duration` field
+  // through clampMotionTimeout() (wire_handler.cpp) BEFORE calling the
+  // Adapter: 0 is refused (Result::kRange, matching the `cruise <= 0`
+  // refusal precedent) and anything above 2^31-1 is silently clamped.
+  // Deliberately in the exec, not the decode phase -- a value-range
+  // refusal is a MERITS rejection (ack + err), not a decode failure
+  // (nack): the line parses fine, only its meaning is out of range. ----
   bool decodeWheelsX(char** fields, size_t fieldCount);
   void execWheelsX(char** fields, size_t fieldCount, uint32_t id,
                    uint8_t& errCode);
@@ -781,44 +672,31 @@ class WireHandler {
   uint32_t malformedCount_ = 0;
 
   // ---- the reliability layer's own state (protocol.md S8.1) -- one
-  // integer plus one bool, and deliberately NO clock/timer.
-  // `lastDone_` is NOT here: it lives on the Adapter (S8.8), polled
-  // fresh on every ack/nack, never cached on this class. ----
+  // integer plus one bool, and deliberately NO clock/timer. `lastDone_`
+  // is NOT here: it lives on the Adapter (S8.8), polled fresh on every
+  // ack/nack, never cached on this class. ----
   uint32_t expectedNext_ = 1;    // next sequence id expected from the host
 
-  // gapOutstanding_ was DELETED 2026-08-26 (S8.5) along with the
-  // telemetry ack piggyback, whose emitReliability() was its only
-  // reader. It came back 2026-08-27, stakeholder-approved, and the
-  // scope of its return matters more than its existence:
-  //
-  //   IT IS A REPLY PREDICATE ONLY.
-  //
-  // Its sole job is gating whether an inbound UNSEQUENCED line's reply
-  // carries the reminder (see emitReminderIfStalled()). It does NOT
-  // restore a periodic emission, a telemetry-carried ack/nack, or a
-  // beacon of any kind -- all of that stays deleted and S8.5's
-  // anti-beacon rule is untouched. An idle connection is still
-  // COMPLETELY silent on both carriers: `feed()` remains the only
-  // origin of every emission this class makes, and nothing here has a
-  // clock.
-  //
-  // Approved with that scope stated, because re-adding it partially
-  // undoes the stakeholder's own direction from the day before. The
-  // requirement it serves: an unsequenced verb must be issuable at any
-  // time with no id (that is the gating half, and it is absolute), but
-  // it MAY still carry back "your last command didn't land" when
-  // something is actually wrong. Sequence gating and reply emission are
-  // separable, and only the first was ever objected to.
-  //
-  // It cannot be derived from expectedNext_ alone: that counter cannot
-  // distinguish "clean, waiting for #5 which the host has not sent yet"
-  // from "stalled, discarded #6, still want #5".
+  // A REPLY PREDICATE, and nothing more. Set when a numeric gap or a
+  // decode failure stalls the stream (dispatch()/handleDecodeFailure()),
+  // cleared by an accepted in-order line and by HELLO. Its one reader is
+  // emitReminderIfStalled(), which decides whether an inbound
+  // UNSEQUENCED verb's reply also carries `nack <expectedNext_>`, so an
+  // operator issuing an unsequenced verb at any time still learns that
+  // an earlier numbered command did not land. It restores no periodic
+  // emission, no telemetry-carried ack/nack and no beacon of any kind
+  // (S8.5): feed() remains the only origin of every emission this class
+  // makes, nothing here has a clock, and an idle connection stays
+  // COMPLETELY silent on both carriers. It cannot be derived from
+  // expectedNext_ alone -- that counter cannot distinguish "clean,
+  // waiting for #5 which the host has not sent yet" from "stalled,
+  // discarded #6, still want #5".
   bool gapOutstanding_ = false;
 
   // ---- telemetry header memo state (protocol.md S5.2) -- a COPY of
   // the most recently emitted header's shape, sized generously above
-  // any realistic column set (sprint.md's own widest set, POSE+FULL,
-  // is 20 columns; column names in this project are all <=6 chars) so
+  // any realistic column set (the widest set, POSE+FULL, is 20
+  // columns; column names in this project are all <=6 chars) so
   // headerChanged()'s per-column comparison never has to worry about
   // storage running out for a real caller. A Snapshot wider than
   // kMaxHeaderColumns is treated as always-changed by headerChanged()
@@ -832,7 +710,7 @@ class WireHandler {
   bool everEmittedHeader_ = false;  // false until the very first thdr
 
   // The 20-frame (~1 Hz at this project's 50 ms emission cadence)
-  // forced header refresh (sprint.md SUC-004) -- counts calls to
+  // forced header refresh -- counts calls to
   // emitTelemetry(snapshot) since the last thdr was emitted (for ANY
   // reason: a real change, the very first call, or this same
   // staleness trigger), reset to 1 every time one goes out since the
@@ -840,25 +718,21 @@ class WireHandler {
   static constexpr uint32_t kHeaderRefreshFrames = 20;
   uint32_t framesSinceHeader_ = 0;
 
-  // Telemetry's own member-owned scratch buffer (never a stack local
-  // in emitHeader()/emitFrame() -- see this file's own kMaxLineBytes
-  // comment and sprint.md's Phase B formatting constraints: the
-  // protocol fiber is 2 KB, and radio_transport.h:128 records a
-  // measured hard-fault from exactly this mistake elsewhere in this
-  // project). Sized identically to lineBuf_ (the wire's own 240-byte
-  // line ceiling) rather than reused: lineBuf_ is RX-only reassembly
-  // state (fed byte-by-byte from feed()), and aliasing an unrelated TX
-  // formatting buffer onto it would be a correctness landmine for a
-  // future edit, not a real memory saving.
+  // Telemetry's own member-owned scratch buffer (never a stack local in
+  // emitHeader()/emitFrame(): the protocol fiber is 2 KB, and
+  // radio_transport.h records a measured hard-fault from exactly this
+  // mistake elsewhere in this project). Sized identically to lineBuf_
+  // (the wire's own 240-byte line ceiling) rather than reused --
+  // lineBuf_ is RX-only reassembly state fed byte-by-byte from feed(),
+  // and aliasing an unrelated TX formatting buffer onto it would be a
+  // correctness landmine for a future edit, not a real memory saving.
   char emitBuf_[kMaxLineBytes] = {};
 
-  // RUN's own reply-body scratch, same emitBuf_ reasoning applied to
-  // execRun(): a member instead of a stack local so this array's
-  // storage never adds to that function's own frame at all, regardless
-  // of where in the function body it would otherwise be declared.
-  // argv[] stays a plain local in execRun() -- it is genuinely needed
-  // as the adapter call's own argument, before any early-return point
-  // exists ahead of it.
+  // RUN's own reply-body scratch, same reasoning applied to execRun():
+  // a member instead of a stack local, so this array's storage never
+  // adds to that function's frame. argv[] stays a plain local there --
+  // it is genuinely needed as the adapter call's own argument, before
+  // any early-return point exists ahead of it.
   char runResult_[kMaxRunResultBytes] = {};
 };
 

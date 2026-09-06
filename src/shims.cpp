@@ -7,11 +7,12 @@
 //     positions (the kernel is counts-native and has no chassis
 //     geometry; track width and travel calibration live HERE).
 //   - MOVE ENGINE: position-mode moves (distance+yaw, and goto via the
-//     TS layer's arc math) as a start/update/end state machine over the
-//     kernel's velocity interface. The TypeScript layer polls
+//     TS layer's arc math) live in motion/motion_engine.{h,cpp}; what
+//     this file adds is the MotionEngine member composed onto the
+//     kernel and the forwards onto it. The TypeScript layer polls
 //     updateMove() -- blocking and loop-style forms are both built on
-//     that poll. Both updateMove() and the tick engine below share one
-//     implementation, service().
+//     that poll -- and updateMove() and the tick engine below both
+//     drive the engine's one service().
 //   - TICK ENGINE: tickDrive() runs one kernel.step() + service()
 //     on the CALLER's own fiber, then self-paces to the next 24 ms
 //     deadline. The kernel's own background fiber pacer
@@ -233,49 +234,26 @@ struct Rig {
   // The deadline the NEXT go-to gets: an ordinary config field
   // (`goto_timeout`, ordinal 39, kConfigAccessors below), backed by
   // this Rig member exactly the way defaultCruise_ above backs
-  // `default_cruise` -- NOT a bespoke, call-scoped handoff slot, which
-  // is what it was until sprint 033 ticket 004.
+  // `default_cruise`, so a bench host can `GET`/`SET` it. This is where
+  // engineSetGoToDeadline() parks the fifth argument engineGoToRArmed()
+  // cannot take -- see that shim for why it cannot.
   //
-  // It arrived as one, and the shape it left behind is why
-  // engineSetGoToDeadline() (below) still exists as its own `//%`
-  // shim. Sprint 015 ticket 006 split the block layer's go-to entry
-  // point across two shims because a real PXT build of the ORIGINAL
-  // single five-parameter engineGoToR() reproduced "TS9200: Assertion
-  // failed" deterministically -- twice, non-benign, surviving
-  // make_deploy.py's one retry for the shape tools/DESIGN.md documents
-  // under the same error code -- confirming the risk
-  // setTaperWindows()'s own comment already recorded from an earlier
-  // incident. Every `//%` shim in this file therefore stays at <=4
-  // params, and the fifth argument has to reach engineGoToRArmed()
-  // through Rig rather than through its own parameter list.
-  //
-  // Only the STORAGE moved: engineSetGoToDeadline() writes this field
-  // and engineGoToRArmed() reads it, exactly as before, but it is now
-  // one row of the shared config surface -- so a bench host can also
-  // read the pending deadline back with `GET goto_timeout`, and set
-  // one with `SET goto_timeout`. Neither was possible while it was a
-  // private field, which is the standing cost of a bespoke singleton.
-  //
-  // It was never one-SHOT even when it was bespoke: nothing zeroes it
-  // after a go-to consumes it, and nothing ever did. The block layer
-  // sets it immediately before every _goToR() (motion.ts's
+  // NOT one-shot: nothing zeroes it once a go-to consumes it. The block
+  // layer sets it immediately before every _goToR() (motion.ts's
   // startGoTo()), so the last writer wins and a wire-set value is
   // overwritten by the next block-issued go-to. That ORDERING is the
-  // contract; the storage never was.
+  // contract.
   uint32_t goToDeadline = 0;  // [ms]
 
   // The go-to entry point's own yaw-rate ceiling
   // (engineSetGoToYawRate()/engineGoToRArmed() below) -- a SEPARATE
-  // field/setter pair rather than a 5th engineGoToRArmed() parameter
-  // for the exact same reason goToDeadline immediately above records:
-  // every `//%` shim in this file stays at <=4 params (see that
-  // field's own comment for the PXT packager crash this avoids).
-  // Deliberately still a plain Rig field rather than a config row: the
-  // wire's own GO_TO_R carries no yaw-rate ceiling, so there is no
-  // wire-side counterpart for it to become one row of. One caller
-  // (sim.ts's _setGoToYawRate(), called by
-  // motion.ts's startGoTo() immediately before _goToR(), alongside
-  // _setGoToDeadline()).
+  // field/setter pair rather than a 5th engineGoToRArmed() parameter,
+  // for the same reason goToDeadline above is one. Deliberately still a
+  // plain Rig field rather than a config row: the wire's own GO_TO_R
+  // carries no yaw-rate ceiling, so there is no wire-side counterpart
+  // for it to become one row of. One caller (sim.ts's
+  // _setGoToYawRate(), called by motion.ts's startGoTo() immediately
+  // before _goToR(), alongside _setGoToDeadline()).
   float pendingGoToYawRate_ = 0.0f;  // [cdeg/s]
 };
 
@@ -367,89 +345,47 @@ static Rig& ensure() {
 // against a scripted wheel path with no kernel in the link at all.
 static void odomUpdate(Rig& r) { r.odometry.update(r.kernel.output()); }
 
-// ---- the soft stop (sprint 033 ticket 004; cross-fiber delivery from
-// sprint 006 ticket 002) -------------------------------------------------
+// ---- the soft stop --------------------------------------------------
 // THE one soft stop this file has. Every stop path calls it and none
 // writes the sequence out again: stopAll() (the `stop` block and the
 // wire's STOP verb), endMove() (the `stop move` block), the starvation
-// watchdog, and updateMove()'s own move-completion branch. Until this
-// ticket the three parts below were spelled out separately at each of
-// those four sites (the port-level third part behind a free function,
-// deliverStopNow(), which this method absorbs), and four copies of one
-// sequence is four chances for them to stop agreeing -- which they
-// already had: updateMove()'s branch carried only the port write.
+// watchdog, and updateMove()'s own move-completion branch. (It absorbed
+// the free function deliverStopNow(), a name src/DESIGN.md,
+// tests/host/fake_ports.h and several code-review documents still use.)
 //
-// The three parts, in order, and why each is needed:
+// The three parts, in order:
 //
 //   engine.endMove()  clears the move engine's own in-flight state, so
 //                     a later service() cannot re-command from it.
-//   kernel.neutral()  disarms the kernel's HELD commanded velocity
-//                     (a continuous drive holds up to kLeaseMax, one
-//                     hour). Without it the port zero below is
-//                     momentary: the very next step() re-commands the
-//                     duty. endMove() stages this itself only when a
-//                     move-engine move was active, which is why the
-//                     call is unconditional here -- a stop after
-//                     setWheels()/driveTwist() needs it and would
-//                     otherwise not get it (stakeholder decision,
-//                     2026-08-26).
-//   the port write    delivers the stop NOW, see below.
+//   kernel.neutral()  disarms the kernel's HELD commanded velocity (a
+//                     continuous drive holds up to kLeaseMax, one
+//                     hour); without it the port zero below is
+//                     momentary, because the very next step()
+//                     re-commands the duty. Unconditional, so a stop
+//                     after setWheels()/driveTwist() gets it too
+//                     (stakeholder decision, 2026-08-26).
+//   the port write    delivers the stop NOW.
 //
-// updateMove()'s completion branch gains the first two by routing here,
-// and they are inert on that path: MotionEngine::service() has already
-// neutralled the kernel and cleared the Segment by the time it returns
-// false, so endMove() finds nothing active (it leaves
-// lastSegmentEndedByDeadline_ alone for exactly that reason) and the
-// only residue is a VelocityShaper reset that every subsequent segment
-// start performs anyway (motion_engine.cpp).
+// Why PORT-LEVEL (R-08/BLK-01): kernel.neutral() only STAGES a zero
+// (diffdrive.cpp), delivered solely on a LATER kernel.step(), and
+// step() writes duty BEFORE its two ~4 ms-per-wheel encoder settle
+// sleeps. A stop issued from a fiber that is not the one inside step()
+// therefore stages a neutral nobody delivers -- and if that same call
+// is what ended a `while (tickDrive())` loop, not until the starvation
+// watchdog fires ~100-150 ms later. Writing NezhaMotorPort::
+// emergencyStop() on both motors lands the stop in the SAME tick,
+// synchronously on the calling fiber, with no new ticker and no edit to
+// the vendored kernel. Never kernel.emergencyStopMotors(): that also
+// latches estopLatch_ (diffdrive.cpp), turning this resumable soft stop
+// into a hard e-stop needing clearEmergencyStop().
 //
-// Why a PORT-LEVEL write at all. Closes R-08/BLK-01 (code review
-// 2026-08-23, independently re-derived in
-// verify-blocks.md): kernel.neutral() only STAGES a zero command
-// (diffdrive.cpp) -- delivery to the motors happens solely on a LATER
-// kernel.step(), and step()'s own duty write happens BEFORE its two
-// ~4 ms-per-wheel encoder settle sleeps. A stop or move-completion issued
-// from a fiber other than the one currently inside step()'s settle
-// window therefore stages a neutral that is not delivered until that
-// step() returns AND another step() runs -- which, if the very call that
-// staged it is what ended a `while (tickDrive())` loop (the common
-// case), never happens until the ~100-150 ms starvation watchdog fires:
-// the same class of bug commit 3e919e5 fixed for the in-fiber
-// (move-completion) case, reopened here for the cross-fiber case.
-//
-// This method's third part is an immediate, PORT-LEVEL zero write to
-// both motors -- the exact primitive the starvation watchdog below used
-// to use directly (NezhaMotorPort::emergencyStop(), proven
-// tick-independent by its exact-zero short-circuit in
-// writeShapedDuty()) -- alongside the staged kernel.neutral()/
-// engine.endMove(). That delivers the stop within the SAME tick regardless of where
-// in the settle window the race lands, adds no new fiber/ticker (a
-// synchronous call on whichever fiber is already running -- the
-// one-ticker-per-move invariant is unaffected), and never touches the
-// vendored kernel (diffdrive.{h,cpp} stay byte-unchanged).
-//
-// Deliberately calls the MOTOR ports directly, exactly as the watchdog
-// does, and never kernel.emergencyStopMotors() -- that kernel-level
-// method also latches estopLatch_ as an (undocumented) side effect
-// (diffdrive.cpp), which would turn this resumable soft stop into a
-// hard e-stop requiring clearEmergencyStop(). Calling the ports directly
-// stays in the same resumable "soft stop" family stopAll()/the watchdog
-// already established: a fresh drive()/tickDrive() call resumes motion
-// with no clear step needed.
-//
-// Staged instead of immediate while busGuard is held: writing the
-// motor ports HERE, on whichever fiber called this, would race the
-// I2C traffic of whichever OTHER fiber currently holds the guard (mid
-// kernel.step(), possibly parked in its own encoder settle sleep) --
-// the exact bus-collision hazard the guard exists to prevent. Setting
-// Rig::pendingStop_ instead defers the port write to that busy fiber
-// itself, delivered from inside tickDrive() before it releases the
-// guard (see that function's own comment), which still lands within
-// the SAME tick the request was made in -- the same "no later than
-// this tick" guarantee this function has always given, just delivered
-// by the fiber that can safely touch the bus rather than this one.
-// When the guard is free (the common case), the write still happens
-// immediately, right here, exactly as before.
+// Staged while busGuard is held: the port write would otherwise race
+// the I2C traffic of whichever OTHER fiber holds the guard (mid
+// kernel.step(), possibly parked in its own settle sleep) -- the exact
+// collision the guard exists to prevent. Rig::pendingStop_ hands the
+// write to that fiber instead, delivered from inside tickDrive() just
+// before it releases the guard, still within the same tick. When the
+// guard is free (the common case) the write happens here, immediately.
 void Rig::softStop() {
   engine.endMove();
   kernel.neutral();
@@ -517,15 +453,12 @@ void driveTwistTimed(int speed, int yawRate,
 // handlers) --------------------------------------------------------------
 // Same same-package forward-declaration convention as setWheelsTimed()/
 // driveTwistTimed() above -- WireAdapter has no reference of its own to
-// this Rig's `engine`, so it forwards through these thin, wire-shaped
-// calls instead. Wire-shaped units throughout (mm, mm/s, ms);
-// `rotation` arrives at engineMoveX() ALREADY converted from the
-// wire's milliradian integer (wire_adapter.cpp's mradToRad()). `cruise`
-// <= 0 here is MotionEngine's own existing no-op -- the wire's "0 means
-// the configured default" substitution (engineDefaultCruise() below)
-// is resolved BEFORE calling these; neither of these two ever sees the
-// sentinel itself. Deliberately NOT `//%`-annotated: the block API's
-// own startMove() already has a call shape of its own.
+// this Rig's `engine`. Wire-shaped units throughout (mm, mm/s, ms);
+// `rotation` arrives at engineMoveX() ALREADY converted from the wire's
+// milliradian integer (wire_adapter.cpp's mradToRad()). The wire's
+// "0 means the configured default" substitution (engineDefaultCruise()
+// below) is resolved BEFORE these are called, so neither ever sees the
+// sentinel and `cruise <= 0` here is MotionEngine's own no-op.
 void engineWheelsX(float left, float right, float cruise,
                    uint32_t timeout) {  // [mm] [mm] [mm/s] [ms]
   Rig& r = ensure();
@@ -540,55 +473,28 @@ void engineMoveX(float distance, float rotation, float cruise,
 
 // The wire's "cruise == 0 means the configured default" substitution
 // (motion-api.md S1.1: "an X-form's commanded value is a displacement
-// ... pass 0 for the configured default"). Sprint 007 ticket 003
-// (closing R-11/BLK-03/API-03): this used to derive the substituted
-// value from kernel.config().fullDutyVelocity -- this robot's 100%-duty
-// ceiling, ~875 mm/s -- so a spec-following host sending `cruise 0`
-// got the fastest, least-controlled move the robot can make, ~1.5x the
-// speed the project's own bench notes call unusable. fullDutyVelocity
-// is the wrong field for this: at the kernel layer, `0` there means
-// "uncalibrated, refuse VELOCITY commands entirely"
-// (DifferentialDrive::checkCommandable()) -- an unrelated meaning of
-// zero that happened to share a variable with this substitution. Now
-// returns the Rig's own, independently configured defaultCruise_
-// (seeded 150 mm/s above, settable/gettable via the `default_cruise`
-// wire field, ordinal 15 -- setKernelValue()/getConfigValue() below).
-// fullDutyVelocity remains the duty CEILING elsewhere in this file and
-// the kernel; it is no longer read here. Returns 0 if defaultCruise_
-// itself is non-positive (an operator can still force "no default
-// available" via `SET default_cruise 0`) -- wire_adapter.cpp's four
-// verb handlers already treat that as a range refusal, not a
-// silently-accepted zero-speed command; that refusal logic is
-// unchanged by this ticket.
+// ... pass 0 for the configured default"). Returns the Rig's own
+// defaultCruise_ -- the `default_cruise` wire field, ordinal 15 --
+// NOT kernel.config().fullDutyVelocity, which is the 100%-duty ceiling
+// (~875 mm/s, so `cruise 0` meant the fastest move the robot can make)
+// and whose own zero means the unrelated "uncalibrated, refuse
+// VELOCITY" (DifferentialDrive::checkCommandable()). Returns 0 when
+// defaultCruise_ is non-positive, an operator's way to force "no
+// default available"; wire_adapter.cpp's verb handlers treat that as a
+// range refusal, not a silently-accepted zero-speed command.
 float engineDefaultCruise() {  // [mm/s]
   return ensure().defaultCruise_;
 }
 
-// SUC-003: same same-package forward-declaration convention as
-// engineDefaultCruise() immediately above -- WireAdapter has no
-// reference of its own to this Rig's `engine`. engineADecel() lets
-// the wire layer decide, per call, whether a `cruise == 0` sentinel
-// should resolve from the flat legacy default above or from the
-// call's own leg distance below; engineDefaultCruiseForDistance()
-// is that distance-aware resolve itself, forwarding straight onto
-// MotionEngine::defaultCruiseForDistance() (motion_engine.h). Neither
-// is read by engineWheelsX()'s own wire path -- WHEELS_X/WHEELS_V keep
-// the flat sentinel unconditionally.
-//
-// this ticket: this used to read MotionEngine::aDecelMmS2(),
-// which selected "legacy mode" at its compiled-in 0.0 default (no
-// shaping configured yet). That field is deleted -- MotionLimits::decel
-// defaults to 400 and can never be set back to 0 (design S8: accel/
-// decel are "now always active, no legacy mode") -- so this now reads
-// limits().decel directly, which is always positive. The wire-layer
-// consequence: onMoveX()'s own `engineADecel() > 0.0f ? ... :
-// ...` selector (wire_adapter.cpp) now ALWAYS takes the distance-aware
-// branch; a MOVE_X `cruise == 0` no longer ever resolves through the
-// flat `default_cruise` field. This is a genuine, ticket-3-forced
-// behavior change (not a choice made here) -- see this ticket's own
-// report for the affected tests (test_wire_motion_verbs.py's SUC-003
-// section) and why the flat-default wire surface itself is out of this
-// ticket's scope (ticket 004 owns the descriptor table).
+// SUC-003: two more wire-layer forwards, same same-package
+// forward-declaration convention as engineDefaultCruise() above.
+// engineADecel() returns MotionLimits::decel, which defaults to 400 and
+// can never be set to 0 -- so onMoveX()'s own `engineADecel() > 0.0f`
+// selector (wire_adapter.cpp) ALWAYS takes the distance-aware branch,
+// and a MOVE_X `cruise == 0` resolves through
+// engineDefaultCruiseForDistance() rather than the flat
+// `default_cruise` field above. engineWheelsX()'s wire path reads
+// neither: WHEELS_X/WHEELS_V keep the flat sentinel unconditionally.
 float engineADecel() {  // [mm/s^2]
   return ensure().engine.limits().decel;
 }
@@ -600,41 +506,30 @@ float engineDefaultCruiseForDistance(float distance) {  // [mm] -> [mm/s]
 // SUC-003: MOVE_X's own D input for the resolver above -- a pure pivot
 // (distance == 0) still has a real wheel-travel distance, so onMoveX()
 // (wire_adapter.cpp) reaches this instead of taking |distance| alone.
-// Forwards onto MotionEngine::dominantAxisTravel() (motion_engine.h,
-// renamed from dominantAxisTravelMm() -- no-units-in-identifiers.md),
-// the same `dominant` quantity beginSegment() itself reduces to.
+// Forwards onto MotionEngine::dominantAxisTravel(), the same `dominant`
+// quantity beginSegment() itself reduces to.
 float engineDominantAxisTravel(float distance, float rotation) {  // [mm] [rad] -> [mm]
   return ensure().engine.dominantAxisTravel(distance, rotation);
 }
 
-// Sprint 005 ticket 004 (closing wire-motion-completion-signal.md/R-23):
-// the ONE genuinely new read WireAdapter's own motion-completion
-// resolution needs (wire_adapter.cpp's forward declaration, its own
-// header comment there) -- true iff MotionEngine's move-engine state
-// (MOVE_X/GO_TO_R/GO_TO_W's own tracked segment) is currently active.
-// Mirrors moving()'s exact body (further down, this file's `//%`
-// block-API surface) but is deliberately its OWN function, not a call
-// to moving(): this is a wire-shaped bridge (no `//%`, same
-// same-package forward-declaration convention as engineWheelsX() et
-// al. above), and must not depend on a block-API function's own
-// continued existence or shape -- same rationale setWheelsTimed() gives
-// for staying separate from the block API's own setWheels(). `rig ==
-// nullptr` (no kernel ever composed -- e.g. a wire session with no
-// prior motion verb at all) answers false, same honest "nothing is
-// active" default moving() gives.
+// True iff MotionEngine's move-engine state (MOVE_X/GO_TO_R/GO_TO_W's
+// own tracked segment) is currently active -- one of the two reads
+// WireAdapter's motion-completion resolution needs. Mirrors the `//%`
+// block API's moving() but is deliberately its OWN function: a
+// wire-shaped bridge must not depend on a block-API function's
+// continued existence or shape, the same rationale setWheelsTimed()
+// gives for staying separate from setWheels(). `rig == nullptr` (a wire
+// session with no prior motion verb) answers false.
 bool engineMoveActive() {
   return rig != nullptr && rig->engine.isMoveActive();
 }
 
-// The SECOND genuinely new read WireAdapter's motion-completion
-// resolution needs, alongside engineMoveActive() above -- true iff the
-// most recent Segment to go inactive ended via its OWN deadline rather
-// than by reaching its own goal, an abort, or an external stop. See
-// MotionEngine::lastSegmentEndedByDeadline()'s own doc comment
-// (motion_engine.h) for why this matters: it is latched once, on the
-// engine's own tick, instead of being re-derived from a wire-side clock
-// comparison whenever a host later happens to ask. `rig == nullptr`
-// answers false, the same honest default engineMoveActive() gives.
+// The second such read -- true iff the most recent Segment to go
+// inactive ended via its OWN deadline rather than by reaching its goal,
+// an abort, or an external stop. Latched once on the engine's own tick
+// (see MotionEngine::lastSegmentEndedByDeadline()) instead of being
+// re-derived from a wire-side clock whenever a host happens to ask.
+// `rig == nullptr` answers false.
 bool engineMoveEndedByDeadline() {
   return rig != nullptr && rig->engine.lastSegmentEndedByDeadline();
 }
@@ -762,34 +657,21 @@ static OtosPort& otosRef();
 // ---- tick engine --------------------------------------------------------
 // tickDrive(): the caller-driven replacement for the kernel's own
 // now-unwired fiber (see ensure()'s comment). Runs exactly one
-// kernel.step() + service() on the CALLER's fiber, then self-paces
-// to the next absolute 24 ms deadline -- the same absolute-deadline
-// pacing DifferentialDrive::run() uses, lifted here since run() itself
-// is no longer wired to anything. The deadline anchors to the previous
-// tick's own deadline while calls stay consecutive (no drift
-// accumulates); a gap since the last deadline re-anchors to now rather
-// than catching up a burst of overdue ticks.
+// kernel.step() + service() on the CALLER's fiber -- always, even with
+// nothing active, or continuous-mode driving never progresses -- then
+// self-paces to the next absolute 24 ms deadline, the same
+// absolute-deadline pacing DifferentialDrive::run() uses. Consecutive
+// calls anchor to the previous deadline so no drift accumulates; a gap
+// re-anchors to now rather than catching up a burst of overdue ticks.
 //
-// Always executes the step, even with no move active and no continuous
-// command in force: a `while (tickDrive())` loop driving
-// setWheels()/driveTwist() must step the kernel every call, or
-// continuous-mode driving never progresses.
-//
-// Returns commandLooksActive(r) -- a move-engine move still in flight,
-// OR nonzero applied duty -- computed AFTER service() runs. NOT raw
-// post-service() moveActive: wheelsV()/wheelsX() clear the move
-// planner before tickDrive() is ever called, so a continuous-mode
-// `while (tickDrive())` loop reading raw moveActive exited on its very
-// first iteration (the starvation watchdog then stopped the robot
-// ~150 ms later); commandLooksActive()'s "or nonzero applied duty"
-// clause is what keeps the loop running. A position-mode move's final
-// tick is unaffected: the settle loop just below already drives
-// applied duty to zero before this function returns, so that tick still
-// returns false as before. See
-// tests/host/test_continuous_drive_command_looks_active.py (pins this
-// return value's condition) and
-// tests/host/test_regression_post_move_neutral.py (pins the settle
-// loop).
+// Returns commandLooksActive(r) -- a move still in flight OR nonzero
+// applied duty -- computed AFTER service(). Raw moveActive is the wrong
+// read here: wheelsV()/wheelsX() clear the move planner before
+// tickDrive() is ever called, so a continuous-mode `while (tickDrive())`
+// loop reading it exits on its first iteration and the robot stops on
+// the starvation watchdog ~150 ms later. A position-mode move's final
+// tick still returns false, because the settle loop below drives
+// applied duty to zero before this function returns.
 //%
 bool tickDrive() {
   Rig& r = ensure();
@@ -808,85 +690,45 @@ bool tickDrive() {
   r.kernel.step();
 
   // isDriving() (seg_.active || hold_.active), NOT isMoveActive()
-  // (seg_.active alone) -- this used to read isMoveActive(), which
-  // mirrored updateMove()'s own gate just below
-  // but, unlike THAT gate, feeds the settle-loop decision a few lines
-  // down. A continuous WHEELS_V/MOVE_V hold reaching ITS OWN deadline
-  // inside service() (Hold's "holdExpired" branch, motion_engine.cpp)
-  // sets hold_.active = false and stages kernel_.neutral() exactly like
-  // a Segment's own arrival does -- but with the OLD isMoveActive()
-  // read, `wasActive` was ALWAYS false for a Hold (seg_.active is never
-  // true for one), so `wasActive && !moveActive` never fired and the
-  // settle loop below never ran for a Hold's natural end, only for a
-  // Segment's. The staged neutral then had to wait for a FURTHER
-  // kernel.step() to ever commit -- and once this wire-issued Hold's
-  // own lease (hasLiveMotionObligation(), wire_adapter.cpp) elapses at
-  // essentially the same instant, protocol.cpp's run() loop stops
-  // calling tickDrive() at all, so that further step() never comes:
-  // Output (velocityLeft/Right, appliedDutyLeft/Right, positionLeft/
-  // Right, cycleCount) freezes at its last mid-drive, nonzero reading
-  // forever, and STATUS's `active` bit (computed from that same frozen
-  // velocity) reads stuck "still moving" indefinitely -- MEASURED via
-  // this ticket's own host test,
-  // tests/host/test_wire_motion_verbs.py::test_wheels_v_hold_expiry_settles_and_status_reads_fresh,
-  // which reproduces the freeze with the OLD isMoveActive() read and
-  // confirms it is gone with isDriving(). commandLooksActive() (this
-  // file, below) already made this exact isMoveActive()->isDriving()
-  // fix for the starvation watchdog; this was the same bug in the
-  // sibling check tickDrive() itself makes, missed at the time.
+  // (seg_.active alone): this feeds the settle-loop gate below, and a
+  // continuous WHEELS_V/MOVE_V Hold reaching its own deadline inside
+  // service() stages kernel_.neutral() exactly as a Segment's arrival
+  // does while never setting seg_.active. Under the narrower read the
+  // settle loop never ran for a Hold's natural end; the staged neutral
+  // waited on a further kernel.step() that never came once the wire
+  // lease elapsed and protocol.cpp stopped ticking, so Output froze at
+  // its last mid-drive reading and STATUS's `active` bit read stuck
+  // "still moving" forever. Pinned by
+  // tests/host/test_wire_motion_verbs.py.
   const bool wasActive = r.engine.isDriving();
-  // odomUpdate() now runs UNCONDITIONALLY, every tick (sprint 006 ticket
-  // 003, closes R-09/BLK-05, continuous-mode-odometry-chord-error.md):
-  // this used to read `if (wasActive) odomUpdate(r);`, matching
-  // updateMove()'s own gate just below -- so continuous-mode driving
-  // (setWheels()/driveTwist() under a `while (tickDrive())` loop, no
-  // move-engine move ever active) never called this at all, and the
-  // next pose read integrated the ENTIRE driven interval as one
-  // straight chord at one midpoint heading: wrong by the difference
-  // between an arc and its chord, exactly the whole path length for a
-  // closed loop (drive a full circle, pose reports ~the path length
-  // instead of ~0). odomUpdate() diffs against the last kernel Output
-  // it consumed and immediately re-stamps that value, so it is a no-op
-  // on a tick with no new encoder movement -- safe to call
-  // unconditionally. `wasActive` is still computed here and kept for
-  // the settle-loop gate below (`if (wasActive && !moveActive)`), which
-  // is a different concern (folding post-move coast counts into pose)
-  // and is unaffected by this change. updateMove()'s OWN odometry gate
-  // -- a different caller, serving the TypeScript layer's blocking-move
-  // poll -- is untouched; see its own comment. (updateMove() has the
-  // SAME isMoveActive()-vs-isDriving() gap in its own `wasActive`, for
-  // the TS blocking-poll path rather than the wire path this ticket
-  // scoped -- flagged, not fixed here; see this ticket's session notes.)
+  // UNCONDITIONAL, every tick (R-09/BLK-05): odomUpdate() diffs against
+  // the last kernel Output it consumed and re-stamps it, so it is a
+  // no-op on a tick with no new encoder movement. Gated on `wasActive`
+  // it never ran at all for continuous-mode driving
+  // (setWheels()/driveTwist() with no move-engine move active), and the
+  // next pose read then integrated the ENTIRE driven interval as one
+  // straight chord at one midpoint heading -- for a closed loop, an
+  // error the size of the whole path. `wasActive` is still computed,
+  // for the settle-loop gate below (a different concern: folding
+  // post-move coast counts into pose). updateMove() keeps its own,
+  // narrower odometry gate for the TS blocking-poll path.
   odomUpdate(r);
   const bool moveActive = r.engine.service();
 
-  // Move-completion stop delivery (bench root-cause, 2026-08-20): when
-  // service() ends the move it posts kernel.neutral(), but the
-  // neutral only reaches the MOTORS on the NEXT kernel.step() -- and a
-  // `while (tickDrive())` caller exits the moment we return false, so
-  // that step never ran. The wheels then coasted at the last commanded
-  // duty until the starvation watchdog's port-level stop (~100-150 ms
-  // = +9-13 deg per turn, +15-22 mm per leg): the intermittent tour
-  // corruption. (It was intermittent only because the protocol fiber's
-  // former co-ticking sometimes delivered this step by accident.) Run
-  // one extra step here so the stop lands before we report "done".
-  // This now also catches a continuous Hold's own natural deadline
-  // (wasActive is isDriving(), above), not just a Segment's arrival --
-  // same mechanism, same reason.
+  // Settle before reporting "done". service() ends the move by posting
+  // kernel.neutral(), which reaches the MOTORS only on a LATER
+  // kernel.step() -- and a `while (tickDrive())` caller exits the
+  // moment this returns false. Without the extra stepping the wheels
+  // coast at the last commanded duty until the starvation watchdog's
+  // port-level stop ~100-150 ms later: +9-13 deg per turn, +15-22 mm
+  // per leg (bench root-cause, 2026-08-20). One extra step is not
+  // enough either -- its own encoder read can land mid-spin-down and
+  // freeze Output, and every post-move DIAG, at a nonzero velocity
+  // forever. settleToRest() (motion_engine.h, host-tested) keeps
+  // stepping, bounded, until both wheels witness the stop. Reached for
+  // a continuous Hold's natural deadline as well as a Segment's
+  // arrival, since `wasActive` is isDriving().
   if (wasActive && !moveActive) {
-    // Settling before reporting "done": kernel.neutral() only STAGES a
-    // zero command, and one extra step's own encoder read can land
-    // mid-spin-down, freezing Output -- and every post-move DIAG -- at
-    // a nonzero velocity forever (bench chart artifact: wheels "ending"
-    // at +4/-2.5 cm/s). settleToRest() (MotionEngine, host-tested) keeps
-    // stepping, bounded, until both wheels witness the actual stop --
-    // see its own comment (motion_engine.h) for the decision logic.
-    // KNOWN GAP: the decision logic is host-tested, but this call and
-    // odomUpdate(r) below are only ever exercised against real hardware
-    // (flashing) -- both need a real kernel.step() over real encoders.
-    // Odometry ownership is unchanged by the extraction: settleToRest()
-    // never touches Rig-local x/y/heading -- odomUpdate(r) is still
-    // this file's own call, immediately after.
     r.engine.settleToRest();
     odomUpdate(r);  // coast counts -> pose before the final TLM
   }
@@ -1203,48 +1045,36 @@ int diagValue(int what) {
     case 23: return static_cast<int>(ensure().left.glitchCount_);
     case 24: return static_cast<int>(ensure().right.glitchCount_);
     case 25: return static_cast<int>(ensure().engine.wrongWayCount());
-    // 26: SerialTransport::writeLine() drop count (ticket 006) -- the
-    // two-writer guard's retry cap exhausted, or a uBit.serial.send()
-    // call itself failed. Bench operators read this via probe(26); it
-    // should stay 0 during a normal run.
+    // 26: SerialTransport::writeLine() drops -- the two-writer guard's
+    // retry cap exhausted, or uBit.serial.send() itself failed.
+    // Nonzero means lines were lost off the serial link.
     case 26: return protocolSerialDropCount();
-    // 27: sum of both wheels' encoder rebaseline-on-discontinuity
-    // events (sprint 006 ticket 005, EncoderGlitchArmor's
-    // kAcceptAsRebaseline outcome -- see encoder_glitch_armor.h). A
-    // two-strike implausible-then-consistent jump treated as a counter
-    // restart (e.g. a brick MCU reset) instead of integrated as a
-    // multi-meter teleport. Should read 0 across a normal session with
-    // no discontinuities.
+    // 27: both wheels' encoder rebaselines -- an implausible-then-
+    // consistent jump treated as a counter restart (a brick MCU reset)
+    // instead of integrated as a multi-metre teleport. Nonzero means
+    // an encoder counter restarted mid-session.
     case 27:
       return static_cast<int>(ensure().left.rebaselineCount_ +
                               ensure().right.rebaselineCount_);
-    // 28: cleartext RUN payloads refused because every ring slot
-    // was still in flight. The predecessor to that ring silently
-    // overwrote unread payload instead, so a handler could run a
-    // command nobody sent; this counter is what makes the
-    // refusal visible. Should read 0 unless a host out-runs the
-    // robot.
+    // 28: cleartext RUN payloads refused because every ring slot was
+    // still in flight. Nonzero means a host out-ran the robot.
     case 28: return protocolRunDropCount();
-    // 29: emitLine() calls refused because the outbound emit ring was
-    // already full -- see comms/emit_queue.h and Protocol::emitLine()
-    // for the ring this counts. Should read 0 across a normal session;
-    // a nonzero value means a caller queued lines faster than this
-    // fiber's own loop could drain them onto the wire.
+    // 29: emitLine() calls refused because the outbound emit ring
+    // (comms/emit_queue.h) was full. Nonzero means a caller queued
+    // lines faster than the protocol fiber drained them onto the wire.
     case 29: return protocolEmitDropCount();
     // 30: cleartext RUN payloads refused by the bridge's SANITIZER --
-    // empty, overlong (>= 48 bytes), non-printable, or an empty name.
-    // Distinct from 28 above, which counts capacity refusals only: a
-    // command that vanished because it was one byte too long looked,
-    // from the relay, exactly like radio loss until this counter
-    // existed. Should read 0 unless a host is sending malformed lines.
+    // empty, >= 48 bytes, non-printable, or an empty name. Distinct
+    // from 28, which counts capacity refusals only; nonzero means a
+    // host is sending malformed lines (which look exactly like radio
+    // loss from the relay).
     case 30: return protocolRunMalformedCount();
-    // 31-34: the radio RX path, in the order "what arrived, what got
-    // through, and the two ways the rest did not". 31 counts complete
-    // single-fragment lines received; 32 those delivered into the RX
-    // slot; 33 those dropped because the previous line had not been
-    // drained yet; 34 those dropped for exceeding the 240-byte RX
-    // buffer (dropped whole, never truncated into a shorter still-
-    // parseable command). 31 - 32 == 33 + 34 on any healthy build.
+    // 31-34: the radio RX path -- what arrived, what got through, and
+    // the two ways the rest did not. 31 complete single-fragment lines
+    // received; 32 delivered into the RX slot; 33 dropped because the
+    // previous line was not drained yet; 34 dropped whole (never
+    // truncated) for exceeding the 240-byte RX buffer.
+    // 31 - 32 == 33 + 34 on any healthy build.
     case 31: return protocolRadioRxFrameCount();
     case 32: return protocolRadioRxAcceptedCount();
     case 33: return protocolRadioRxOverrunDropCount();
@@ -1293,22 +1123,15 @@ void setGeometry(int trackWidth, int calib) {  // [0.1 mm] [1e-4 mm/deg]
   if (calib > 0) r.engine.setTravelCalib(static_cast<float>(calib) * 1e-4f);
 }
 
-// ---- shaping-field descriptor table (this ticket, design S4.7's own
-// review-CO-05-scoped rationale: "one descriptor table replaces the
-// three parallel switches for the shaping fields") -----------------------
-// {ordinal, setter, field} rows that setKernelValue()/getConfigValue()
-// (below) both consult BEFORE falling into their own per-field switch --
-// every one of design S4.7's ten wire-name-table rows that maps onto a
-// MotionLimits member (v_floor/stop_distance/accel/decel/v_max/jerk/
-// omega_max/omega_floor/arrive_dist/arrive_yaw) lives here instead of as
-// a standalone `case N:` line. `setter` is one of MotionLimits' own
-// "positive, else keep" validated setters (motion_limits.h) -- called
-// through a pointer-to-member-function, exactly the way `field` (a
-// pointer-to-data-member) is read through -- so this table adds no
-// validation logic of its own; it only ROUTES. The rest of the config
-// surface -- every ordinal that is not a MotionLimits member -- is the
-// kConfigAccessors table immediately below, which both functions consult
-// second; between the two there is no per-field switch left in this file.
+// ---- shaping-field descriptor table ---------------------------------
+// {ordinal, setter, field} rows for the ten config ordinals that map
+// onto a MotionLimits member. setKernelValue()/getConfigValue() (below)
+// consult this table first and kConfigAccessors (below it) second;
+// between the two there is no per-field switch left in this file.
+// `setter` is one of MotionLimits' own "positive, else keep" validated
+// setters (motion_limits.h), called through a pointer-to-member-
+// function exactly as `field` is read through a pointer-to-data-member,
+// so this table adds no validation of its own -- it only ROUTES.
 namespace {
 struct LimitsFieldEntry {
   int ordinal;
@@ -1316,35 +1139,27 @@ struct LimitsFieldEntry {
   float MotionLimits::*field;
 };
 
-// this ticket, design S4.7's wire-name table: {ordinal, setter, field}
-// for the ten shaping ordinals -- kOrdinal/kSetter/kField values below
-// come straight from motion_limits.h's own "positive, else keep"
-// setters and public members (both declared there, see that header's
-// own comment for the naming rationale). Order matches the design
-// table's own row order, not declaration/ordinal order, so a reader
-// comparing the two side by side does not have to re-sort either one.
+// Row order follows design motion-profile-unification.md S4.7's own
+// wire-name table, NOT ordinal order, so the two read side by side
+// without re-sorting either.
 constexpr LimitsFieldEntry kLimitsFields[] = {
     {19, &MotionLimits::setAccel, &MotionLimits::accel},
     {20, &MotionLimits::setDecel, &MotionLimits::decel},
     {21, &MotionLimits::setVMax, &MotionLimits::vMax},
     {28, &MotionLimits::setJerk, &MotionLimits::jerk},
     {30, &MotionLimits::setOmegaMax, &MotionLimits::omegaMax},
-    // 8 (this ticket, K5): v_floor -- the ordinal is unchanged from the
-    // old kernel speed_floor, but the setter now writes HERE, not
-    // k.setSpeedFloor(); the kernel's own vMin stays pinned at 0
-    // (ensure()'s own Config seed comment above).
+    // 8: v_floor, the ordinal the kernel's old speed_floor used -- the
+    // setter writes HERE now, and the kernel's own vMin stays pinned at
+    // 0 (see ensure()'s Config seed above).
     {8, &MotionLimits::setVFloor, &MotionLimits::vFloor},
     {34, &MotionLimits::setOmegaFloor, &MotionLimits::omegaFloor},
-    // 18: stop_distance -- the ordinal is unchanged from the old
-    // pivot_overrun; see config_fields.h's row for the rename's own
-    // provenance.
+    // 18: stop_distance, on the ordinal the old pivot_overrun used;
+    // config_fields.h's row carries the rename's provenance.
     {18, &MotionLimits::setStopDistance, &MotionLimits::stopDistance},
     {35, &MotionLimits::setArriveDist, &MotionLimits::arriveDist},
     {36, &MotionLimits::setArriveYaw, &MotionLimits::arriveYaw},
-    // 37 (design S4.1/S10.2, NEW ordinal): lag --
-    // the drivetrain's own first-order response lag, [s]. See
-    // motion_limits.h's own field comment and config_fields.h's row
-    // for the provenance.
+    // 37: lag -- the drivetrain's first-order response lag [s]; see
+    // motion_limits.h's own field comment.
     {37, &MotionLimits::setLag, &MotionLimits::lag},
 };
 constexpr size_t kLimitsFieldCount =
@@ -1363,28 +1178,26 @@ const LimitsFieldEntry* findLimitsField(int ordinal) {
 // ordinals are answered by kLimitsFields above; every other one is a row
 // here.
 //
-// The wire NAMES these ordinals answer to are deliberately absent from
-// this file: they live once, in comms/config_fields.h, which
-// wire_adapter.cpp reads to turn a `SET <name>`/`GET <name>` into an
-// ordinal. That header is host-portable and this file is not (it
-// includes pxt.h, and every accessor below reaches into Rig, the kernel
-// or the motion engine), so the surface is split by portability, not by
-// preference: names and ordinals there, behaviour here, bound by the
-// ordinal and checked by tests/host/test_config_surface_single_source.py
-// -- which fails if either side names an ordinal the other does not.
-// Adding a field means one row in each, and nothing else; before this
-// table there were four hand-kept lists and the drift was visible in the
-// comments.
+// The wire NAMES these ordinals answer to live once, in
+// comms/config_fields.h, which wire_adapter.cpp reads to turn a
+// `SET <name>`/`GET <name>` into an ordinal. The surface is split by
+// portability, not preference: that header is host-portable and this
+// file is not (it includes pxt.h and reaches into Rig, the kernel and
+// the motion engine). Names and ordinals there, behaviour here, bound
+// by the ordinal and checked by
+// tests/host/test_config_surface_single_source.py, which fails if
+// either side names an ordinal the other does not. Adding a field means
+// one row in each, and nothing else.
 //
-// Values are UNSCALED in these accessors. setKernelValue()/
-// getConfigValue() below own the wire's x1000 integer convention, on the
-// way in and on the way out, exactly as they always have.
+// Values are UNSCALED in these accessors; setKernelValue()/
+// getConfigValue() below own the wire's x1000 integer convention on the
+// way in and on the way out.
 //
-// The accessors are named functions rather than lambdas written inline
-// in the table because a non-capturing lambda's conversion to a function
-// pointer only became a constant expression in C++17, and both embedded
-// targets compile at C++11 -- an inline-lambda table would be built by a
-// startup constructor into RAM instead of sitting in flash.
+// Named functions rather than lambdas written inline in the table: a
+// non-capturing lambda's conversion to a function pointer became a
+// constant expression only in C++17, and both embedded targets compile
+// at C++11 -- an inline-lambda table would be built into RAM by a
+// startup constructor instead of sitting in flash.
 namespace {
 
 float cfgGetMaxDuty(Rig& r) { return r.kernel.config().maxDuty; }
@@ -1484,25 +1297,19 @@ void cfgSetStallClear(Rig& r, float v) {
   if (v != 0.0f) r.kernel.clearStallLatch();
 }
 
-// rebase zeroes the odometry frame. It writes BOTH pose sources,
-// mirroring seedPose()'s own "write both" contract: the encoder-
-// integrated pose this file tracks AND the OTOS position register, so
-// the two stay agreed at the new zero instead of OTOS silently keeping
-// its old absolute reading.
+// rebase zeroes the odometry frame, writing BOTH pose sources
+// (seedPose()'s own "write both" contract): the encoder-integrated pose
+// this file tracks AND the OTOS position register, so the two stay
+// agreed at the new zero instead of OTOS keeping its old absolute
+// reading. Only Odometry::reset() happens synchronously -- the other
+// two are DEFERRED requests. kernel.rebasePosition() re-anchors at the
+// NEXT step(), and Odometry's position-epoch guard keeps that
+// legitimate discontinuity from reading as a spurious jump; the OTOS
+// zero arms pendingOtosZero for tickDrive() to service after
+// busGuard.release(), so the write lands on a fiber that owns the bus.
 //
-// Two of the three writes are DEFERRED requests, not synchronous
-// effects. kernel.rebasePosition() re-anchors the kernel's own position
-// tracking at its NEXT step(); Odometry's own position-epoch guard is
-// what keeps that later, legitimate discontinuity from reading as a
-// spurious jump. The OTOS zero is deferred the same way, by arming
-// pendingOtosZero for tickDrive() to service after busGuard.release() --
-// this used to be an otosRef().setPose(0,0,0) call right here, on
-// whichever fiber issued the SET, with no relationship to the bus guard
-// at all. Only Odometry::reset() happens synchronously.
-//
-// GET is refused upstream (wire_adapter.cpp's onGet()) rather than
-// answered from here: a rebase has no stored value and no latch worth
-// reading back, so any answer would be a manufactured 0.
+// GET is refused upstream (wire_adapter.cpp's onGet()): a rebase has no
+// stored value and no latch, so any answer would be a manufactured 0.
 float cfgGetRebase(Rig&) { return 0.0f; }
 void cfgSetRebase(Rig& r, float v) {
   if (v == 0.0f) return;
@@ -1525,21 +1332,16 @@ void cfgSetEstopClear(Rig& r, float v) {
 float cfgGetStraightTrim(Rig& r) { return r.kernel.config().straightTrim; }
 void cfgSetStraightTrim(Rig& r, float v) { r.kernel.setStraightTrim(v); }
 
-// goto_timeout: the deadline the next go-to gets (Rig::goToDeadline --
-// see that field's own comment for how it stopped being a bespoke
-// call-scoped handoff slot and became this row). Backed by a Rig field
-// rather than by the kernel's Config, exactly like default_cruise
-// above.
-//
-// 0 is a legal value here, unlike default_cruise's ">0, else keep":
-// engineGoToRArmed() passes whatever this holds straight to
-// MotionEngine::goToR() as its `timeout`, and 0 is that call's own
-// "already expired" -- refusing to store it would mean this field
-// could not read back the state the block layer can actually put the
-// robot in. Negative is refused: the cast below is undefined for it,
-// and the wire has no meaning for a deadline in the past. The upper
-// end needs no guard -- the wire's x1000 integer convention caps an
-// arriving value near 2.1e6 ms, far below what a uint32_t holds.
+// goto_timeout: the deadline the next go-to gets (Rig::goToDeadline),
+// backed by a Rig field rather than the kernel's Config, like
+// default_cruise above. 0 is LEGAL here, unlike default_cruise's
+// ">0, else keep": engineGoToRArmed() passes this straight to
+// MotionEngine::goToR() as `timeout`, where 0 means "already expired",
+// and refusing to store it would leave this field unable to read back a
+// state the block layer can put the robot in. Negative is refused (the
+// cast below is undefined for it, and a deadline in the past has no
+// wire meaning); the upper end needs no guard, since the wire's x1000
+// convention caps an arriving value near 2.1e6 ms.
 float cfgGetGoToDeadline(Rig& r) {
   return static_cast<float>(r.goToDeadline);
 }
@@ -1670,36 +1472,26 @@ void engineGoToR(float x, float y, float speed, float arrive,
 }
 
 // `//%`-annotated -- pre-arms the NEXT engineGoToRArmed() call's
-// deadline. Split out of what used to be a single five-parameter
-// engineGoToR() shim (sprint 015 ticket 006): a real PXT build of that
-// version reproduced "TS9200: Assertion failed" deterministically --
-// twice, including after make_deploy.py's one automatic retry for the
-// benign packaging-abort shape tools/DESIGN.md documents under the
-// same error code, so this was the ARITY, not a nondeterministic
-// abort. setTaperWindows()'s own comment already recorded an earlier
-// incident with the identical symptom; this build is what confirmed
-// it. Every `//%` shim in this file now stays at <=4 params. The
-// value lands in Rig::goToDeadline, which since sprint 033 ticket 004
-// is an ordinary config row (`goto_timeout`, ordinal 39) rather than a
-// private handoff slot -- see that field's own comment (above, in the
-// struct) for what did and did not change. This signature did not: one
-// caller (sim.ts's _setGoToDeadline(), called by motion.ts's
-// startGoTo() immediately before _goToR()), still writing the value
-// the very next go-to reads.
+// deadline, landing it in Rig::goToDeadline. PXT rejects a `//%` shim
+// carrying more than four parameters: a real build of the original
+// single five-parameter engineGoToR() shim reproduced "TS9200:
+// Assertion failed" deterministically, surviving make_deploy.py's one
+// automatic retry for the benign packaging abort that reports the same
+// error code. Every `//%` shim in this file therefore stays at <=4
+// params and this setter supplies the fifth argument. One caller
+// (sim.ts's _setGoToDeadline(), called by motion.ts's startGoTo()
+// immediately before _goToR()).
 //%
 void engineSetGoToDeadline(uint32_t timeout) {  // [ms]
   ensure().goToDeadline = timeout;
 }
 
 // `//%`-annotated -- same pre-arm shape as engineSetGoToDeadline()
-// immediately above, added so engineGoToRArmed() below can reconcile a
-// SEPARATE yaw-rate ceiling against `speed` (mirroring startMove()'s
-// existing (distance, yaw, speed, yawRate) shape) without becoming a
-// 5th engineGoToRArmed() parameter -- see Rig::pendingGoToYawRate_'s
-// own comment for why that would resurrect the exact packager crash
-// the deadline's own setter was split out to avoid. One caller only (sim.ts's _setGoToYawRate(),
-// called by motion.ts's startGoTo() immediately before _goToR(),
-// alongside _setGoToDeadline()).
+// immediately above (see it for the <=4-param rule), added so
+// engineGoToRArmed() below can reconcile a SEPARATE yaw-rate ceiling
+// against `speed`, mirroring startMove()'s own (distance, yaw, speed,
+// yawRate) shape. One caller only (sim.ts's _setGoToYawRate(), called
+// by motion.ts's startGoTo() alongside _setGoToDeadline()).
 //%
 void engineSetGoToYawRate(int yawRate) {  // [cdeg/s]
   ensure().pendingGoToYawRate_ = static_cast<float>(yawRate);

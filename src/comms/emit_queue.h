@@ -1,40 +1,29 @@
 // emit_queue.h -- the ring behind the outbound emit path.
 //
-// WHAT THIS REPLACES. The line a caller handed to the protocol's emit
-// path used to go straight onto the wire from whatever fiber called
-// it: a direct serial write followed by a direct radio mirror. That
-// made the calling fiber a second producer into the serial driver,
-// racing the protocol fiber's own writes -- see this module's caller
-// (Protocol::emitLine(), comms/protocol.cpp) for the full mechanism.
-// This ring turns that direct write into a copy-and-return: the text
-// is copied into a slot here, and only the fiber that owns this ring
-// ever reads a slot back out and puts it on the wire. That gives the
-// underlying transport writes exactly one caller, by construction,
-// regardless of how many fibers call enqueue().
+// Protocol::emitLine() can be called from ANY fiber. Writing the wire
+// there directly made the calling fiber a second producer into the
+// serial driver, racing the protocol fiber's own writes; this ring
+// turns that into a copy-and-return, so the transport writes have
+// exactly one caller by construction however many fibers enqueue().
 //
-// WHY DRAIN, NOT RANDOM ACCESS. Unlike a ring whose consumer reads a
-// specific slot back by index (see run_queue.h's own RunQueue, which
-// hands a MessageBus listener a slot number to read later), this
-// ring's only consumer is a drain loop that wants every line, in the
-// order it arrived, with nothing left keyed by index once it has been
-// read. dequeue() therefore both returns and releases the oldest slot
-// in one call, copying its text OUT to a caller-supplied buffer rather
-// than handing back an internal pointer -- the drain loop's own write
-// to the wire can block or yield, and a pointer into this ring's
-// storage would not survive a concurrent enqueue() landing in the same
-// slot across that yield.
+// WHY DRAIN, NOT RANDOM ACCESS. The only consumer is the protocol
+// fiber's own drain loop, which wants every line in the order it
+// arrived with nothing left keyed by index. dequeue() therefore both
+// returns AND releases the oldest slot, copying its text OUT to a
+// caller-supplied buffer rather than handing back an internal pointer
+// -- that write to the wire can block or yield, and a pointer into this
+// ring's storage would not survive an enqueue() landing in the same
+// slot across the yield.
 //
 // A refusal (ring full) counts rather than silently overwriting a
 // queued line, and the counter SATURATES rather than wrapping, same
-// convention as RunQueue -- a drop count that rolls over to zero reads
-// as "nothing was lost".
+// convention as RunQueue -- a drop count that rolled over to zero would
+// read as "nothing was lost".
 //
 // Host-portable on purpose -- no pxt.h, no CODAL types, nothing but
 // <cstdint>/<cstring> -- same split run_queue.h/heading_wrap.h/
-// encoder_glitch_armor.h already use: the logic worth testing lives
-// where a host test can reach it. Exercised host-side by the FIFO-order
-// and drop-counting behavior a dedicated pytest module drives through a
-// small ctypes shim (see tests/host/'s own test for this file).
+// encoder_glitch_armor.h already use, and exercised host-side through a
+// small ctypes shim (tests/host/'s own test for this file).
 #pragma once
 
 #include <cstdint>

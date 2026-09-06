@@ -56,10 +56,8 @@ bool engineGoToW(float x, float y, float speed, float arrive,
 // shims.cpp, for why that would be wrong).
 float engineGoToWChord(float worldX, float worldY);  // -> [mm]
 
-// ---- shims.cpp entry points (sprint 004 ticket 004) ---------------------
-// buildSnapshot()'s own five reads, reaching live pose/OTOS/wheel-speed
-// state -- every one of these already exists in shims.cpp today (this
-// ticket adds ZERO new entry points there), same same-package
+// ---- shims.cpp entry points: buildSnapshot()'s own five reads,
+// reaching live pose/OTOS/wheel-speed state. Same same-package
 // forward-declaration convention as every block above.
 //
 // THREE HAZARDS, each with real debugging history on this project:
@@ -77,11 +75,11 @@ float engineGoToWChord(float worldX, float worldY);  // -> [mm]
 //      primitive, a DIFFERENT, deliberately-not-named-here entry point
 //      from this ordinal-based cache accessor) -- an I2C transaction
 //      interposed in the Nezha encoder's select->read window destroys
-//      the sample (Phase F). See
-//      tests/host/test_wire_telemetry_projection.py's own source-text
-//      check for the enforcement: that blocking-read entry point's own
-//      name must appear NOWHERE in this file, comments included -- a
-//      one-careless-line-away, catastrophic, SILENT failure mode.
+//      the sample. Enforced by a source-text check in
+//      tests/host/test_wire_telemetry_projection.py: that blocking-read
+//      entry point's name must appear NOWHERE in this file, comments
+//      included -- a one-careless-line-away, catastrophic, SILENT
+//      failure mode.
 int poseX();          // [mm] MUTATES odometry -- see hazard 1 above
 int poseY();          // [mm] MUTATES odometry -- see hazard 1 above
 int poseHeading();    // [cdeg] MUTATES odometry -- see hazard 1 above
@@ -89,12 +87,10 @@ int otosGet(int what);  // CACHE ONLY -- see hazard 3 above; never the
                          // blocking-read entry point
 int wheelSpeed(int which);  // [mm/s]; which: 0 = left, 1 = right
 
-// ---- shims.cpp entry point (sprint 005 ticket 004: the motion-
-// completion signal, closing wire-motion-completion-signal.md/R-23) ----
-// The ONE genuinely new read this ticket needs (sprint.md's own Design
-// Rationale) -- true iff MotionEngine's own move-engine state is
-// currently active, read-only, thin, matching engineWheelsX()'s own
-// forward-declaration convention exactly. Used only by
+// ---- shims.cpp entry point: the motion-completion signal ----
+// True iff MotionEngine's own move-engine state is currently active --
+// read-only, thin, matching engineWheelsX()'s own forward-declaration
+// convention exactly. Used only by
 // resolvePendingReason() (below) for the three goal-directed verbs
 // (MOVE_X/GO_TO_R/GO_TO_W); WHEELS_V/WHEELS_X/MOVE_V never need it
 // (they never make MotionEngine's move-engine state active in the
@@ -165,11 +161,9 @@ constexpr int kDiagWedgeRight = 7;
 constexpr int kDiagVelocityLeft = 14;
 constexpr int kDiagVelocityRight = 15;
 
-// Sprint 004 ticket 004 additions -- otosGet(7)'s connected/disconnected
-// boolean (R-22/WIRE-06's fix for status()'s own out.otos, below) and
-// diagValue()'s numeric FULL-column ordinals (sprint.md Phase B / the
-// issue's own column table; shims.cpp's diagValue() switch is the
-// authority for these numbers).
+// otosGet(7)'s connected/disconnected boolean (status()'s own out.otos,
+// below) and diagValue()'s numeric FULL-column ordinals. shims.cpp's
+// diagValue() switch is the authority for these numbers.
 constexpr int kOtosConnected = 7;      // otosGet(int), NOT diagValue()
 constexpr int kDiagI2cFault = 8;       // -> STATUS `i2cf=` and the `i2cf` column
 constexpr int kDiagLeaseExpiryCount = 9;   // -> `lexc`
@@ -184,7 +178,6 @@ constexpr int kDiagWrongWayCount = 25;     // -> `wrng`
 // LOCAL flags layout's own free function, extracted (unchanged bit
 // layout) so STATUS's `flags=` and the telemetry `flags` column read
 // the SAME computation instead of two independently-editable copies
-// (sprint.md's own Design Rationale; status-lost-diag-numeric-surface.md).
 // Called from both status() and buildSnapshot() below.
 uint32_t computeFlags() {
   uint32_t flags = 0;
@@ -206,7 +199,7 @@ const char* tlmModeWireName(Wire::TlmMode mode) {
     case Wire::TlmMode::kFull: return "full";
     case Wire::TlmMode::kAuto: return "auto";
     // kBuffer can never reach mode_ (onTlm() below refuses it,
-    // kUnimplemented, before assignment -- sprint 008 ticket 005), so
+    // kUnimplemented, before assignment), so
     // this arm is as unreachable via status()/buildSnapshot() as kNow's,
     // immediately below -- kept only so this switch stays exhaustive
     // against a future TlmMode enumerator.
@@ -223,7 +216,7 @@ const char* tlmModeWireName(Wire::TlmMode mode) {
 // motion-api.md S9.1: "Angles are degrees at the API and milliradian
 // integers on the wire ... The conversion lives in the binding, in one
 // place." This is that one place: MOVE_X's wire `rotation` field and
-// MOVE_V's wire `omega` field (sprint 003 ticket 012) both arrive here
+// MOVE_V's wire `omega` field both arrive here
 // as a milliradian INTEGER, already decoded into this float by
 // wire_handler.cpp; MotionEngine::moveX()/moveV() (motion_engine.h) both
 // want RADIANS (or radians-per-second, for `omega`), their own native
@@ -275,18 +268,11 @@ uint32_t WireAdapter::now() const {
   return now_ != nullptr ? now_() : 0;
 }
 
-// Sprint 004 ticket 004 closes the numeric half of the gap the comment
-// below used to describe (status-lost-diag-numeric-surface.md):
-// `i2cf=<n>` now rides STATUS via the SAME diagValue(kDiagI2cFault) call
-// the telemetry `i2cf` column reads, so the two can never disagree.
-// FULL's other seven numeric columns (posl/posr/dutl/dutr/lexc/wrng/
-// cycovr) still have no STATUS-level equivalent -- they are telemetry,
-// not status, per the issue's own resolution of that split (see
-// buildSnapshot() below); only `i2cf` was judged genuinely status-shaped
-// (SUC-005). R-22/WIRE-06 (code review 2026-08-23) also fixed here:
-// `out.otos` used to hardcode false with a comment claiming no OTOS was
-// wire-reachable -- false even at the time it was written, since
-// otosGet(7) already existed and engineGoToW() already gated on it.
+// `i2cf=<n>` rides STATUS via the SAME diagValue(kDiagI2cFault) call the
+// telemetry `i2cf` column reads, so the two can never disagree. FULL's
+// other seven numeric columns (posl/posr/dutl/dutr/lexc/wrng/cycovr)
+// have no STATUS-level equivalent on purpose -- they are telemetry, not
+// status; only `i2cf` is genuinely status-shaped.
 void WireAdapter::status(Wire::StatusFields& out) const {
   out.ready = diagValue(kDiagReady) != 0;
   const bool estopped = diagValue(kDiagEstopped) != 0;
@@ -295,10 +281,10 @@ void WireAdapter::status(Wire::StatusFields& out) const {
 
   out.connLeft = diagValue(kDiagConnLeft) != 0;
   out.connRight = diagValue(kDiagConnRight) != 0;
-  // R-22/WIRE-06 fix: otosGet(7) is the SAME connected/disconnected
-  // boolean engineGoToW() (shims.cpp) already gates its own dispatch on
-  // -- STATUS can no longer claim "no OTOS" while a GO_TO_W move is
-  // actively using one. otosGet() reads a cache; this is not a
+  // otosGet(7) is the SAME connected/disconnected boolean engineGoToW()
+  // (shims.cpp) gates its own dispatch on, so STATUS cannot claim "no
+  // OTOS" while a GO_TO_W move is actively using one. otosGet() reads a
+  // cache; this is not a
   // fresh-sample blocking read (see this file's own forward-declaration
   // block for why that distinction is load-bearing).
   out.otos = otosGet(kOtosConnected) != 0;
@@ -310,12 +296,11 @@ void WireAdapter::status(Wire::StatusFields& out) const {
 
   out.flags = computeFlags();
   out.i2cf = diagValue(kDiagI2cFault);
-  // Sprint 010 ticket 003: same seam as i2cf immediately above, same
-  // reasoning -- diagValue(kDiagCycleCount) is the SAME call FULL
-  // telemetry's `cyc` column reads (buildSnapshot() below), so a
-  // never-ticked kernel (cyc == 0) and a ticked-but-unreachable-brick
-  // kernel (cyc > 0, connL/connR possibly still 0) are distinguishable
-  // from STATUS alone (unpowered-nezha-brick-wedges-program-at-boot.md).
+  // Same seam as i2cf immediately above: diagValue(kDiagCycleCount) is
+  // the SAME call FULL telemetry's `cyc` column reads, so a never-ticked
+  // kernel (cyc == 0) and a ticked-but-unreachable-brick kernel
+  // (cyc > 0, connL/connR possibly still 0) are distinguishable from
+  // STATUS alone.
   out.cyc = static_cast<uint32_t>(diagValue(kDiagCycleCount));
 
   out.tlm = tlmModeWireName(mode_);
@@ -330,8 +315,8 @@ Wire::Result WireAdapter::onWheelsV(float left, float right,
   // (wire_adapter.h).
   if (externalOwner_ != MotionOwner::kNone) return Wire::Result::kBusy;
   if (duration > kWheelsVDurationCeiling) return Wire::Result::kRange;
-  // WIRE-08 (code review 2026-08-23): refuse BEFORE the cast below runs
-  // at all -- see kWireBoundaryCastCeiling's own doc comment
+  // Refuse BEFORE the cast below runs at all -- see
+  // kWireBoundaryCastCeiling's own doc comment
   // (wire_adapter.h) for why an unclamped static_cast<int> here is
   // platform-dependent UB for a wire-legal but absurd value, and why
   // this bound is what keeps the cast well-defined (and therefore
@@ -345,8 +330,8 @@ Wire::Result WireAdapter::onWheelsV(float left, float right,
   // is exact, no rounding needed, now that the range check above rules
   // out the one region where "exact" stops being true.
   //
-  // sprint 005 ticket 004: resolve any still-pending PREVIOUS motion as
-  // "superseded" BEFORE dispatching this one, not after -- setWheelsTimed()
+  // Resolve any still-pending PREVIOUS motion as "superseded" BEFORE
+  // dispatching this one, not after -- setWheelsTimed()
   // below calls MotionEngine::wheelsV(), whose FIRST act is cancelMove()
   // (motion-api.md S6: "wheels_* clears the planner"); if the previous
   // pending motion was goal-directed (MOVE_X/GO_TO_R/GO_TO_W),
@@ -384,7 +369,7 @@ Wire::Result WireAdapter::onWheelsX(float left, float right, float cruise,
   const float resolvedCruise =
       cruise == 0.0f ? engineDefaultCruise() : cruise;
   if (resolvedCruise <= 0.0f) return Wire::Result::kRange;
-  // sprint 005 ticket 004: see onWheelsV()'s identical comment above --
+  // See onWheelsV()'s identical comment above --
   // engineWheelsX() below routes onto MotionEngine::wheelsX(), which
   // ALSO calls cancelMove() first, same "wheels_* clears the planner"
   // rationale.
@@ -426,8 +411,8 @@ Wire::Result WireAdapter::onMoveX(float distance, float rotation,
                 engineDominantAxisTravel(distance, engineRotation))
           : cruise;
   if (resolvedCruise <= 0.0f) return Wire::Result::kRange;
-  // sprint 005 ticket 004: resolve any still-pending PREVIOUS motion
-  // BEFORE dispatching -- unlike WHEELS_V/WHEELS_X/MOVE_V,
+  // Resolve any still-pending PREVIOUS motion BEFORE dispatching --
+  // unlike WHEELS_V/WHEELS_X/MOVE_V,
   // engineMoveX() below does not call cancelMove() (it overwrites this
   // engine's own `move_` state directly, motion_engine.cpp), so this
   // ordering is not strictly required for correctness the way it is
@@ -452,7 +437,7 @@ Wire::Result WireAdapter::onMoveV(float v_x, float omega, uint32_t duration,
   // Shares WHEELS_V's own ceiling and "duration is the lease" rationale
   // -- see kWheelsVDurationCeiling's own doc comment (wire_adapter.h).
   if (duration > kWheelsVDurationCeiling) return Wire::Result::kRange;
-  // sprint 005 ticket 004: see onWheelsV()'s identical comment above --
+  // See onWheelsV()'s identical comment above --
   // engineMoveV() below routes onto MotionEngine::moveV(), which itself
   // calls wheelsV() (motion_engine.cpp), so the SAME cancelMove()
   // side-effect ordering hazard applies here.
@@ -489,8 +474,8 @@ Wire::Result WireAdapter::onGoToR(float x, float y, float speed, float arrive,
   const float resolvedSpeed =
       speed == 0.0f ? resolveDefaultCruise(std::hypot(x, y)) : speed;
   if (resolvedSpeed <= 0.0f) return Wire::Result::kRange;
-  // sprint 005 ticket 004: see onMoveX()'s identical comment above --
-  // GOAL-DIRECTED, same as MOVE_X.
+  // See onMoveX()'s identical comment above -- GOAL-DIRECTED, same as
+  // MOVE_X.
   if (now_ != nullptr) forceResolvePending(Wire::DoneReason::kAborted);
   engineGoToR(x, y, resolvedSpeed, arrive, timeout);
   if (now_ != nullptr) {
@@ -521,18 +506,17 @@ Wire::Result WireAdapter::onGoToW(float x, float y, float speed, float arrive,
       speed == 0.0f ? resolveDefaultCruise(engineGoToWChord(x, y))
                     : speed;
   if (resolvedSpeed <= 0.0f) return Wire::Result::kRange;
-  // Sprint 006 ticket 007: engineGoToW() now falls back to encoder
-  // odometry when no OTOS is connected (motion-api.md S3.6) rather than
-  // refusing, so this call always dispatches in the current
-  // implementation -- see this method's own doc comment (wire_adapter.h)
+  // engineGoToW() falls back to encoder odometry when no OTOS is
+  // connected (motion-api.md S3.6) rather than refusing, so this call
+  // always dispatches -- see this method's own doc comment
+  // (wire_adapter.h)
   // for why the `!engineGoToW(...)` check below is nonetheless kept.
   if (!engineGoToW(x, y, resolvedSpeed, arrive, timeout)) {
     return Wire::Result::kUnimplemented;
   }
   // only armed on the path that actually dispatched a move.
   if (now_ != nullptr) {
-    // sprint 005 ticket 004: GOAL-DIRECTED, same as MOVE_X/GO_TO_R --
-    // but UNLIKE those two (and unlike the three lease-style verbs),
+    // GOAL-DIRECTED, same as MOVE_X/GO_TO_R -- but UNLIKE those two (and unlike the three lease-style verbs),
     // this supersede resolution stays AFTER the dispatch call above,
     // not before: whether this GO_TO_W call dispatches at all is
     // exactly what `!engineGoToW(...)` above just decided, so there is
@@ -554,46 +538,28 @@ Wire::Result WireAdapter::onGoToW(float x, float y, float speed, float arrive,
 
 void WireAdapter::onEstop() {
   // ESTOP -> estopAll() -> kernel.estop() + emergencyStopMotors() +
-  // engine.endMove(): the handler itself never inspects this method's
-  // return (void, per wire_handler.h's own Adapter::onEstop() contract)
-  // -- it replies `estop` unconditionally after calling this.
+  // engine.endMove(). The handler never inspects this method's return
+  // (void, per wire_handler.h's own Adapter::onEstop() contract) -- it
+  // replies `estop` unconditionally after calling this.
   estopAll();
-  // sprint 005 ticket 004: resolve whatever motion was still pending as
-  // kEstop, RIGHT NOW, UNCONDITIONALLY -- deliberately NOT going through
-  // forceResolvePending()'s usual "trust resolvePendingReason()'s own
-  // natural resolution first" path (every other force-resolve call site
-  // in this file does), because a real ESTOP has two hazards that path
-  // cannot see past:
-  //   1. diagValue(kDiagEstopped) is a published Output field
-  //      (shims.cpp's publishOutput(), mirrored by the host test
-  //      double) that only updates on the kernel's NEXT step() -- it
-  //      cannot yet read true here, no matter how real this estop is.
-  //   2. estopAll() above already force-ends any in-flight goal-directed
-  //      move (engine.endMove()), so engineMoveActive() already reads
-  //      false for a pending MOVE_X/GO_TO_R/GO_TO_W -- resolvePendingReason()
-  //      would misread that as "reached its own stop condition" (kStop)
-  //      rather than "estopped," since hasLiveMotionObligation() is
-  //      still true at this exact instant (see point 3 below).
-  // ESTOP is this class's own highest-priority reason
-  // (resolvePendingReason()'s own priority order checks it before
-  // anything else, including kStall) -- there is never a MORE specific
-  // NATURAL reason for this call to defer to the way onStop() below
-  // correctly defers to an already-latched kStall, so committing
-  // unconditionally is not a shortcut, it is the correct rule for this
-  // one reason.
+  // Commit kEstop UNCONDITIONALLY, rather than going through
+  // forceResolvePending() the way every other force-resolve site here
+  // does: diagValue(kDiagEstopped) is a published field that does not
+  // update until the kernel's NEXT step(), and estopAll() has already
+  // ended any in-flight engine move -- so resolvePendingReason() would
+  // see an inactive move with a still-live deadline and misread this as
+  // kStop. ESTOP is also this class's highest-priority reason, so there
+  // is no more specific natural reason to defer to.
   if (pendingActive_) {
     lastDoneId_ = pendingId_;
     lastDoneReason_ = Wire::DoneReason::kEstop;
     pendingActive_ = false;
   }
-  // 3. Cleared AFTER the commit above, not before: motionObligationActive_
-  // feeds hasLiveMotionObligation(), which a NATURAL (non-ESTOP)
-  // resolution above would have needed to read correctly -- clearing it
-  // first would corrupt that read for no benefit, since this commit
-  // does not consult it anyway. An e-stop must still revert
-  // protocol.cpp's fiber loop to its idle poll immediately, not keep
-  // ticking until a now-meaningless deadline elapses (same rationale
-  // sprint 002's original obligation-clearing handleEstop() documented).
+  // Cleared AFTER that commit, not before: motionObligationActive_
+  // feeds hasLiveMotionObligation(), which any natural resolution would
+  // have needed to read correctly. An e-stop must still revert
+  // protocol.cpp's fiber loop to its idle poll immediately rather than
+  // ticking out a now-meaningless deadline.
   motionObligationActive_ = false;
 }
 
@@ -606,8 +572,7 @@ Wire::Result WireAdapter::onStop(bool /*immediate*/, uint32_t /*id*/) {
   // DiffDriveAdapter documents for its own onStop() override
   // (protocol.md S5.1: "both are immediate at the kernel level").
   stopAll();
-  // sprint 005 ticket 004: an explicit STOP ends whatever motion was
-  // still pending -- "the stop condition was met, or stop() ended it"
+  // An explicit STOP ends whatever motion was still pending -- "the stop condition was met, or stop() ended it"
   // (Wire::DoneReason::kStop's own doc comment, wire_handler.h).
   // forceResolvePending() gives resolvePendingReason() first refusal, so
   // an already-stalled pending motion keeps kStall instead of being
@@ -633,8 +598,8 @@ Wire::Result WireAdapter::onStop(bool /*immediate*/, uint32_t /*id*/) {
 bool WireAdapter::motionObligationDeadlineLive() const {
   if (!motionObligationActive_ || now_ == nullptr) return false;
   const uint32_t sample = now_();  // [ms]
-  // Wraparound-safe elapsed check (signed-difference idiom), same one
-  // sprint 002's original obligation tracking used in protocol.cpp.
+  // Wraparound-safe elapsed check (signed-difference idiom), the same
+  // one protocol.cpp's own obligation tracking uses.
   return static_cast<int32_t>(sample - motionObligationDeadline_) < 0;
 }
 
@@ -652,7 +617,7 @@ bool WireAdapter::hasLiveMotionObligation() const {
   return motionObligationDeadlineLive();
 }
 
-// ---- sprint 005 ticket 004: motion-completion resolution (S8.8) --------
+// ---- motion-completion resolution (S8.8) ----
 // See wire_adapter.h's own comment on lastDone()/lastDoneReason() for the
 // full design; this is the implementation.
 
@@ -663,7 +628,7 @@ Wire::DoneReason WireAdapter::resolvePendingReason() const {
   // right answer for whatever motion was in flight when it happened.
   // Both already reach this class through the SAME diagValue() path
   // computeFlags() uses for STATUS's `flags=` and telemetry's `flags`
-  // column -- no new plumbing (sprint.md's own Design Rationale).
+  // column -- no new plumbing.
   if (diagValue(kDiagEstopped) != 0) return Wire::DoneReason::kEstop;
   if (diagValue(kDiagStallHalted) != 0) return Wire::DoneReason::kStall;
   if (pendingGoalDirected_) {
@@ -692,8 +657,7 @@ Wire::DoneReason WireAdapter::resolvePendingReason() const {
   }
   // WHEELS_V/WHEELS_X/MOVE_V: no engine read needed -- these resolve
   // entirely from the SAME lease-deadline bookkeeping
-  // motionObligationDeadlineLive() already provides ("no new dependency
-  // needed for these three verbs," sprint.md's own Design Rationale).
+  // motionObligationDeadlineLive() already provides.
   // A still-live lease means not yet resolved; an elapsed one with
   // nothing having superseded or stopped it (both handled elsewhere,
   // see forceResolvePending()) means it simply ran out the clock.
@@ -708,10 +672,9 @@ void WireAdapter::resolvePendingIfDue() const {
   lastDoneId_ = pendingId_;
   lastDoneReason_ = reason;
   pendingActive_ = false;
-  // sprint 016 ticket 003 (closing wire-motion-obligation-never-clears.md):
-  // this commit already knows the motion is over -- the NATURAL-completion
-  // clearing point that was missing before (only onEstop()/onStop() ever
-  // cleared this flag). `reason` was computed by resolvePendingReason()
+  // This commit already knows the motion is over -- the
+  // NATURAL-completion clearing point, the one onEstop()/onStop() alone
+  // cannot supply. `reason` was computed by resolvePendingReason()
   // just above, which itself reads the pre-clear value of
   // motionObligationActive_ (via motionObligationDeadlineLive()) for the
   // lease-style branch -- so clearing it AFTER that read, not before, is
@@ -732,8 +695,8 @@ void WireAdapter::forceResolvePending(Wire::DoneReason forcedReason) {
   lastDoneId_ = pendingId_;
   lastDoneReason_ = reason;
   pendingActive_ = false;
-  // sprint 016 ticket 003: same clearing this method's own doc comment
-  // (wire_adapter.h) describes -- covers the "a later verb supersedes a
+  // Same clearing this method's own doc comment (wire_adapter.h)
+  // describes -- covers the "a later verb supersedes a
   // still-live earlier one" (kAborted) path, which runs BEFORE the *new*
   // verb re-arms motionObligationActive_ = true a few lines later in the
   // same onXxx() handler (wire_adapter.cpp's six onWheelsV()/onWheelsX()/
@@ -812,7 +775,7 @@ Wire::Result WireAdapter::onSet(const char* name, float value, uint32_t id) {
       (hasLiveMotionObligation() || engineMoveActive())) {
     return Wire::Result::kBusy;
   }
-  // WIRE-08 (code review 2026-08-23): `value` arrives with no ceiling
+  // `value` arrives with no ceiling
   // of its own (parseFloatField, wire_handler.cpp, accepts any finite
   // float) -- setKernelValue()'s own x1000 scaling convention can turn
   // an absurd-but-legal field value into a product that overflows
@@ -839,34 +802,26 @@ const char* WireAdapter::fieldName(size_t index) const {
 }
 
 Wire::Result WireAdapter::onTlm(Wire::TlmMode mode) {
-  // Sprint 008 ticket 005 (closing tlm-auto-buffer-column-set-undefined.md):
-  // TLM BUFFER refuses -- kUnimplemented, wire err 6 -- right here, BEFORE
-  // mode_ is ever touched: no buffering mechanism exists anywhere in this
-  // codebase to give "buffer" real, narrower column-set semantics yet
-  // (DESIGN.md S14's own Design Rationale), so answering err is more
-  // honest than emitting a column set nobody specified. This is a MERITS
+  // TLM BUFFER refuses -- kUnimplemented, wire err 6 -- right here,
+  // BEFORE mode_ is ever touched: no buffering mechanism exists to give
+  // "buffer" real, narrower column-set semantics, so answering err is
+  // more honest than emitting a column set nobody specified. A MERITS
   // rejection, not a decode failure (decodeTlm()/parseTlmMode() already
-  // accept "BUFFER" as a well-formed token) -- same "ack unconditionally,
-  // then err on top, state left unchanged" shape wire_handler.cpp's
-  // clampMotionTimeout()-based refusals already established for the six
-  // motion verbs (sprint 008 ticket 001). mode_ is left exactly as it
-  // was, so a host with e.g. TLM POSE already active keeps getting POSE
-  // frames after a refused TLM BUFFER -- it is NOT silently switched to
-  // off or to any other mode.
+  // accept "BUFFER" as well-formed) -- same "ack unconditionally, then
+  // err on top, state left unchanged" shape as the six motion verbs'
+  // clampMotionTimeout() refusals. mode_ is left exactly as it was, so
+  // a host with TLM POSE active keeps getting POSE frames after a
+  // refused TLM BUFFER.
   if (mode == Wire::TlmMode::kBuffer) return Wire::Result::kUnimplemented;
   // TLM NOW is a one-shot request in the CURRENT subscription's shape,
   // not a new subscription (protocol.md S6.1: "does not change mode") --
   // so it is deliberately never stored into mode_. Instead it arms
   // oneShotTelemetryDue_, which consumeOneShotTelemetry() (below) hands
-  // to protocol.cpp's fiber loop -- previously this arm was the ONLY
-  // thing missing: nothing ever read a "one-shot due" signal, so TLM
-  // NOW acked kOk and emitted nothing at all. TLM AUTO is a
-  // documented ALIAS for TLM POSE as of this same ticket -- it stores
-  // mode_ = kAuto here like any other mode, but buildSnapshot() below
-  // already treats every stored mode other than kFull identically, so
-  // kAuto needs no separate branch there to behave exactly like kPose
-  // (same 12 columns, same cadence). Everything else (kOff/kPose/kFull/
-  // kAuto) becomes the persisted mode.
+  // to protocol.cpp's fiber loop. TLM AUTO is a documented ALIAS for
+  // TLM POSE: it stores mode_ = kAuto like any other mode, but
+  // buildSnapshot() below treats every stored mode other than kFull
+  // identically, so kAuto needs no separate branch there. Everything
+  // else (kOff/kPose/kFull/kAuto) becomes the persisted mode.
   if (mode == Wire::TlmMode::kNow) {
     oneShotTelemetryDue_ = true;
   } else {
@@ -926,14 +881,11 @@ const Wire::Snapshot& WireAdapter::buildSnapshot() {
   columns_[i++] = {"vr", vr, false};
   columns_[i++] = {"i2cf", i2cf, false};
 
-  // FULL adds these 8; every other mode this adapter can actually reach
-  // here is kPose or kAuto -- kAuto is a documented ALIAS for kPose
-  // (sprint 008 ticket 005: same 12 columns, same cadence, no separate
-  // branch needed); kOff never reaches this call at all (telemetryEnabled()
-  // gates it, see protocol.cpp's fiber loop); kBuffer can never reach
-  // mode_ in the first place -- onTlm() above refuses it before
-  // assignment. See this file's own buildSnapshot() doc comment,
-  // wire_adapter.h, for the full decision.
+  // FULL adds these 8; every other mode reachable here is kPose or
+  // kAuto (a documented ALIAS for kPose -- same 12 columns, same
+  // cadence, no separate branch needed). kOff never reaches this call
+  // (telemetryEnabled() gates it) and kBuffer can never reach mode_ at
+  // all -- onTlm() above refuses it before assignment.
   if (mode_ == Wire::TlmMode::kFull) {
     columns_[i++] = {"cyc", static_cast<int32_t>(diagValue(kDiagCycleCount)),
                      false};

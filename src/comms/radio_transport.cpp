@@ -110,8 +110,7 @@ void RadioTransport::onDatagram() {
 void RadioTransport::sendFragmented(const uint8_t* payload,
                                     size_t payloadLen) {
   // MICROBIT_RADIO_MAX_PACKET_SIZE is whatever this build's CODAL
-  // target actually compiles with -- see this file's header comment
-  // and sprint.md Open Question 1. Computed locally (not as a
+  // target actually compiles with. Computed locally (not as a
   // class-level constant) so this translation unit has no static
   // initialization-order dependency on the macro.
   constexpr int kMaxFrame = MICROBIT_RADIO_MAX_PACKET_SIZE;

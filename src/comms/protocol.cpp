@@ -40,62 +40,33 @@ namespace {
 
 // ---- identity constants ----------------------------------------------
 // Assembled into a Wire::Identity by Protocol::buildIdentity() below.
-//   - name: microbit_friendly_name() (silicon-derived, unique per
-//     board). mbdeploy keys its device registry off this field, so a
-//     fixed string here would stomp the registry across the fleet.
-//   - serial: microbit_serial_number() -- genuinely unique per device.
-//   - kDrivetrain = this extension's kinematic type (matches the
-//     package name); kProfile = which robot's config this hex was
-//     BUILT AGAINST -- deploy-time build-target selection, NOT board
-//     identity (radio-robot-lib's per-robot config filename stem, e.g.
-//     "vevov" or "tovez" -- matches the elite reference design's
-//     Config::kRobotProfileName, "baked from the robot JSON's own ...
-//     filename stem"). Injected per-robot at DEPLOY time, into the
-//     SCRATCH COPY only, by tools/make_deploy.py's _inject_profile() --
-//     the same scratch-copy-only substitution _inject_radio_channel()
-//     performs for radio_transport.h's kChannel. This repo's own
-//     checked-in literal below is therefore never a real fleet robot
-//     name: it is the UN-BAKED default, so a build run with no
-//     --robot (or built outside make_deploy.py entirely) cannot be
-//     mistaken for, or impersonate, any board on the fleet. (Before
-//     this injection existed, kProfile was a hand-written constant
-//     frozen fleet-wide at "tovez" -- every board, including vevov,
-//     reported "tovez" over ID. That was the defect this injection
-//     fixes for BUILD PROVENANCE; it does not make kProfile board
-//     identity -- `name` above (identity.name) is the wire's sole
-//     authoritative board identity, because it is read from silicon at
-//     call time and cannot be stale, whereas `profile` is only ever as
-//     correct as the build that produced it. `profile` and `name` can
-//     legitimately disagree on one ID reply: `profile` says which
-//     robot's config the hex targeted, `name` says which physical
-//     board is actually answering. That disagreement IS the
-//     diagnostic -- it means this board was flashed with the wrong
-//     robot's build -- so never "fix" it by forcing the two to match.
-//     Note this also decouples kProfile from shims.cpp's Rig tuning
-//     defaults -- which bake those constants are actually measured
-//     from is a separate, currently-contradictory question, tracked as
-//     its own issue, not settled by this constant.)
-//   - kVersion: the BUILD version, `0.YYYYMMDD.n`, injected at deploy
-//     time by tools/make_deploy.py's _inject_version() from
-//     pyproject.toml (which config/dotconfig.yaml keeps in step via
-//     `dotconfig version bump`). Same scratch-copy-only mechanism as
-//     kProfile and kChannel, so the checked-in literal below is a
-//     PLACEHOLDER, never a real build's version.
+//   - name: microbit_friendly_name(), read from silicon at call time --
+//     THE authoritative board identity, and what mbdeploy keys its
+//     device registry off, so a fixed string here would stomp that
+//     registry fleet-wide.
+//   - serial: microbit_serial_number(), unique per device.
+//   - kDrivetrain: this extension's kinematic type (matches the package
+//     name).
+//   - kProfile: which robot's config this hex was BUILT AGAINST
+//     (radio-robot-lib's per-robot config filename stem, e.g. "vevov").
+//     Build PROVENANCE, never board identity.
+//   - kVersion: the BUILD version, `0.YYYYMMDD.n`, from pyproject.toml.
+//     NOT pxt.json's extension semver, which moves only on release and
+//     so answers "which build is on this robot?" identically for every
+//     firmware between two releases; that semver still governs how
+//     MakeCode resolves the extension, a different question.
 //
-//     It used to mirror pxt.json's "1.0.10"-style EXTENSION semver
-//     instead. That was changed 2026-08-27, by stakeholder direction,
-//     because the extension version is a poor answer to the question
-//     VER actually gets asked: "which build is on this robot?" It moves
-//     only when the extension is released, so every firmware built
-//     between two releases reports an identical VER -- and on
-//     2026-08-27 that cost hours, with two robots on visibly different
-//     firmware both answering `ver 1.0.10` and nothing on the wire able
-//     to tell them apart. The build version moves on every commit, so
-//     VER (and ID's third field) now identify the image.
+// kProfile and kVersion are injected at DEPLOY time into the SCRATCH
+// COPY only (tools/make_deploy.py's _inject_profile()/_inject_version()),
+// the same substitution _inject_radio_channel() performs on
+// radio_transport.h's kChannel -- so the checked-in "unbaked" literals
+// below can never impersonate a fleet board or a real build.
 //
-//     pxt.json's semver is unaffected and still governs how MakeCode
-//     resolves the extension -- a different question, deliberately not
-//     answered by this constant any more.
+// `profile` and `name` can legitimately DISAGREE on one ID reply:
+// profile says which robot's config the hex targeted, name says which
+// physical board is answering. That disagreement IS the diagnostic --
+// this board was flashed with the wrong robot's build -- so never
+// "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
 constexpr const char* kVersion = "unbaked";  // injected by make_deploy.py;
@@ -147,22 +118,9 @@ constexpr uint32_t kPollInterval = 5;  // [ms]
 void Protocol::emitLine(const char* text) {
   if (text == nullptr) return;
   size_t len = 0;
-  // Sprint 008 ticket 002 (WIRE-05/R-21): this clip now names
-  // RadioTransport::kMaxPayloadBytes directly instead of re-declaring
-  // its own bare 200 literal. The bare literal had drifted from a
-  // parity claim into a silent defect: SerialTransport::kMaxLineBytes
-  // was raised to 240 (sprint 004 ticket 005), radio_transport.h's own
-  // doc comment kept claiming this cap "equals" that bound, and this
-  // clip stayed at 200 regardless -- so a 201-239 byte result line
-  // truncated silently on ANY transport, not only radio's. Naming the
-  // shared constant closes that gap: kMaxPayloadBytes is deliberately
-  // the TIGHTER of the two transports' caps (radio's real capacity, not
-  // serial's 240 -- see radio_transport.h's own updated comment), so a
-  // line this call clips never depends on which transport happens to
-  // carry it, and the two can never drift apart silently again.
-  // kMaxPayloadBytes moved from private to public on RadioTransport to
-  // make this reference possible (one-line access-specifier change, no
-  // encapsulation cost -- radio_transport.h).
+  // Clip by NAME to RadioTransport::kMaxPayloadBytes, never to a
+  // literal of this call's own: the two drifted apart silently once,
+  // and a 201-239 byte line then truncated on EVERY transport.
   while (text[len] != '\0' && len < RadioTransport::kMaxPayloadBytes) ++len;
   if (len == 0) return;
   // No transport write here any more -- copy into the ring and return.

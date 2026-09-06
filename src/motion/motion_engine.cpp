@@ -452,17 +452,11 @@ bool MotionEngine::service() {
       kernel_.neutral();
       if (seg_.hasPending) {
         // 6.4: the pivot->straight handoff goes through rest. neutral()
-        // above only STAGES the stop -- delivery (and the kernel's own
-        // reference disarm) happens on the caller's NEXT step(). K4's
-        // rearmReferences() disarms the twist-hold/position references
-        // too, at the START of that same next step(), so phase 2
-        // re-anchors fresh instead of carrying phase 1's accumulated
-        // reference. beginPendingStraightPhase() builds phase 2 as a
-        // brand-new Segment (originPending = true, shaper_ reset) but
-        // issues no drive() of its own (S6.5's lazy start) -- the
-        // FOLLOWING service() tick captures its origin and issues its
-        // first command, by which point the neutral+rearm above has
-        // actually landed.
+        // above only STAGES the stop; it lands, and rearmReferences()
+        // disarms the twist-hold/position references, on the caller's
+        // NEXT step(). Phase 2 therefore re-anchors fresh instead of
+        // carrying phase 1's accumulated reference, and issues its own
+        // first command a tick later still (S6.5's lazy start).
         kernel_.rearmReferences();
         beginPendingStraightPhase();
         return seg_.active;

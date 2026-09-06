@@ -1,12 +1,6 @@
 namespace diffDrive {
     // ================= stopping ======================================
 
-    // Stop group (sprint 021 ticket 004, approved layout in
-    // block-toolbox-groups-reorganization.md): the three top-level
-    // safety controls (stop, emergency stop, is stalled) outweigh the
-    // two latch-clearing blocks (clear emergency stop, clear stall
-    // latch), which stay advanced -- recovery, not stopping.
-
     /**
      * Stop driving (normal stop).
      */

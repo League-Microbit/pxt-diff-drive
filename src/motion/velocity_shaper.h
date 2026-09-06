@@ -52,12 +52,7 @@ class VelocityShaper {
   //            planning/predicting arrival against the command alone
   //            over-brakes late and lands long (design S6.3, MEASURED
   //            tovez 2026-09-04). `< 0` (the default) means "unknown,
-  //            use this shaper's own last commanded speed instead" --
-  //            a regression guard: with `measured < 0` AND `lim.lag ==
-  //            0` (MotionLimits' own default) every branch below is
-  //            bit-identical to the formula this parameter's addition
-  //            replaced, so a caller that does not yet supply a
-  //            measured speed sees no behavior change at all.
+  //            use this shaper's own last commanded speed instead".
   Step advance(float target, float remain, float floor, float cap, float dt,
                const MotionLimits& lim, float measured = -1.0f);
 

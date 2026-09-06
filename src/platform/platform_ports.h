@@ -20,19 +20,12 @@ class CodalClock final : public DiffDrive::Clock {
 // HAZARD -- READ BEFORE CHANGING EITHER METHOD BELOW.
 //
 // These two calls are where this extension yields the CPU, and a yield
-// under CODAL is not free. The build enables the hardware FPU
-// (-mfpu=fpv4-sp-d16 -mfloat-abi=softfp) but CODAL's swap_context saves
-// only R0-R12/SP/LR -- it contains no VFP instructions at all. GCC uses
-// the callee-saved bank s16-s31 (= d8-d15) as ordinary spill space, for
-// POINTERS as well as floats, so whatever a parked fiber left there is
-// destroyed by the next fiber that does arithmetic.
-//
-// MEASURED gopiv 2026-09-01 (pyOCD on a fault-spin build): the protocol
-// fiber parked an object pointer in s17 across its poll sleep, a tour
-// fiber's PID wrote a wheel speed over it, and the protocol fiber woke
-// and dereferenced float -25.0f as `this`. Precise bus error, board
-// reset. See the yield-discipline invariant in this package's design
-// notes, and the knowledge article under docs/, for the full forensics.
+// under CODAL is not free: the context switch saves no FPU registers,
+// so a parked fiber's spilled locals -- POINTERS as well as floats --
+// can be destroyed by the next fiber that does arithmetic. vfp_guard.h
+// carries the mechanism, the measurement behind it, and why the
+// vfpSafe* wrappers below are the fix. Never yield here except through
+// them.
 //
 // This class is also the single choke point through which the VENDORED
 // kernel yields: DifferentialDrive::step()'s two encoder settle sleeps

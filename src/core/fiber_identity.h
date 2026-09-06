@@ -4,16 +4,15 @@
 // EVERY call, from whatever fiber happens to call it -- a dispatched
 // job's own tick loop on the protocol fiber, a wire motion obligation
 // on the protocol fiber, or a MessageBus button-handler fiber calling
-// tickDrive() directly. Before this fix the hook gated on a piece of
-// STATE (whether a job was believed to be running), not on which fiber
-// was actually calling -- so a second fiber's tickDrive() call during a
-// live job satisfied that state check and ran the wire dispatcher a
-// second time, concurrently, corrupting its shared line buffer mid-
-// yield.
+// tickDrive() directly. The hook may only ever run on the ONE fiber
+// that is Protocol's own -- the fiber Protocol::run() itself executes
+// on -- because a second, concurrent entry into the wire dispatcher
+// corrupts its shared line buffer mid-yield. Only fiber IDENTITY
+// catches that: a gate on STATE (whether a job is believed to be
+// running) is satisfied by a second fiber's tickDrive() call during a
+// live job, and lets it through.
 //
-// The fix compares fiber IDENTITY instead: the hook may only ever run
-// on the one fiber that is Protocol's own -- the fiber Protocol::run()
-// itself executes on. This function is that comparison, extracted into
+// This function is that comparison, extracted into
 // a host-portable pure function (no pxt.h, no CODAL type -- both ids
 // are opaque pointers, compared for identity only, never dereferenced)
 // so tests/host/test_fiber_identity_gate.py can pin fake ids on both

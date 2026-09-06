@@ -2,6 +2,9 @@ namespace diffDrive {
     // =========== internal shims (simulator fallback bodies) ==========
     // Hardware uses the C++ in shims.cpp; the bodies below are a
     // minimal kinematic stand-in so programs behave in the browser.
+    //
+    // Every shim body here must contain a statement: pxt emits an empty
+    // {} as native-only and the simulator crashes at the call site.
 
     let simX = 0            // [mm]
     let simY = 0            // [mm]
@@ -129,31 +132,13 @@ namespace diffDrive {
         simIntegrate()
         if (simEstopped) return
         simVel = (left + right) / 2
-        // Differential-drive kinematics: omega [rad/s] = (v_right -
-        // v_left) [mm/s] / trackWidth [mm] -- the same relation
-        // _driveTwist() below applies in reverse (its hardware shim
-        // computes `twist = yaw * 0.5 * effectiveTrackWidth()`,
-        // shims.cpp). Hardware's own divisor is NOT trackWidth_ alone:
-        // it is effectiveTrackWidth() = trackWidth_ / rotationalSlip_
-        // (motion_engine.h). _driveTwist() below needs no matching
-        // update: it converts yawRate straight to rad/s with no
-        // trackWidth divisor of its own, because hardware's own
-        // multiply-by-effectiveTrackWidth()-then-divide-by-it round trip
-        // (twist -> wheelsV -> omega) cancels algebraically for ANY
-        // trackWidth/slip value -- the two paths' observable yaw rate
-        // is exactly equal without _driveTwist() ever reading either
-        // one. The simulator's contract is exact parity on *observable*
-        // kinematic output, not a physical model of hardware's
-        // calibration mechanism -- rotationalSlip_ corrects for a real
-        // wheel imperfection this idealized simulator has no equivalent
-        // of -- so this divides by the same two constituent values
-        // (simTrackWidth / simRotationalSlip, just above -- now live
-        // state, not fixed constants) rather than growing its own
-        // "slip" concept. (Previously divided by trackWidth_ alone via a
-        // bare 115 literal -- a 4.3% discrepancy against hardware and
-        // against _driveTwist() below. Before that, divided by 10 first
-        // as well, an erroneous effective 1150 mm track that turned 10x
-        // too slowly -- R-12/BLK-06.)
+        // omega [rad/s] = (vR - vL) [mm/s] / effectiveTrackWidth [mm],
+        // where effectiveTrackWidth = trackWidth / rotationalSlip
+        // (motion_engine.h) -- the same divisor _driveTwist() inverts on
+        // hardware (`twist = yaw * 0.5 * effectiveTrackWidth()`,
+        // shims.cpp), which is why _driveTwist() below needs no divisor
+        // of its own: that round trip cancels for any trackWidth/slip
+        // pair, so both paths' observable yaw rate is equal.
         simYawRate = (right - left) / (simTrackWidth / simRotationalSlip)  // [rad/s]
         simMoveActive = false
     }
@@ -220,28 +205,14 @@ namespace diffDrive {
         return simMoveActive
     }
 
-    // [ms] -- pre-arms the NEXT _goToR() call's deadline. Split out of
-    // what used to be a single five-parameter _goToR()/engineGoToR()
-    // shim pair (sprint 015 ticket 006): a real PXT build of that
-    // version reproduced "TS9200: Assertion failed" deterministically,
-    // surviving make_deploy.py's own retry for the benign packaging-
-    // abort shape tools/DESIGN.md documents under the same error code
-    // -- so this was the arity, not a nondeterministic abort. See
-    // shims.cpp's engineSetGoToDeadline()/engineGoToRArmed() for the
-    // native side of this same split. `timeout` was always a
-    // hardware-only deadline backstop the simulator never used (see
-    // _goToR()'s own comment below), so this is a genuine no-op here
-    // -- nothing to store, nothing for _goToR() below to read.
+    // [ms] -- Two shims, not one: a five-parameter shim annotation fails
+    // the PXT packager (TS9200; the full account is on shims.cpp's
+    // engineSetGoToDeadline()). Deadline is pre-armed here for the very
+    // next _goToR().
     //% shim=diffDrive::engineSetGoToDeadline
     export function _setGoToDeadline(timeout: number): void {  // [ms]
         // Simulator: no-op. `timeout` is a hardware-only deadline
-        // backstop; nothing can strand a move in this simulator. The
-        // explicit `return` below is load-bearing, not decorative: a
-        // body with zero statements -- even one containing only this
-        // comment -- is indistinguishable, to pxt, from a bare `{}`.
-        // Both are emitted as a native-only shim call with no pxsim
-        // implementation, crashing the simulator exactly like this
-        // file's other previously-empty-bodied shims.
+        // backstop; nothing can strand a move in this simulator.
         return
     }
 
@@ -261,40 +232,24 @@ namespace diffDrive {
         simPendingGoToYawRate = yawRate
     }
 
-    // [mm] [mm] [mm/s] [mm] -- simulator stand-in for
-    // MotionEngine::goToR()'s arc reduction (motion_engine.cpp): bearing
-    // = atan2(y, x), turn angle theta = 2*bearing wrapped to the short
-    // arc (|theta| <= pi, same wrap goToR() applies, KERN-03) so a
-    // target behind the robot turns the short way, not almost a full
-    // circle. Unlike _startMove() below (which now mirrors the real
-    // motion engine's own >=50 deg pivot-then-straight split), this
-    // reduction is always a single blended arc regardless of angle --
-    // an arc-length/arc-angle pair reissued as pivot-then-straight
-    // would land at a DIFFERENT point than the arc it was computed
-    // for (arc length != chord length except in the limit), so goToR's
-    // own reduction deliberately never splits; it reaches (x, y)
-    // exactly by construction instead. FOUR params, not five: the
-    // fifth (`timeout`, a hardware-only deadline backstop -- nothing
-    // can strand a move in this simulator) moved to _setGoToDeadline()
-    // immediately above, matching shims.cpp's native-side split.
-    // Params typed `number`, matching the rest of this file's
-    // shim-fallback functions now that none of them declares an int32
-    // local/parameter -- int32 locals/params on a function with a TS
-    // body fail the JS->Blocks decompiler with TS9256. The native shim
-    // ABI is governed by the C++ signature, not this declaration, so
-    // `number` here is hardware-safe.
+    // [mm] [mm] [mm/s] [mm]. Simulator stand-in for
+    // MotionEngine::goToR() (motion_engine.cpp): bearing = atan2(y, x),
+    // turn angle theta = 2*bearing wrapped to the short arc (|theta| <=
+    // pi, KERN-03) so a target behind the robot turns the short way.
+    // Sim reaches (x, y) as one blended arc; hardware's >=50 deg
+    // pivot-then-chord split lands at the same point, so no split is
+    // modelled here. FOUR params, not five -- the fifth (`timeout`)
+    // moved to _setGoToDeadline() above.
+    //
+    // Params typed `number`, not `int32`: an int32 local/param on a
+    // function with a TS body fails the JS->Blocks decompiler with
+    // TS9256. The native shim ABI comes from the C++ signature, not
+    // this declaration, so `number` here is hardware-safe.
     //
     // `speed` and the pre-armed `simPendingGoToYawRate` are two
-    // INDEPENDENT rate ceilings (mirroring _startMove()'s own `speed`/
-    // `yawRate` pair) reconciled into a single `duration` here --
-    // whichever axis takes LONGER at its own ceiling governs, same
-    // "whichever axis takes longer governs" reconciliation
-    // _startMove()'s non-split (blended) branch above already applies,
-    // not the pivot-then-straight budget its split branch uses: this
-    // reduction never splits (see this function's own comment above),
-    // so there is only ever one blended segment to budget for. Fixes
-    // the pivot arc previously always running at whatever angular rate
-    // `speed` alone implied, ignoring "set default turn rate" entirely.
+    // INDEPENDENT rate ceilings reconciled into one `duration` below --
+    // whichever axis takes LONGER at its own ceiling governs, the same
+    // reconciliation _startMove()'s blended branch applies.
     //% shim=diffDrive::engineGoToRArmed
     export function _goToR(x: number, y: number, speed: number,
         arrive: number): void {
@@ -339,23 +294,15 @@ namespace diffDrive {
     // active, matching the hardware contract that continuous-mode
     // driving depends on.
     //
-    // Returns `simMoveActive || simVel != 0 || simYawRate != 0` (sprint
-    // 007 ticket 002, closes R-10/API-01) -- the simulator-state mirror
-    // of shims.cpp's `commandLooksActive(r)`, not raw `simMoveActive`.
-    // simIntegrate() (just above) already zeroed simVel/simYawRate
-    // synchronously, in this same call, if a position-mode move
-    // completed on this step -- there is no motor coast-down to model
-    // in the browser, so no settle-loop equivalent is needed the way
-    // shims.cpp's tickDrive() needs one on hardware -- so a move's final
-    // tick still returns false here, same as before. A continuous-mode
-    // command (setWheelSpeeds()/driveTwist(), which leave
-    // simMoveActive == false but simVel/simYawRate nonzero) now keeps
-    // this true instead of returning false on the very first tick, the
-    // same fix as shims.cpp's own. See
+    // Returns "anything still commanded" (move active or nonzero
+    // velocity), matching shims.cpp's commandLooksActive(): a continuous
+    // drive keeps the loop alive; a finished move ends it on the same
+    // call, because simIntegrate() above already zeroed simVel/
+    // simYawRate synchronously (no motor coast-down to model in the
+    // browser). See
     // tests/host/test_continuous_drive_command_looks_active.py for the
-    // host-side proof of the equivalent hardware condition (this
-    // simulator body itself is not host-testable -- no automated check
-    // reaches this TypeScript layer; see this ticket's C++11 Gate Coverage).
+    // host-side proof of the equivalent hardware condition -- no
+    // automated check reaches this TypeScript layer itself.
     //% shim=diffDrive::tickDrive
     export function _tickDrive(): boolean {
         simIntegrate()
@@ -408,13 +355,10 @@ namespace diffDrive {
         simEstopped = false
     }
 
-    // Stall latch clear/readback (sprint 007 ticket 001): no-ops in the
-    // simulator -- there is no stall model in the browser, matching
-    // this file's existing precedent for setGeometry/setKernelValue's
-    // simulator fallbacks (specification.md §5). Real (if trivial) body
-    // below, not a bare `{}`: pxt emits an empty-bodied shim as
-    // native-only, and no pxsim implementation exists, so the simulator
-    // crashes at the call site.
+    // Stall latch clear/readback: no-ops in the simulator -- there is no
+    // stall model in the browser, matching this file's existing
+    // precedent for setGeometry/setKernelValue's simulator fallbacks
+    // (specification.md §5).
     //% shim=diffDrive::clearStall
     export function _clearStallLatch(): void {
         return
@@ -460,10 +404,7 @@ namespace diffDrive {
     // (ConfigField.RotationalSlip in blocks/motion.ts; wire name
     // "rotational_slip") to the paired simRotationalSlip state; every
     // other field still has no simulator model and stays a silent
-    // no-op, same as before. Both keep real (if partial) bodies, not
-    // bare `{}`: an empty body is emitted by pxt as native-only, and no
-    // pxsim implementation exists for either, so the simulator crashes
-    // at the call site.
+    // no-op, same as before.
 
     //% shim=diffDrive::setGeometry
     export function _setGeometry(trackWidth: number, calib: number): void {  // [0.1 mm] [1e-4 mm/deg]
@@ -565,10 +506,7 @@ namespace diffDrive {
     export function otosGet(what: number): number { return 0 }
 
     // Sim fallbacks below report a sensor that is absent (see this
-    // section's header comment); real (if trivial) bodies, not bare
-    // `{}`, so pxt doesn't treat them as native-only shims (no pxsim
-    // implementation exists for any of the three, so an empty body
-    // would crash the simulator at the call site).
+    // section's header comment).
     //% shim=diffDrive::otosZero
     export function otosZero(): void {
         return
@@ -617,14 +555,8 @@ namespace diffDrive {
     }
 
     // Registers the callback protocol.cpp's dispatchJob() invokes
-    // directly once per dequeued RUN command (replacing the old
-    // control.onEvent()-based MessageBus registration). The simulator
-    // has no wire and never dequeues a RUN command, so this has nothing
-    // to model -- a real (if trivial) body, not a bare `{}`, for the
-    // same reason every other shim-only stub in this file has one: an
-    // empty body is emitted by pxt as native-only, and no pxsim
-    // implementation exists, which crashes the simulator at the call
-    // site.
+    // directly once per dequeued RUN command. The simulator has no wire
+    // and never dequeues one, so this has nothing to model.
     //% shim=diffDrive::registerRunDispatch
     export function _registerRunDispatch(cb: () => void): void {
         return
@@ -640,10 +572,7 @@ namespace diffDrive {
 
     // Recorded so the "setup radio" block (blocks/run.ts) is observable
     // in the simulator; there is no radio in the browser, so this has no
-    // other in-sim effect to model. Real (if trivial) body, not a bare
-    // `{}` -- an empty body is emitted by pxt as native-only, and no
-    // pxsim implementation exists, which crashes the simulator at the
-    // call site (the exact defect fixed elsewhere in this file).
+    // other in-sim effect to model.
     let simRadioChannel = 4
     let simRadioGroup = 10
     let simRadioEnabled = false

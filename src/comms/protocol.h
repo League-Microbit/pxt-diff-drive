@@ -1,40 +1,31 @@
 // protocol.h -- Protocol: the CODAL protocol fiber and byte plumbing
-// between SerialTransport/RadioTransport and the v6 wire stack
+// between SerialTransport/RadioTransport/WifiLink and the v6 wire stack
 // (wire_handler.h/.cpp, wire_adapter.h/.cpp). Knows nothing of the v6
 // grammar, the reliability layer, or any verb's own behavior -- all of
-// that lives behind wireHandler_/wireHandlerRadio_/wireAdapter_.
+// that lives behind wireHandler_/wireHandlerRadio_/wireHandlerWifi_/
+// wireAdapter_.
 //
-// One exception, preserved deliberately: the OLD cleartext
-// "RUN:<name>[:<arg>...]" bridge (handleRun()/dispatchJob()/the
-// runBridge_ object below) coexists with v6 on the same wire -- detected
-// directly by its literal "RUN:" prefix before a line ever reaches the
-// v6 stack (no verb registry involved -- see run()'s own comment). It
-// is the ONLY path that feeds the by-name test-trigger dispatch
-// test.ts actually uses: v6's own RUN verb (wire_adapter.cpp's
-// WireAdapter::onRun()) is kUnknown.
+// Cleartext "RUN:<name>[:<arg>...]" is the ONE carve-out, matched by
+// its literal "RUN:" prefix before a line reaches the v6 stack, on
+// every transport. It exists because v6's own RUN verb
+// (WireAdapter::onRun()) answers kUnknown, so this is the only path
+// into the by-name test-trigger dispatch test.ts uses.
 //
-// The radio transport speaks the full v6 grammar too, through a SECOND
-// WireHandler (wireHandlerRadio_, below) composed over the SAME
-// wireAdapter_ instance the serial handler uses -- not a second
-// adapter: two adapters would let a sequence gap on one transport nack
-// the OTHER transport's next command, which is exactly the corruption
-// the second-handler structure exists to prevent. The old-style
-// cleartext RUN: carve-out above is preserved on radio too, as a
-// fallback, unchanged -- see run()'s own radio-polling block.
-// `emitLine()` below -- the free function shims.cpp's test-result
-// reporting already uses -- queues onto a Protocol-owned ring rather
-// than writing to either transport directly; this fiber's own loop
-// drains it every pass. An untethered bench run's results still reach
-// a listening host, just through one more level of indirection than
-// before, and only ever written by this fiber.
+// Each transport gets its OWN WireHandler over the SAME wireAdapter_ --
+// never a second adapter: two adapters would let a sequence gap on one
+// transport nack the OTHER transport's next command, which is exactly
+// the corruption this structure prevents. Each handler keeps its own
+// expectedNext_.
 //
-// This project's own telemetry is real and shipped on the v6 wire
-// stack: WireHandler::emitTelemetry(Snapshot) (see its own doc comment
-// for the thdr/t frame format) replaces the old v5 cleartext
-// "TLM:<ms>:..." line entirely. tools/tour_run.py, tools/tour_capture.py,
-// tools/tour_watch.py, and this repo's other bench scripts read the
-// thdr/t stream directly -- retrofitted onto it in full; no TLM:
-// parsing remains anywhere in this tree.
+// emitLine() below queues onto a Protocol-owned ring rather than
+// writing a transport directly, and this fiber's loop drains it every
+// pass -- so an untethered bench run's result lines still reach a
+// listening host, and only this fiber ever writes a wire.
+//
+// Telemetry is the v6 thdr/t frame stream
+// (WireHandler::emitTelemetry(Snapshot), see its own doc comment for
+// the format); the bench scripts read it directly and no cleartext
+// "TLM:" parsing remains anywhere in this tree.
 #pragma once
 
 #include <cstddef>
@@ -62,76 +53,55 @@ class Protocol {
   // DifferentialDrive::start()'s own idempotent guard.
   void start();
 
-  // Queue one caller-supplied text line for emission on BOTH transports
-  // -- this consolidates what used to be two separate single-transport
-  // emitters into the one path anything wanting both wires mirrored now
-  // uses. Exists because the test programs' result lines (tour fixes,
-  // calibration data, timings) were written with TypeScript's
-  // `serial.writeLine`, which reaches the USB cable only -- and the USB
-  // cable only reaches the bench stand, where the wheels are off the
-  // ground. Every test that needs the robot to actually move therefore
-  // runs untethered, and its results have to come back over the radio.
+  // Queue one caller-supplied text line for emission on BOTH transports.
+  // Callable from ANY fiber (shims.cpp's emitLine is the TS-facing
+  // caller): it clips to RadioTransport::kMaxPayloadBytes, copies into
+  // emitQueue_ and returns, touching no transport. Only this object's
+  // own fiber (run(), via drainEmitQueue()) ever writes a transport for
+  // this path, so two fibers can never race one underlying serial write.
   //
-  // Called from the TS layer (shims.cpp's emitLine), on whatever fiber
-  // that call happens to run on -- NOT this object's own fiber. This
-  // clips the line and copies it into emitQueue_, then returns: it no
-  // longer touches transport_/radioTransport_ itself. Only this
-  // object's own fiber (Protocol::run(), via drainEmitQueue()) ever
-  // writes either transport, so two fibers can never race the same
-  // underlying serial write again. The tradeoff: a caller can no longer
-  // assume the line is physically on the wire by the time this call
-  // returns, only that it is queued for the next drain pass (at most
-  // one poll interval later); and a full ring drops the newest line
-  // rather than blocking the caller, counted rather than silent (see
-  // emitLineNow()'s own comment for where the actual writes happen).
+  // The tradeoff: a caller cannot assume the line is physically on the
+  // wire when this returns, only that it is queued for the next drain
+  // (at most one poll interval later); a full ring drops the NEWEST
+  // line, counted (emitDropCount()) rather than silent.
+  //
+  // It exists because TypeScript's `serial.writeLine` reaches the USB
+  // cable only, and the cable only reaches the bench stand: anything
+  // that has to actually move runs untethered, so its results have to
+  // come back over the radio.
   void emitLine(const char* text);
 
   // The text of whichever RUN command is CURRENTLY being dispatched --
   // the whole payload after `RUN:`, e.g. "pivot:180". Valid only while
-  // dispatchJob()'s (or the abort/clearestop bypass's) own call into the
-  // registered RUN dispatch callback is executing, on THIS fiber -- see
-  // RunBridge::currentText()'s own comment for why a nested reentrant
-  // dispatch (abort arriving mid-job) can never corrupt an outer job's
-  // already-consumed text. Called from the TS layer (shims.cpp's
-  // now-zero-argument runCommandText() -- the old
-  // MessageBus-event-carries-a-slot-number indirection this used to
-  // read through is gone).
+  // the registered RUN dispatch callback is executing, on THIS fiber;
+  // see RunBridge::currentText() for why a nested reentrant dispatch
+  // (an abort arriving mid-job) cannot corrupt an outer job's
+  // already-consumed text. Read from TS via shims.cpp's
+  // runCommandText().
   const char* currentRunText() const;
 
   // The take/release pair every MOTION entry point in shims.cpp
   // (startMove()/driveTwist()/engineGoToRArmed()) brackets its own call
-  // span with -- tryTakeMotionOwnership() up front, releaseBlockOwnership()
-  // (below) once tickDrive()/the starvation watchdog/the explicit stop
-  // paths (endMove()/stopAll()/estopAll()) next find the drivetrain idle.
+  // span with: take up front, release once tickDrive()/the starvation
+  // watchdog/an explicit stop path (endMove()/stopAll()/estopAll())
+  // next finds the drivetrain idle.
   //
-  // This used to be a plain kBlock take (tryTakeBlockOwnership()) --
-  // refused unconditionally whenever motionOwner_ was anything but
-  // kNone, INCLUDING kJob. That refused a dispatched RUN job's own
-  // move: dispatchJob() (below) sets motionOwner_ = kJob and then calls
-  // the TS handler SYNCHRONOUSLY, on THIS fiber, so the handler's own
-  // startMove()/driveTwist() call was indistinguishable from a genuine
-  // block-program caller arriving mid-job -- both saw motionOwner_ ==
-  // kJob and were refused, silently (the caller still emitted its
-  // normal completion receipts). tryTakeMotionOwnership() (below)
-  // resolves that: it computes whether THIS call is running on
-  // Protocol's own fiber (the same fiber-identity comparison
-  // serviceHookEntry() already makes, core/fiber_identity.h) and, if
-  // so AND motionOwner_ is already kJob, lets the call through
-  // unchanged -- that is the job's OWN move, not a competitor for the
-  // drivetrain. A genuine block caller (a different fiber -- a button
-  // handler, a student script) still applies the UNCHANGED kBlock
-  // take/refuse rule: refused, never silently superseding, whenever
-  // motionOwner_ is kWire, kJob, or an already-taken kBlock. Both rules
-  // are the SAME pure decision core/motion_owner.h defines
-  // (tryTakeMotionOwnership(), host-tested there directly) -- a release
-  // is a no-op unless currently kBlock, exactly as before (the job-own-
-  // fiber bypass never sets kBlock, so it has nothing here to release;
-  // dispatchJob() itself owns clearing kJob once runDispatch() returns).
-  // Public (not private, unlike motionOwner_ itself) so the free-
-  // function seam beside these methods' own definitions (protocol.cpp)
-  // can reach them from shims.cpp, the same "public method, free-
-  // function forward-declaration wrapper" shape currentRunText() above
-  // already uses for protocolCurrentRunText().
+  // Two rules, one pure decision core (core/motion_owner.h, host-tested
+  // there directly). A call arriving on Protocol's OWN fiber while
+  // motionOwner_ is already kJob is the dispatched job's own move and
+  // passes through unchanged -- dispatchJob() sets kJob and then calls
+  // the TS handler SYNCHRONOUSLY on this fiber, so without that branch
+  // the handler's own startMove() is indistinguishable from a
+  // competitor arriving mid-job and is refused silently. Any other
+  // fiber (a student script, a button handler) gets the UNCHANGED
+  // kBlock rule: refused, never silently superseding, whenever
+  // motionOwner_ is kWire, kJob or an already-taken kBlock. A release
+  // is a no-op unless currently kBlock -- the job-own-fiber branch
+  // never sets kBlock, and dispatchJob() clears kJob itself.
+  //
+  // Public (unlike motionOwner_) so the free-function seam beside these
+  // definitions (protocol.cpp) can reach them from shims.cpp, the same
+  // shape currentRunText() above uses.
   bool tryTakeMotionOwnership();
   void releaseBlockOwnership();
 
@@ -157,9 +127,7 @@ class Protocol {
   // than the RX buffer.
   //
   // frames - accepted is the whole story of what the radio heard and
-  // could not keep. The first two used to exist as members nothing ever
-  // incremented, which answered that question with a permanent,
-  // confident zero.
+  // could not keep.
   uint32_t radioRxFrameCount() const;
   uint32_t radioRxAcceptedCount() const;
   uint32_t radioRxOverrunDropCount() const;
@@ -171,14 +139,12 @@ class Protocol {
   // session.
   uint32_t emitDropCount() const;
 
-  // SerialTransport::writeLine()'s drop counter (ticket 006), surfaced
-  // for shims.cpp's diagValue(26)/probe(26). Same same-package
-  // forward-declaration boundary as emitLine()/currentRunText() above:
-  // shims.cpp reaches this via a free-function wrapper
-  // (protocolSerialDropCount(), protocol.cpp) rather than including
-  // this header directly, so it never pulls in radio_transport.h (see
-  // protocol.h's own top-of-file comment on why that matters to PXT's
-  // dependency scan).
+  // SerialTransport::writeLine()'s drop counter, surfaced for
+  // shims.cpp's diagValue(26)/probe(26). Same free-function boundary as
+  // emitLine()/currentRunText() above: shims.cpp reaches this through
+  // protocolSerialDropCount() (protocol.cpp) rather than including this
+  // header, so it never pulls radio_transport.h into its own include
+  // graph.
   int serialDropCount() const;
 
   // Configure the radio AND bring the v6 radio link up -- the ONE write
@@ -195,14 +161,14 @@ class Protocol {
   void setupRadio(uint8_t channel, uint8_t group);
 
   // Bring the v6 radio link up on whatever channel/group are already
-  // configured -- i.e. the per-robot channel tools/make_deploy.py
-  // injected into kChannel at deploy time, and group 10.
+  // configured -- i.e. the per-robot pair tools/make_deploy.py injected
+  // into kChannel/kGroup at deploy time (radio_transport.h).
   //
   // This is what the on-robot test program (test/test.ts) calls. It
   // deliberately does NOT take a channel: hardcoding one there would
-  // override the deploy injection and put every `--robot tovez` build on
-  // vevov's channel. Students get setupRadio() instead, where naming the
-  // channel is the point.
+  // override the deploy injection and put every robot's build on one
+  // board's channel. Students get setupRadio() instead, where naming
+  // the channel is the point.
   void enableRadio();
 
   // Bring the v6 WiFi link up (Planet X Ai-WB2-12F on RJ11 J1 -- see
@@ -236,63 +202,48 @@ class Protocol {
   void emitWifiDebug();
 
   // ---- single executor -- motionOwner_ arbitration -------------------
-  // Exactly one execution model remains for engine-facing motion: this
-  // fiber. motionOwner_ (MotionOwner, core/motion_owner.h) arbitrates
-  // which caller currently holds the drivetrain -- kNone (idle), kWire
-  // (a live wire motion obligation, set/cleared by run()'s own loop
-  // around its tickDrive() call), kJob (a dispatched RUN job, set/
-  // cleared by dispatchJob() around its call into the TS handler), or
-  // kBlock (the block program's own fiber -- a student's own move()/
-  // driveTwist()/startDrive() call, or a MessageBus button handler
-  // calling one of those directly -- taken/released via
-  // tryTakeMotionOwnership()/releaseBlockOwnership() below, reached from
-  // shims.cpp through the free-function seam beside those methods; a
-  // dispatched job's OWN call into those same shims.cpp entry points
-  // takes the OTHER branch of tryTakeMotionOwnership() instead, per that
-  // method's own doc comment above, and never touches kBlock at all).
+  // Which caller currently holds the drivetrain (MotionOwner,
+  // core/motion_owner.h): kNone (idle), kWire (a live wire motion
+  // obligation, set/cleared by run()'s loop around its tickDrive()
+  // call), kJob (a dispatched RUN job, set/cleared by dispatchJob()
+  // around its call into the TS handler), or kBlock (a student's own
+  // move()/driveTwist()/startDrive() on some other fiber, taken and
+  // released through tryTakeMotionOwnership()/releaseBlockOwnership()
+  // above).
+  //
   // Lives HERE, not on WireAdapter or the RUN queue, because this class
-  // is the only one that can see a wire request, a dispatched job, AND
-  // a block-motion call, all three; wireAdapter_.setExternalOwner()
-  // (wire_adapter.h) is the one seam this class uses to mirror the same
-  // value into that host-portable class, so the two never drift apart
-  // as separately-maintained fields.
+  // is the only one that can see a wire request, a dispatched job AND a
+  // block-motion call. wireAdapter_.setExternalOwner() (wire_adapter.h)
+  // is the one seam that mirrors the value into that host-portable
+  // class, so the two cannot drift as separately-maintained fields.
   MotionOwner motionOwner_ = MotionOwner::kNone;
 
   // Dequeues and dispatches ONE queued RUN job, if one is waiting and
-  // motionOwner_ is kNone (nothing else owns the drivetrain right now --
-  // covers both a live wire motion and, defensively, a job already
-  // dispatching via a reentrant call, though the latter cannot actually
-  // happen: see the note below). Sets motionOwner_ = kJob and tells
-  // wireAdapter_ so a wire motion verb arriving while this job runs is
-  // refused (kBusy) rather than silently overwriting or racing its move
-  // -- both cleared again once the dispatched call returns.
+  // motionOwner_ is kNone. Sets motionOwner_ = kJob and tells
+  // wireAdapter_, so a wire motion verb arriving mid-job is refused
+  // (kBusy) rather than silently racing its move; both are cleared once
+  // the dispatched call returns.
   //
-  // Called once per pass of run()'s own loop, after drainEmitQueue() and
-  // before the wire/radio poll (serviceOnce(), below) -- but the
-  // dispatched call itself can run for a long time (a whole tour), during
-  // which THIS SAME fiber re-enters serviceOnce() repeatedly through
-  // tickDrive()'s own service hook (see serviceHookEntry() below), which
-  // calls dispatchJob() again on every re-entry. That nested call always
-  // finds motionOwner_ == kJob already and returns immediately -- a job
-  // is dispatched exactly once per queued command, never re-entered.
+  // The dispatched call can run for a whole tour, during which THIS
+  // SAME fiber re-enters serviceOnce() through tickDrive()'s service
+  // hook (serviceHookEntry(), below), which calls this again on every
+  // re-entry. Those nested calls find motionOwner_ == kJob and return
+  // immediately: a job is dispatched exactly once per queued command,
+  // never re-entered.
   void dispatchJob();
 
-  // One pass of this fiber's OWN servicing: drains emitQueue_, dispatches
-  // one queued RUN job if the drivetrain is free, polls serial and radio
-  // for new lines (the old-style cleartext RUN: bridge or the v6
-  // grammar), and emits a telemetry frame if one is due. This is run()'s
-  // own former per-pass loop body (minus the final tick-or-sleep step),
-  // extracted so it can ALSO run as tickDrive()'s service hook
-  // (serviceHookEntry(), below): a dispatched job's own
-  // `while (driveTick())` tick loop nests back into this same servicing
-  // once per tick, which is what lets an abort, a new queued command, or
-  // ordinary telemetry keep flowing without waiting for that job to
-  // return -- inverting the pump (this fiber's own servicing rides
-  // inside the job's tick loop) rather than adding a second fiber to
-  // drive the job. Never calls tickDrive() itself and never
-  // sleeps -- run()'s own loop (below) does both of those, once per pass,
-  // strictly AFTER this returns; the ONE nested call site (tickDrive()
-  // itself) is already mid-tick when this fires, so doing either here
+  // One pass of this fiber's OWN servicing: drains emitQueue_,
+  // dispatches one queued RUN job if the drivetrain is free, polls each
+  // transport for new lines, and emits a telemetry frame if one is due.
+  // It ALSO runs as tickDrive()'s service hook (serviceHookEntry(),
+  // below), so a dispatched job's own `while (driveTick())` loop nests
+  // back into this servicing once per tick -- which is what lets an
+  // abort, a new queued command or ordinary telemetry keep flowing
+  // without waiting for that job to return, without a second fiber.
+  //
+  // Never calls tickDrive() itself and never sleeps: run()'s loop does
+  // both, once per pass, strictly AFTER this returns. The one nested
+  // call site is already mid-tick when this fires, so doing either here
   // would be reentrant and wrong.
   void serviceOnce();
 
@@ -312,28 +263,24 @@ class Protocol {
   //    host blasting commands would starve drainEmitQueue() and the
   //    telemetry cadence, both of which run only between passes.
   //
-  // Not a per-transport tuning knob: if one transport ever needs its
-  // own budget, that is a reason to name a second constant here, not to
-  // spell a bare number at its call site.
+  // Not a per-transport knob: a transport needing its own budget is a
+  // reason to name a second constant here, not to spell a bare number
+  // at its call site.
   static constexpr int kRxDrainPerPass = 4;
 
   // The ONE path an inbound line takes, whichever transport produced
-  // it: `data`/`len` is one complete line, delimiter already stripped by
-  // the transport that framed it. A line whose first bytes are the
-  // literal "RUN:" prefix goes to the old-style cleartext bridge
-  // (handleRun(), below); everything else -- including the v6 grammar's
-  // own space-separated "RUN <name> ... #<id>" verb -- is fed to
-  // `handler`, followed by the separate "\n" feed() needs to see the
-  // line as complete.
+  // it: `data`/`len` is one complete line, delimiter already stripped
+  // by the transport that framed it. A line whose first bytes are the
+  // literal "RUN:" prefix goes to the cleartext bridge (handleRun(),
+  // below); everything else -- including the v6 grammar's own
+  // space-separated "RUN <name> ... #<id>" verb -- is fed to `handler`,
+  // followed by the separate "\n" feed() needs to see the line as
+  // complete.
   //
-  // `handler` is the caller's own WireHandler, never a fixed one: each
-  // transport has its own (wireHandler_/wireHandlerRadio_/
-  // wireHandlerWifi_), each with its own expectedNext_, so a sequence
-  // gap on one transport can never nack another's next command. That
-  // per-transport handler is the ONLY thing that ever differed between
-  // the three poll branches this replaces -- they were otherwise
-  // identical, which is exactly why the "RUN:" carve-out had to be
-  // written out three times to stay true on all three wires.
+  // `handler` is the CALLER's own WireHandler, never a fixed one: each
+  // transport has its own, each with its own expectedNext_, so a
+  // sequence gap on one can never nack another's next command. That is
+  // the only thing that differs between the three poll branches.
   void routeLine(Wire::WireHandler& handler, const uint8_t* data, size_t len);
 
   // This fiber's own clock reading -- the ONE place clock_'s microsecond
@@ -343,28 +290,20 @@ class Protocol {
   // conversions, one per caller.
   uint32_t clockNow();  // [ms]
 
-  // tickDrive()'s (shims.cpp) service hook, registered once via
-  // registerTickServiceHook() when run() starts -- a plain
-  // no-capture function pointer (same reason wireNow() below is a
-  // plain static member function, not a lambda: a bare C function
-  // pointer cannot capture `this`), so it reaches this specific
-  // Protocol instance through the protocol() singleton accessor, safe
-  // for the same reason wireNow() is. Gates on WHICH FIBER is calling,
-  // via diffDrive::shouldServiceHookRun() (core/fiber_identity.h) --
-  // NOT on motionOwner_'s value, which used to be this method's whole
-  // check and is exactly what let a second fiber slip through: a
-  // button-handler fiber calling tickDrive() while a job ran on this
-  // one satisfied `motionOwner_ == kJob` and ran serviceOnce() a SECOND
-  // time, concurrently, corrupting the wire dispatcher's own shared
-  // line buffer mid-yield. Comparing fiber identity instead makes "no
-  // fiber but this object's own ever runs serviceOnce()" true by
-  // construction, independent of what any state variable says: tickDrive()
-  // is also called (a) from run()'s own loop for a live wire motion
-  // obligation, which already gets its own servicing once per pass via
-  // run()'s own loop calling serviceOnce() directly, and (b) from
-  // anything else's own fiber -- a student's continuous-mode drive loop,
-  // or a button handler -- neither of which needs or may ever trigger
-  // this hook's extra work.
+  // tickDrive()'s (shims.cpp) service hook, registered once by run() --
+  // a plain no-capture function pointer (a bare C function pointer
+  // cannot capture `this`, the same reason wireNow() below is a static
+  // member function), so it reaches this instance through the
+  // protocol() singleton accessor.
+  //
+  // Gates on WHICH FIBER is calling, via
+  // diffDrive::shouldServiceHookRun() (core/fiber_identity.h), NOT on
+  // motionOwner_: a button-handler fiber calling tickDrive() while a
+  // job ran satisfied `motionOwner_ == kJob` and ran serviceOnce() a
+  // SECOND time, concurrently, corrupting the wire dispatcher's shared
+  // line buffer mid-yield. Comparing fiber identity makes "no fiber but
+  // this object's own ever runs serviceOnce()" true by construction,
+  // whatever any state variable says.
   static void serviceHookEntry();
 
   // The identity this fiber captured as its own, the first (and only)
@@ -384,20 +323,14 @@ class Protocol {
   static CurrentFiberFn currentFiberFn_;
 
   // ---- the outbound emit path: single producer, one caller each ------
-  // emitLine() (public, above) no longer writes a transport itself -- it
-  // clips and enqueues onto emitQueue_ below and returns. These two
-  // private methods are the split: emitLineNow() is the actual write
-  // (the old emitLine() body, unchanged), and drainEmitQueue() is its
-  // only caller, itself called once per pass of run()'s own loop, on
-  // this object's own fiber. That makes this fiber the only caller that
-  // can ever reach either transport's underlying write for this path,
-  // regardless of which fiber called emitLine().
-  //
   // Copies `len` bytes from `text` to serial, then (if the radio link
   // is up) mirrors the same bytes to radio with one retry -- see the
-  // definition (protocol.cpp) for the retry's own reasoning. Only ever
-  // called from drainEmitQueue(), so `text` always points at a local
-  // buffer that outlives any yield this performs.
+  // definition (protocol.cpp) for the retry's own reasoning. Its ONLY
+  // caller is drainEmitQueue() below, itself called once per pass of
+  // run()'s loop on this object's own fiber, which is what makes this
+  // fiber the only writer of either transport for the emit path
+  // whatever fiber called emitLine(). `text` therefore always points at
+  // a local buffer that outlives any yield this performs.
   void emitLineNow(const char* text, size_t len);
 
   // Drains every currently-queued line out of emitQueue_, in FIFO
@@ -456,15 +389,9 @@ class Protocol {
 
   // ---- the v6 wire transport seam --------------------------------------
   // All three transports are reached through ONE Sink class
-  // (TransportSink, transport_sink.h) rather than one hand-copied Sink
-  // apiece. Everything a Sink does here -- decide how much of the
-  // written line is content, hand those bytes to the transport, which
-  // appends its own single delimiter -- is identical for all three; the
-  // only difference is the write call itself, which is what these three
-  // one-line adapters supply. The content decision (and, in particular,
-  // that the terminator is CHECKED before it is dropped) lives in
-  // transport_sink.h, host-portable and host-tested by
-  // tests/host/test_transport_sink.py.
+  // (TransportSink, transport_sink.h); the only thing that differs
+  // between them is the write call itself, which is what these three
+  // one-line adapters supply.
   //
   // A dropped line is accepted silently in all three cases: radio
   // refuses while its link is disabled, and WiFi drops while the link
@@ -508,18 +435,13 @@ class Protocol {
   bool wifiBegun_ = false;
   uint32_t lastWifiDbg_ = 0;  // [ms]
 
-  // NSDMI, not a hand-written constructor: each member depends only on
-  // members declared textually above it (transport_/radioTransport_ for
-  // the sinks; wireNow() for wireAdapter_; wireAdapter_ + the sinks
-  // for wireHandler_/wireHandlerRadio_), so declaration-order in-class
-  // initializers are enough. wireAdapter_ starts with a placeholder
-  // Wire::Identity(); run() supplies the real one via setIdentity()
-  // once it is safe to read (see buildIdentity()'s own comment above).
-  //
-  // wireHandlerRadio_ shares this SAME wireAdapter_ instance with
-  // wireHandler_ -- NOT a second WireAdapter (see this file's own
-  // top-of-file comment for why) -- but each keeps its own
-  // expectedNext_.
+  // NSDMI, not a hand-written constructor: every member below depends
+  // only on members declared textually above it, so declaration-order
+  // in-class initializers suffice. wireAdapter_ starts with a
+  // placeholder Wire::Identity(); run() supplies the real one via
+  // setIdentity() once it is safe to read (buildIdentity(), above).
+  // wireHandlerRadio_ shares this SAME wireAdapter_ -- never a second
+  // one, see this file's top comment -- but keeps its own expectedNext_.
   TransportSink<SerialTransport> serialSink_{transport_, &Protocol::writeSerial};
   TransportSink<RadioTransport> radioSink_{radioTransport_,
                                            &Protocol::writeRadio};
@@ -541,22 +463,17 @@ class Protocol {
   // reply trace (emitLine() clips to the wire cap anyway).
   char wifiDbgBuf_[320];
 
-  // Radio RX scratch -- every line the radio's own poll receives lands
-  // here first, whether it turns out to be the old-style cleartext RUN
-  // carve-out or a v6 line handed to wireHandlerRadio_ (see run()'s own
-  // radio-polling block); reused every poll, serial branch is done with
-  // its own buffer by the time this runs each iteration.
+  // Radio RX scratch -- every line the radio poll receives lands here
+  // first, cleartext RUN carve-out or v6 line alike; reused every poll,
+  // and the serial branch is done with its own buffer by then.
   uint8_t rxLineBuf_[64];
 
-  // Serial RX scratch, the serial-side twin of rxLineBuf_ above --
-  // moved from a run()-local to a member so serviceOnce() (below) can
-  // read into it from ANY nesting depth (run()'s own top-level pass, or
-  // a re-entrant call arriving through tickDrive()'s service hook while
-  // a job's own tick loop runs) without needing to thread a buffer
-  // pointer down through that reentrant call chain. Safe to share: each
-  // level fully reads and dispatches whatever landed here before any
-  // deeper call could touch it again, and a shallower level never reads
-  // it again once it has already handed off to handleRun()/feed().
+  // Serial RX scratch, the serial-side twin of rxLineBuf_ above. A
+  // member, not a run() local, so serviceOnce() can read into it from
+  // ANY nesting depth without threading a pointer down the reentrant
+  // call chain. Safe to share: each level fully reads and dispatches
+  // whatever landed here before any deeper call can touch it, and never
+  // reads it again once it has handed off to handleRun()/feed().
   uint8_t lineBuf_[kMaxLineBytes];
 
   // serviceOnce()'s own telemetry-cadence clock, the same reason

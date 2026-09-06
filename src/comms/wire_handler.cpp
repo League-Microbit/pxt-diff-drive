@@ -119,53 +119,33 @@ bool parseUint32(const char* field, uint32_t& out) {
   return true;
 }
 
-// Sprint 008 (wire-timeout-hardening.md, R-06 + R-18, code review
-// 2026-08-23): the shared ceiling every one of the six motion verbs'
+// The shared ceiling every one of the six motion verbs'
 // `timeout`/`duration` field is clamped against, in each exec function
-// below, BEFORE the value ever reaches the Adapter (WireAdapter's own
-// obligation-window math, MotionEngine::wheelsX()'s lease-clamp
-// arithmetic, and the kernel's own lease/deadline math therefore never
-// see an out-of-range value -- none of them needs its own defensive
-// check).
+// below, BEFORE the value ever reaches the Adapter -- so WireAdapter's
+// obligation-window math, MotionEngine's lease-clamp arithmetic and the
+// kernel's own deadline math never see an out-of-range value.
 //
-// This is a SIBLING of wire_adapter.h's kWireBoundaryCastCeiling
-// (2e9), not a reuse of it, and deliberately so: that constant bounds a
-// float->int32 CAST at the wire boundary (chosen with headroom below
-// where float's 24-bit mantissa stops representing every integer
-// exactly, so the cast itself stays well-defined) -- this one bounds a
-// uint32_t value directly, with no float involved anywhere in its own
-// path. 2^31-1 is exactly this project's own signed-difference
-// wraparound-safe half-range -- the same idiom
-// WireAdapter::hasLiveMotionObligation() already relies on
-// (`static_cast<int32_t>(nowMs - deadlineMs) < 0`): a `timeout` at or
-// below this ceiling can never make `now + timeout` wrap PAST `now`
-// itself, so that comparison stays correct for any `now`. Reusing
-// kWireBoundaryCastCeiling's literal value (2e9, not 2^31-1) here would
-// leave ~147M ms of headroom where the wraparound-safety guarantee
-// above no longer holds; reusing the symbol itself would mean this file
-// including wire_adapter.h, inverting this project's own layering rule
-// (src/DESIGN.md S1: wire_adapter depends on wire_handler, never the
-// reverse -- this file stays host-portable with no project includes at
-// all). The two ceilings are close in magnitude only because "very
-// large but still safe" happens to land in the same neighborhood in
-// both domains.
+// 2^31-1: the signed-difference half-range, so `now + timeout` can never
+// wrap past `now` itself and the wraparound-safe elapsed comparison
+// (`static_cast<int32_t>(nowMs - deadlineMs) < 0`) stays correct for any
+// `now`. A SIBLING of wire_adapter.h's kWireBoundaryCastCeiling (2e9),
+// never a reuse of it: that one bounds a float->int32 CAST, this one
+// bounds a uint32_t directly, and reusing the symbol would mean this
+// host-portable file including wire_adapter.h, inverting the
+// wire_adapter-depends-on-wire_handler layering (src/DESIGN.md S1).
 constexpr uint32_t kMaxMotionTimeout = 2147483647u;  // 2^31 - 1
 
-// Applied identically to WHEELS_X/WHEELS_V/MOVE_X/MOVE_V/GO_TO_R/GO_TO_W's
-// own timeout/duration field (see kMaxMotionTimeout's own doc comment
-// above for why, and DESIGN.md S14's Design Rationale for the
-// reject-vs-clamp choice on each end): `0` is refused outright
-// (matching the existing precedent that `cruise <= 0` already refuses
-// rather than silently reinterpreting a nonsensical input, WireAdapter
-// ::onWheelsX() et al.) -- both of today's two disagreeing "0" meanings
-// (WHEELS_X's stale-lease lurch, MOVE_X's instant no-op) are confirmed
-// bugs, not designs worth preserving. A value above the ceiling is
-// silently clamped down to it: a host sending an oversized timeout is
-// asking for "run for a very long time," which clamping serves;
-// rejecting would force every large-sentinel-using host to learn this
-// project's specific ceiling. Returns false (reject) for exactly 0,
-// leaving `timeout` unmodified; otherwise clamps `timeout` in place to
-// at most kMaxMotionTimeout and returns true.
+// Applied identically to all six motion verbs' timeout/duration field.
+// `0` is refused outright, matching the precedent that `cruise <= 0`
+// already refuses rather than silently reinterpreting a nonsensical
+// input -- both of the two disagreeing "0" meanings (WHEELS_X's
+// stale-lease lurch, MOVE_X's instant no-op) were confirmed bugs, not
+// designs worth preserving. A value above the ceiling is silently
+// clamped down to it: a host sending an oversized timeout is asking for
+// "run for a very long time," which clamping serves, while rejecting
+// would force every large-sentinel-using host to learn this project's
+// specific ceiling. Returns false (reject) for exactly 0, leaving
+// `timeout` unmodified; otherwise clamps in place and returns true.
 bool clampMotionTimeout(uint32_t& timeout) {
   if (timeout == 0) return false;
   if (timeout > kMaxMotionTimeout) timeout = kMaxMotionTimeout;
@@ -210,40 +190,24 @@ bool parseTlmMode(const char* field, TlmMode& mode) {
   return false;
 }
 
-// formatConfigValue()'s own bound on the INPUT magnitude, applied BEFORE
-// scaling -- NOT a post-scale clamp on the scaled product, which is the
-// defect this constant closes (get-full-duty-velocity-returns-
-// garbage.md). The OLD code scaled in a `uint32_t` intermediate and
-// clamped THAT to `kMaxScaled` (~UINT32_MAX): since `uint32_t` cannot
-// represent `magnitude * 1,000,000` for any magnitude past ~4295 no
-// matter where inside its own range the clamp threshold sits, EVERY
-// field whose real magnitude reached that line clamped to the exact
-// same wrong constant (4294.967040) -- fullDutyVelocity (10795.0) was
-// simply the first of the day's 18 config-table entries to cross it, not a
-// field-specific defect (confirmed by reading every seeded Config value
-// in shims.cpp's ensure()).
+// formatConfigValue()'s bound on the INPUT magnitude, applied BEFORE
+// scaling -- NOT a post-scale clamp on the product, which is the defect
+// this closes: the old code scaled in a `uint32_t` intermediate and
+// clamped THAT, and since `uint32_t` cannot represent
+// `magnitude * 1,000,000` for any magnitude past ~4295, EVERY field
+// whose real magnitude reached that line clamped to the same wrong
+// constant (4294.967040).
 //
-// Mirroring kWireBoundaryCastCeiling's own doc-comment style
-// (wire_adapter.h) but deliberately a SIBLING constant, not a reuse:
-// that one bounds a float->int32_t CAST at the SET/inbound boundary;
-// this one bounds the magnitude a GET reply is willing to report at
-// all, entirely on the OUTBOUND side, and reusing the adapter's own
-// symbol would mean this host-portable, no-project-includes file
-// (src/DESIGN.md S4) including wire_adapter.h, inverting this project's
-// wire_adapter-depends-on-wire_handler layering rule -- same reasoning
-// kMaxMotionTimeout's own doc comment above already applies to a
-// different pair of ceilings. 1,000,000.0f is chosen with two orders of
-// magnitude of headroom above this project's largest real config value
-// (fullDutyVelocity, 10795.0 counts/s) while keeping the scaled product
-// (`kGetValueCeiling * kDivisor` == 1e12) comfortably inside `double`'s
-// exact-integer range (2^53, ~9.007e15) -- see formatConfigValue()'s own
-// comment below for why that headroom is what makes the wide
-// intermediate safe. A magnitude beyond this ceiling is CLAMPED to the
-// ceiling itself: a suspiciously round, always-identical, documented
-// number no real configured value could ever coincide with -- standing
-// in clear contrast to the old bug's plausible-looking wrong digits,
-// and honest about "this is a saturation flag" the instant an operator
-// notices the same round value on more than one field.
+// 1e6 input ceiling: two orders of magnitude above this project's
+// largest real config value (fullDutyVelocity, 10795.0 counts/s), and
+// it keeps the scaled product (`kGetValueCeiling * kDivisor` == 1e12)
+// comfortably inside `double`'s exact-integer range (2^53, ~9.007e15).
+// A magnitude beyond it is CLAMPED to the ceiling itself, so a clamped
+// value prints as a suspiciously round, always-identical number no real
+// configured value could coincide with -- honest about being a
+// saturation flag, unlike the old bug's plausible-looking wrong digits.
+// A SIBLING of wire_adapter.h's kWireBoundaryCastCeiling, not a reuse,
+// for the same layering reason kMaxMotionTimeout's comment above gives.
 constexpr float kGetValueCeiling = 1000000.0f;  // 1e6
 
 // formatConfigValue() -- six fractional digits, always present, no
@@ -252,22 +216,18 @@ constexpr float kGetValueCeiling = 1000000.0f;  // 1e6
 // "0.020000", formatConfigValue(-51.5f) -> "-51.500000".
 //
 // `value` is NOT wire-parsed here -- it is whatever the ADAPTER's own
-// onGet() handed back (parseFloatField already rejects NaN/Inf on the
-// way IN), so this function cannot assume it is finite. +-Inf is already
-// handled correctly below: `magnitude` compares greater than
-// kGetValueCeiling and gets clamped before scaling ever runs. NaN does
-// not: every comparison against a NaN is false, so the ceiling clamp
-// would never trigger for one -- there is no wire spelling for NaN, so
-// fail safe to 0.0 rather than invent one, exactly as before.
+// onGet() handed back -- so this function cannot assume it is finite.
+// +-Inf is handled below: `magnitude` compares greater than
+// kGetValueCeiling and is clamped before scaling. NaN is not: every
+// comparison against a NaN is false, so the clamp would never trigger;
+// there is no wire spelling for NaN, so fail safe to 0.0.
 //
 // The scaling intermediate is `double`, not `uint32_t` -- see
-// kGetValueCeiling's own comment above for why that pairing (a bounded
-// input, a wide intermediate) closes the overflow rather than merely
-// relocating it. `double` exactly represents every integer this
-// function's own bounded `scaled` can reach, so no precision is lost by
-// widening; the final narrowing to `uint32_t` (wholePart/fracPart, each
-// individually far under UINT32_MAX once magnitude is bounded) is what
-// stays safe to print via `%lu` on this project's own embedded target.
+// kGetValueCeiling above for why that pairing (a bounded input, a wide
+// intermediate) closes the overflow rather than relocating it. `double`
+// exactly represents every integer the bounded `scaled` can reach; the
+// final narrowing to `uint32_t` is what stays safe to print via `%lu`
+// on this project's embedded target.
 void formatConfigValue(float value, char* out, size_t cap) {
   if (std::isnan(value)) value = 0.0f;
   constexpr uint32_t kDivisor = 1000000u;  // 10^6 -- six fixed digits
@@ -327,15 +287,13 @@ const WireHandler::VerbEntry WireHandler::kCommandTable[] = {
 
 WireHandler::WireHandler(Adapter& adapter, Sink& sink)
     : adapter_(adapter), sink_(sink) {
-  // WIRE-09 (code review 2026-08-23): pins kCommandTable's deduced size
-  // at compile time -- see that member's own doc comment
-  // (wire_handler.h) for the silent-zero-fill defect this closes.
-  // Placed in a member function (rather than at namespace scope right
-  // after the array's own definition above) because kCommandTable is
-  // private: an id-expression naming a private member is subject to
-  // access control even inside an unevaluated sizeof operand, and only
-  // member/friend context is exempt from that check. Evaluated purely
-  // at compile time -- this constructor need not even run for a
+  // Pins kCommandTable's deduced size at compile time -- see that
+  // member's own doc comment (wire_handler.h) for the silent-zero-fill
+  // defect this closes. Placed in a member function rather than at
+  // namespace scope because kCommandTable is private: an id-expression
+  // naming a private member is subject to access control even inside an
+  // unevaluated sizeof operand, and only member/friend context is
+  // exempt. Purely compile-time -- this constructor need not run for a
   // mismatched count to fail the build.
   static_assert(sizeof(kCommandTable) / sizeof(kCommandTable[0]) == 18,
                 "kCommandTable verb count");
@@ -502,50 +460,21 @@ void WireHandler::dispatch(char* verb, char** fields, size_t fieldCount,
     return;
   }
 
-  // ---- the read-only QUERY verbs are unsequenced too (2026-08-27) ----
+  // ---- the read-only QUERY verbs are unsequenced too ----
   //
-  // ID/VER/STATUS answer a question and change nothing. A duplicate is
-  // harmless and a lost one is recovered by simply asking again, so a
-  // sequence id buys them no reliability at all -- while costing two
-  // real, reported failures:
-  //
-  //   1. a bare `ID` parsed as #0, fell below expectedNext_, and was
-  //      silently dropped; and
-  //   2. a RESENT `ID #1` drew `ack 1 0 none` with NO `id` line -- the
-  //      S8.1 stale-retransmit row, which for a state-changing verb
-  //      correctly means "I already have everything through here, stop
-  //      resending", but for a query reads as "accepted, then answered
-  //      nothing."
-  //
-  // The governing rule, and the reason the sequenced/unsequenced split
-  // is drawn exactly here:
-  //
-  //   A VERB IS SEQUENCED IFF ITS CORRECTNESS DEPENDS ON ITS POSITION
-  //   IN THE STREAM -- either because executing it twice changes the
-  //   robot, or because answering it out of order yields a wrong
-  //   answer.
-  //
-  // Note the second clause: "changes state" alone is NOT the test, and
-  // collapsing it to that is what makes GET look like an exception when
-  // it is not (see below). ID/VER/HELP answer session CONSTANTS --
-  // identity burned into the chip, a compile-time version, a
-  // compile-time verb list -- so they are position-independent. TLM
-  // mutates subscription state and MOVE/RUN/WHEELS move a robot, so
-  // they are not.
-  //
-  // Forgiving of any trailing content, like PING: `ID`, `ID #1` and
-  // `ID #99` all answer identically, and none of them touch
-  // expectedNext_.
-  //
-  // GET stays SEQUENCED and is NOT an exception to the rule -- it is
-  // read-only but ORDER-dependent, which the rule already covers.
-  // `SET kp 500 #7` / `GET kp #8`: if #7 is lost, a sequenced GET #8 is
-  // nacked and never answered, which is correct -- the host must not
-  // receive the pre-SET value and read it as the post-SET value. An
-  // unsequenced GET would return the stale value with no marker saying
-  // it predates a pending write: a silently wrong answer to a config
-  // question. (Framing owed to radio-robot-lib-85, 2026-08-27, which
-  // is protocol.md's owner.)
+  // A VERB IS SEQUENCED IFF ITS CORRECTNESS DEPENDS ON ITS POSITION IN
+  // THE STREAM -- either executing it twice changes the robot, or
+  // answering it out of order yields a wrong answer. ID/VER/STATUS
+  // answer session CONSTANTS, so they are position-independent and are
+  // answered here, forgiving of any trailing content and touching
+  // expectedNext_ not at all: `ID`, `ID #1` and `ID #99` all answer
+  // identically. Note the second clause of the rule -- "changes state"
+  // alone is not the test, and collapsing it to that is what makes GET
+  // look like an exception when it is not. GET stays SEQUENCED because
+  // SET ORDERS it: given `SET kp 500 #7` / `GET kp #8`, if #7 is lost a
+  // sequenced GET #8 is nacked and never answered, which is correct --
+  // an unsequenced GET would hand back the pre-SET value with nothing
+  // marking it as predating a pending write.
   {
     char* noFields[1] = {nullptr};
     uint8_t ignoredErr = 0;
@@ -581,31 +510,17 @@ void WireHandler::dispatch(char* verb, char** fields, size_t fieldCount,
     // No trailing field at all, or one that isn't a well-formed
     // '#'[0-9]+ -- the line cannot be sequence-classified.
     //
-    // 2026-08-27, stakeholder direction: this used to be answered with
-    // TOTAL SILENCE, on the reasoning that with no id there is nothing
-    // to compare against expectedNext_ and therefore nothing to say.
-    // That reasoning is wrong, and it produced the single most
-    // confusing behaviour on the wire:
-    //
-    //     WHEELS_X 100 100 2000      <- typed, no id
-    //     (nothing at all)
-    //
-    // The operator cannot tell that from a dead robot, a dropped
-    // packet, an unknown verb, or a wedged link. "If I don't put a
-    // number on something, there should be an error... Where's my NAK,
-    // or my error, or ANYTHING that tells me what happened?"
-    //
-    // There IS something to say, and it is the same thing a gap says:
-    // `nack <expectedNext_>` -- "I did not run that; send me id N."
-    // That is precisely the information a host missing an id needs, and
-    // it is the reply this branch was already capable of producing.
+    // A RECOGNIZED verb with no usable id is answered
+    // `nack <expectedNext_>` -- "I did not run that; send me id N" --
+    // never with silence: silence is indistinguishable from a dead
+    // robot, a dropped packet, an unknown verb or a wedged link.
     //
     // SCOPED TO RECOGNIZED VERBS ONLY. An unrecognized verb still gets
     // silence, deliberately: the radio channel is shared, and answering
     // arbitrary uppercase garbage would make this robot chatter at
-    // every corrupted line and every other robot's traffic that happens
-    // to survive the case gate. A verb this handler actually implements
-    // is addressed to it; unknown tokens are not assumed to be.
+    // every corrupted line and at every other robot's traffic that
+    // survives the case gate. A verb this handler implements is
+    // addressed to it; unknown tokens are not assumed to be.
     //
     // Does NOT touch the sequence: expectedNext_ is unchanged, nothing
     // executes, and gapOutstanding_ is NOT set -- a missing id is a
@@ -624,24 +539,14 @@ void WireHandler::dispatch(char* verb, char** fields, size_t fieldCount,
 
   if (id == 0) {
     // `#0` is NEVER a legal id -- ids start at 1 and expectedNext_ never
-    // goes below it (S2.2). Until 2026-08-27 this fell into the ordinary
-    // stale-retransmit bucket with no special-casing, so it was answered
-    // `ack <expectedNext_ - 1>` -- and on a fresh session that is
-    // literally `ack 0 0 none`: a receipt for a command that never
-    // existed, was never accepted, and did not run. Reported from the
-    // field as:
-    //
-    //     WHEELS_X 100 100 1000 #0
-    //     ack 0 0 none                 <- and the robot did not move
-    //
-    // which is the same "accepted, then nothing happened" shape as
-    // GET's silent unknown name and the payload-less stale ack. A
-    // never-legal id is a malformed LINE, not a retransmit of anything,
-    // so it is answered the way every other unusable id now is: `nack
-    // <expectedNext_>`, "I did not run that; send me id N."
-    //
-    // Sequence untouched, nothing executes, and gapOutstanding_ is NOT
-    // set -- nothing was lost, the id was simply invalid.
+    // goes below it (S2.2) -- so it is a malformed LINE, not a
+    // retransmit of anything, and is answered the same way every other
+    // unusable id is: `nack <expectedNext_>`. Falling through to the
+    // ordinary stale-retransmit bucket instead would answer
+    // `ack <expectedNext_ - 1>`, i.e. `ack 0 0 none` on a fresh
+    // session: a receipt for a command that never existed and did not
+    // run. Sequence untouched, nothing executes, and gapOutstanding_ is
+    // NOT set -- nothing was lost, the id was simply invalid.
     ++malformedCount_;
     replyNack(expectedNext_);
     return;
@@ -822,33 +727,22 @@ void WireHandler::handleHello() {
 }
 
 void WireHandler::emitReminderIfStalled() {
-  // "Hey, I need to remind you that your last command didn't work."
-  //
-  // 2026-08-27, stakeholder direction. An unsequenced verb is issuable
-  // at ANY time with no id -- that gating rule is absolute and is what
-  // he objected to. It is separable from whether the reply may CARRY a
-  // reliability line, which he does not object to: "I don't actually
-  // mind if ID, VER, and help also return an ACK/NAK. What I mind is
-  // that they REQUIRE an ACK/NAK."
-  //
-  // Conditional, not unconditional. Silent on a clean stream -- no
-  // receipt on every PING/ID/VER, which would also put a second line on
-  // the wire for every query at ch4's measured 66-83% per-line
-  // delivery, where two lines both arriving is materially worse than
-  // one. It speaks up only when something is actually wrong, which is
-  // what makes it a reminder rather than a receipt.
-  //
-  // This does NOT violate S8.5's anti-beacon rule. That rule objected
-  // to PERIODICITY, not to unsolicited-looking acks: a line emitted in
-  // reply to an inbound line is still a response to a message. The rule
-  // widens from "only in direct response to an inbound SEQUENCED line"
-  // to "only in direct response to an INBOUND line". An idle connection
-  // stays completely silent, which is the property that mattered.
+  // A REPLY PREDICATE, never a beacon: re-nack on an inbound
+  // UNSEQUENCED verb iff a gap or decode-failure stall is outstanding.
+  // Conditional, not unconditional -- silent on a clean stream, so a
+  // PING/ID/VER does not put a second line on the wire for every query
+  // at the radio's measured 66-83% per-line delivery, where two lines
+  // both arriving is materially worse than one. It speaks up only when
+  // something is actually wrong, which is what makes it a reminder
+  // rather than a receipt, and it leaves S8.5's anti-beacon rule
+  // untouched: that rule objected to PERIODICITY, and a line emitted in
+  // reply to an inbound line is still a response to a message. An idle
+  // connection stays completely silent.
   //
   // NOT called for ESTOP (S8.3: its reply is the bare word `estop`, no
-  // fields ever, and it must never queue behind an outbound reply -- a
-  // panic stop carries no diagnostic freight) or HELLO (it resets
-  // expectedNext_, so it would be reporting on state it just erased).
+  // fields ever -- a panic stop carries no diagnostic freight) or HELLO
+  // (it resets expectedNext_, so it would report on state it just
+  // erased).
   if (!gapOutstanding_) return;
   replyNack(expectedNext_);
 }
@@ -912,34 +806,23 @@ void WireHandler::execId(char** fields, size_t fieldCount, uint32_t id,
   // `name` appended as a FOURTH field --
   // `id <drivetrain> <profile> <version> <name>`. Strictly additive:
   // fields 0-2 are byte-identical to the 3-field reply radio-robot-lib
-  // pins outside this repo (its own wire-format spec, conformance
-  // fixture, and an independent handler implementation), so any
-  // positional consumer reading only fields 0..2 is unaffected. `name`
-  // is identity.name (Protocol::buildIdentity()'s
-  // microbit_friendly_name() read) -- see protocol.cpp's own kProfile
-  // comment for why `profile` (field 1) is deliberately NOT this verb's
-  // identity source anymore.
+  // pins outside this repo, so any positional consumer reading only
+  // fields 0..2 is unaffected. `name` is identity.name, the
+  // microbit_friendly_name() read -- see protocol.cpp's own kProfile
+  // comment for why `profile` (field 1) is not this verb's identity
+  // source.
   //
-  // Buffer bumped 96 -> 128 and re-verified against the worst case,
-  // since `profile` (kProfile) is not type-bounded -- it is either the
-  // checked-in "unbaked" placeholder or a deploy-time-baked robot
-  // config filename stem (tools/make_deploy.py's _inject_profile()),
-  // which has no code-enforced length cap. Every stem in
-  // radio-robot-lib/config/robots/ today is 5-11 chars (longest:
-  // "tovez_nocal"); budgeted here to 48 to leave real headroom past
-  // that. `version` (kVersion) is currently "1.0.10" (6 chars),
-  // drift-tested against pxt.json; budgeted to 24. `drivetrain`
-  // (kDrivetrain) is a fixed compile-time literal, currently
-  // "diffdrive" (9 chars) -- counted exactly, not budgeted, since it
-  // can only change via a code edit. `name` is NOT a budget either: a
-  // micro:bit friendly name is ALWAYS exactly MICROBIT_NAME_LENGTH (5)
-  // ASCII letters -- an algorithmic hardware fact
-  // (codal-microbit-v2/source/MicroBitDevice.cpp's
-  // microbit_friendly_name()), not a convention, so this field's
-  // contribution is exact. Worst case: "id " (3) + drivetrain (9) +
-  // " " (1) + profile budget (48) + " " (1) + version budget (24) +
-  // " " (1) + name (5, exact) + "\n" (1) + NUL (1) = 94, comfortably
-  // under 128.
+  // Worst case ~94 B: "id " (3) + drivetrain (9, the fixed compile-time
+  // literal "diffdrive", counted exactly) + profile (budgeted 48; it is
+  // either the checked-in "unbaked" placeholder or a deploy-time-baked
+  // robot config filename stem, which has no code-enforced length cap
+  // -- every stem in radio-robot-lib/config/robots/ today is 5-11
+  // chars) + version (budgeted 24; kVersion is likewise "unbaked" in
+  // the tree and injected at deploy as `1.YYYYMMDD.n`, 12 chars, which
+  // tests/host/test_wire_constants_drift.py asserts is NOT pxt.json's
+  // extension semver) + name (5, exact: a micro:bit friendly name is
+  // ALWAYS MICROBIT_NAME_LENGTH ASCII letters) + 3 separators + '\n' +
+  // NUL. 128 leaves margin.
   char buf[128];
   snprintf(buf, sizeof(buf), "id %s %s %s %s\n", identity.drivetrain,
                 identity.profile, identity.version, identity.name);
@@ -967,48 +850,23 @@ void WireHandler::execStatus(char** fields, size_t fieldCount, uint32_t id,
   errCode = 0;
   StatusFields status;
   adapter_.status(status);
-  // Sprint 004 ticket 004: `i2cf=%ld` joins `flags=%x` -- decimal, not
-  // hex (SUC-005's own AC: a copy-pasted hex bit would silently turn
-  // i2cf=26 into i2cf=1a). Buffer size bumped from 176 to 200 to keep
-  // headroom now that a signed 32-bit field (`i2cf`, up to 11 chars
-  // incl. sign) joined the line -- 176 already had margin (the
-  // previous worst case measures under 100 bytes), this just keeps
-  // that margin honest rather than trimming it to the wire.
+  // Worst case ~160 B: "status " + 8 single-digit bools +
+  // flags=ffffffff + i2cf=-2147483648 + cyc/next/done at 10 digits each
+  // + tlm's longest wire name ("buffer") + reason's longest ("aborted")
+  // + '\n'. 200 leaves margin. `i2cf` and `cyc` are decimal, not hex
+  // like `flags` -- a copy-pasted hex bit would silently turn i2cf=26
+  // into i2cf=1a.
   //
-  // Sprint 010 ticket 003: `cyc=%lu` joins `i2cf=` immediately after it
-  // (both are kernel-health-cousin fields -- see StatusFields::cyc's own
-  // doc comment, wire_handler.h). Re-verified against 200: the widest
-  // possible line is "status ready=1 active=1 connL=1 connR=1 otos=1 "
-  // "wedge=1 flags=ffffffff i2cf=-2147483648 cyc=4294967295 tlm=buffer "
-  // "next=4294967295\n" -- 8 single-digit bools (8B), an 8-hex-digit
-  // flags (15B incl. "flags="), an 11-char signed i2cf (17B incl.
-  // " i2cf="), a 10-digit unsigned cyc (15B incl. " cyc="), tlm's
-  // longest wire name "buffer" (11B incl. " tlm="), and a 10-digit
-  // next (16B incl. " next="), plus the "status " prefix (7B) and
-  // trailing '\n' (1B) -- measures well under 130 bytes total, so 200
-  // still keeps comfortable headroom; no bump needed.
-  // 2026-08-27: `done=<n> reason=<tok>` join the line, appended AFTER
-  // next= (additively -- S6's k=v replies let an older parser ignore
-  // unknown keys, so this is backward compatible for free).
-  //
-  // This is REQUIRED by, and lands before, STATUS becoming unsequenced.
-  // Since S8.5 deleted the telemetry piggyback, (lastDone, reason) only
-  // ever rides a direct reply -- and radio-robot-lib's own host
-  // (src/host/robot_v6/reliability.py, poll_completion) pokes the robot
-  // with a STATUS purely to provoke an ack carrying a fresh pair. An
-  // unsequenced STATUS emits no ack, so that poll would go silent and
-  // completion delivery would die quietly. Carrying the pair on the
-  // status line itself removes the dependency on an ack entirely, and
-  // closes what protocol.md S8.7 already called "a gap, not a
-  // considered omission."
-  //
-  // Read fresh off the adapter at format time, exactly as replyAck()
-  // does -- never cached (S8.8).
-  //
-  // Width: the two new keys add at most " done=4294967295" (16B) and
-  // " reason=" plus the longest wire name ("aborted", 7B) = 15B, i.e.
-  // 31B on top of the ~130B worst case documented above. 200 still
-  // holds it with room to spare.
+  // `done=`/`reason=` ride the status line itself rather than only an
+  // ack (S6's k=v replies let an older parser ignore unknown keys, so
+  // adding them was backward compatible for free). This is what makes
+  // an UNSEQUENCED STATUS safe: since S8.5 deleted the telemetry
+  // piggyback, (lastDone, reason) only ever rides a direct reply, and
+  // radio-robot-lib's own host pokes the robot with a STATUS purely to
+  // provoke a fresh pair -- with no ack emitted, that poll would go
+  // silent and completion delivery would die quietly. Both are read
+  // fresh off the adapter at format time, exactly as replyAck() does
+  // (S8.8).
   char buf[200];
   snprintf(buf, sizeof(buf),
                 "status ready=%d active=%d connL=%d connR=%d otos=%d "
@@ -1211,16 +1069,12 @@ void WireHandler::execTlm(char** fields, size_t fieldCount, uint32_t id,
   (void)id;
   TlmMode mode;
   parseTlmMode(fields[0], mode);  // decodeTlm() already proved this succeeds
-  // Sprint 008 ticket 005: the adapter's own Result now surfaces on the
-  // wire for TLM, same as every other merits-checked verb dispatched
-  // through this table (ack unconditionally above, then `err <code>
-  // #<id>` on top iff errCode != 0, per dispatch()'s own comment) --
-  // previously this was hardcoded to 0 (errCode never set from the
-  // call's actual return), which is why TLM BUFFER's own refusal
-  // (WireAdapter::onTlm(), kUnimplemented) could never reach the wire
-  // no matter what the adapter decided. Every mode that still returns
-  // kOk (OFF/POSE/FULL/NOW/AUTO) is unaffected: resultCode(kOk) == 0,
-  // identical to the old hardcoded value.
+  // The adapter's own Result surfaces on the wire for TLM, same as
+  // every other merits-checked verb dispatched through this table (ack
+  // unconditionally above, then `err <code> #<id>` on top iff errCode
+  // != 0). This is what lets TLM BUFFER's refusal
+  // (WireAdapter::onTlm(), kUnimplemented) reach the wire at all; every
+  // mode that returns kOk is unaffected, since resultCode(kOk) == 0.
   Result result = adapter_.onTlm(mode);
   errCode = resultCode(result);
 }
@@ -1251,11 +1105,11 @@ void WireHandler::execWheelsX(char** fields, size_t fieldCount, uint32_t id,
   parseInt32(fields[1], right);
   parseInt32(fields[2], cruise);
   parseUint32(fields[3], timeout);
-  // Sprint 008 (R-06 + R-18): shared reject-0/clamp-above-2^31-1 bound --
+  // Shared reject-0/clamp-above-2^31-1 bound --
   // see clampMotionTimeout()'s own doc comment above. Rejecting here
   // means engineWheelsX() (and therefore MotionEngine::wheelsX()'s own
   // lease-clamp arithmetic) never even runs for timeout == 0, closing
-  // R-06's stale-lease bug at the source rather than downstream.
+  // the stale-lease bug at the source rather than downstream.
   if (!clampMotionTimeout(timeout)) {
     errCode = resultCode(Result::kRange);
     return;
@@ -1282,7 +1136,7 @@ void WireHandler::execWheelsV(char** fields, size_t fieldCount, uint32_t id,
   parseInt32(fields[0], left);
   parseInt32(fields[1], right);
   parseUint32(fields[2], duration);
-  // Sprint 008 (R-06 + R-18): shared reject-0/clamp-above-2^31-1 bound --
+  // Shared reject-0/clamp-above-2^31-1 bound --
   // see clampMotionTimeout()'s own doc comment above. WHEELS_V's own
   // kWheelsVDurationCeiling (5000 ms, wire_adapter.h) still applies
   // downstream, unchanged -- this only rules out 0 and the >2^31-1
@@ -1314,7 +1168,7 @@ void WireHandler::execMoveX(char** fields, size_t fieldCount, uint32_t id,
   parseInt32(fields[1], rotation);
   parseInt32(fields[2], cruise);
   parseUint32(fields[3], timeout);
-  // Sprint 008 (R-06 + R-18): shared reject-0/clamp-above-2^31-1 bound --
+  // Shared reject-0/clamp-above-2^31-1 bound --
   // see clampMotionTimeout()'s own doc comment above. Rejecting here
   // means engineMoveX() never runs for timeout == 0, so
   // MotionEngine::moveX()'s own `move_.deadline = now() + timeout`
@@ -1347,7 +1201,7 @@ void WireHandler::execMoveV(char** fields, size_t fieldCount, uint32_t id,
   parseInt32(fields[0], v_x);
   parseInt32(fields[1], omega);
   parseUint32(fields[2], duration);
-  // Sprint 008 (R-06 + R-18): shared reject-0/clamp-above-2^31-1 bound --
+  // Shared reject-0/clamp-above-2^31-1 bound --
   // see clampMotionTimeout()'s own doc comment above. MOVE_V shares
   // WHEELS_V's own kWheelsVDurationCeiling downstream (unchanged).
   if (!clampMotionTimeout(duration)) {
@@ -1378,7 +1232,7 @@ void WireHandler::execGoToR(char** fields, size_t fieldCount, uint32_t id,
   parseInt32(fields[2], speed);
   parseInt32(fields[3], arrive);
   parseUint32(fields[4], timeout);
-  // Sprint 008 (R-06 + R-18): shared reject-0/clamp-above-2^31-1 bound --
+  // Shared reject-0/clamp-above-2^31-1 bound --
   // see clampMotionTimeout()'s own doc comment above. Rejecting here
   // means engineGoToR() never runs for timeout == 0, so
   // MotionEngine::goToR()'s own deadline math (identical
@@ -1409,7 +1263,7 @@ void WireHandler::execGoToW(char** fields, size_t fieldCount, uint32_t id,
   parseInt32(fields[2], speed);
   parseInt32(fields[3], arrive);
   parseUint32(fields[4], timeout);
-  // Sprint 008 (R-06 + R-18): shared reject-0/clamp-above-2^31-1 bound --
+  // Shared reject-0/clamp-above-2^31-1 bound --
   // see clampMotionTimeout()'s own doc comment above. Same rationale as
   // execGoToR() immediately above -- GO_TO_W shares GO_TO_R's identical
   // field shape and deadline math (via MotionEngine::goToR()).
@@ -1534,17 +1388,12 @@ void WireHandler::emitTelemetry(const Snapshot& snapshot) {
     framesSinceHeader_ = 1;  // this call is frame 1 of the next streak
   }
   emitFrame(snapshot);
-  // No reliability line rides here any more (2026-08-26, protocol.md
-  // S8.5, stakeholder direction: "an ack or a nack is only a response
-  // to a message, not a beacon"): an ack/nack is only ever a direct
-  // reply to an inbound sequenced line. This closes the LAST unsolicited
-  // ack path -- sprint 024 ticket 001 removed the free-running beacon on
-  // non-subscribed transports, and this removes the telemetry-ON
-  // piggyback too (a stale TLM subscription plus the radio path's frame
-  // throttle produced an ack-only barrage on an idle link). A lost
-  // ack/nack heals via the HOST's own retransmit/poll, one round trip
-  // later (S8.1's stale-retransmit re-ack; a gap re-nacks per inbound
-  // line).
+  // No reliability line rides here (protocol.md S8.5): an ack/nack is
+  // only ever a direct reply to an inbound sequenced line, never a
+  // beacon. A stale TLM subscription plus the radio path's frame
+  // throttle used to produce an ack-only barrage on an idle link. A
+  // lost ack/nack heals via the HOST's own retransmit or poll, one
+  // round trip later.
 }
 
 // A memo comparing only count/names would miss a hex-ness-only flip
@@ -1560,8 +1409,7 @@ bool WireHandler::headerChanged(const Snapshot& snapshot) const {
   // (rememberHeader() below only copies the first kMaxHeaderColumns of
   // it) -- treat it as always-changed rather than either overrunning
   // headerNames_/headerHex_ or silently comparing a truncated prefix.
-  // No real caller in this project approaches this cap (sprint.md's
-  // widest set is 20 columns).
+  // No real caller approaches this cap (the widest set is 20 columns).
   if (snapshot.count > kMaxHeaderColumns) return true;
   for (size_t i = 0; i < snapshot.count; ++i) {
     if (headerHex_[i] != snapshot.columns[i].hex) return true;

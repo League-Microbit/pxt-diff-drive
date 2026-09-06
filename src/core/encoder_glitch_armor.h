@@ -1,40 +1,25 @@
 // encoder_glitch_armor.h -- EncoderGlitchArmor: the raw-counts
-// plausibility decision extracted from NezhaMotorPort::collect()
-// (sprint 006 ticket 005, clasi/issues/brick-reset-odometry-teleport.md
-// / code review R-07, KERN-07).
+// plausibility decision NezhaMotorPort::collect() applies to every
+// encoder sample. Its own header rather than a NezhaMotorPort member
+// because nezha_port.h includes pxt.h unconditionally (src/DESIGN.md
+// S1's layering table) and so cannot be compiled host-side at all;
+// <cstdint> and nothing else here is what lets
+// tests/host/test_encoder_glitch_armor.py exercise the decision
+// directly and encoder_glitch_armor_syntax_check.cpp keep it in the
+// C++11 syntax gate. The call site in NezhaMotorPort::collect() is
+// review-verified only -- see its own comment in nezha_port.cpp.
 //
-// nezha_port.h includes pxt.h unconditionally (src/DESIGN.md S1's
-// layering table), so NezhaMotorPort itself cannot be compiled into any
-// host test -- there is no existing seam that exercises its I2C-bound
-// methods host-side, and nothing in this sprint changes that. This
-// header carries the one piece of the fix that CAN be host-compiled and
-// host-tested directly (tests/host/test_encoder_glitch_armor.py): the
-// pure two-strike plausibility decision. Wiring this into
-// NezhaMotorPort::collect() itself is review-verified only -- see that
-// method's own comment in nezha_port.cpp.
-//
-// No project includes, no pxt.h -- <cstdint> only, so this stays
-// host-portable (src/DESIGN.md S1) and is covered by
-// tests/host/test_cxx11_syntax_gate.py via a dedicated syntax-check
-// translation unit (tests/host/encoder_glitch_armor_syntax_check.cpp --
-// encoder_glitch_armor.h has no natural .cpp of its own).
-//
-// **What this fixes.** The pre-existing two-strike rule rejects an
-// implausible raw-counts jump on its first appearance, then ACCEPTS it
-// as truth if a second, mutually-consistent reading follows (the
-// documented hand-rotation re-sync path: a hand-repositioned wheel
-// reads a real, self-consistent jump). That rule cannot tell "the wheel
-// really moved that far between reads" apart from "the counter itself
-// restarted" (e.g. a brick MCU reset/brownout, encOffset_ captured once
-// at begin() and never re-baselined) -- both look identical: implausible
-// first read, then a second read consistent with the first. This class
-// adds the missing THIRD outcome for that same trigger:
-// kAcceptAsRebaseline, which the caller turns into an offset re-anchor
-// instead of an integrated jump, so a genuine reset stops teleporting
-// odometry (measured ~4 m at a typical ~50k-count reset, R-07) without
-// touching the existing behavior for the other two outcomes (an
-// ordinary plausible reading, or a first implausible reading with no
-// consistent second one yet).
+// **The problem it solves.** A two-strike rule that rejects an
+// implausible jump, then accepts it once a second mutually-consistent
+// reading follows, cannot tell "the wheel really moved that far
+// between reads" (the hand-rotation re-sync path) apart from "the
+// counter itself restarted" (a brick MCU reset or brownout --
+// encOffset_ is captured once at begin() and never re-baselined).
+// Both look identical: implausible first read, second read consistent
+// with it. kAcceptAsRebaseline is the third outcome for that same
+// trigger, which the caller turns into an offset re-anchor rather than
+// an integrated jump -- without it a reset teleports odometry by ~4 m
+// at a typical ~50k-count jump.
 #pragma once
 
 #include <cstdint>
@@ -98,12 +83,11 @@ class EncoderGlitchArmor {
   static constexpr int32_t kMaxDeltaCounts = 5000;
 
   // Evaluates one new raw sample against the accumulated two-strike
-  // state and returns the plausibility decision. Mutates internal state
-  // (lastGoodRaw_/lastRejectedRaw_/rejectPending_) exactly the way the
-  // original inline logic did, for every input this class has been
-  // primed with (see markPrimed()/seedLastGoodRaw() below -- before
-  // priming, every reading is accepted unconditionally, matching the
-  // pre-extraction behavior of an un-begun port).
+  // state and returns the plausibility decision, mutating
+  // lastGoodRaw_/lastRejectedRaw_/rejectPending_. Before priming (see
+  // markPrimed()/seedLastGoodRaw() below) every reading is accepted
+  // unconditionally -- an un-begun port has no baseline to judge one
+  // against.
   //
   // Explicit raw-zero rejection: a destroyed sample (an interposed I2C
   // transaction landing inside this counter's own select-to-read settle
@@ -144,10 +128,9 @@ class EncoderGlitchArmor {
   void seedLastGoodRaw(int32_t raw) { lastGoodRaw_ = raw; }
 
   // Arms the plausibility check. Split from seedLastGoodRaw() because
-  // the original code primed unconditionally at the end of begin() even
-  // when the initial read produced no usable sample (good == 0) --
-  // lastGoodRaw_ stays at its default (0) in that case, but the
-  // plausibility gate still arms, exactly reproducing that corner case.
+  // begin() arms unconditionally even when its initial read produced no
+  // usable sample (good == 0): lastGoodRaw_ then stays at its default
+  // of 0 while the gate is live, and that corner case is deliberate.
   void markPrimed() { primed_ = true; }
 
  private:

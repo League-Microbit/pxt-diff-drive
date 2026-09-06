@@ -1,30 +1,27 @@
 // run_queue.h -- the ring behind cleartext RUN: dispatch.
 //
-// WHAT THIS REPLACES. The original was a write cursor and nothing else:
-// four slots, a round-robin index, no occupancy, no overflow signal.
-// Text was handed to a listener as a SLOT NUMBER, and the writer reused
-// slots blindly -- so a burst of commands arriving while a long handler
-// was still running would overwrite payload that handler had not read
-// yet. Silently: no counter moved, no reply changed, and the handler
-// simply ran the wrong command. The 3 s same-text suppression that sat
-// in front of it was a workaround for exactly this, and it cost the
-// ability to send one command twice in a row.
+// A fixed ring with OCCUPANCY, not a bare write cursor: a slot is in
+// flight from enqueue() until release(), and enqueue() refuses --
+// counting a drop, saturating -- rather than trampling a slot still in
+// flight. Without that, a burst arriving while a long handler runs
+// overwrites payload that handler has not read yet, silently: no
+// counter moves, no reply changes, and the handler runs the wrong
+// command.
 //
-// WHY A SLOT INDEX AND A FIFO AT THE SAME TIME. The consumer is a
-// MessageBus listener that receives an integer and reads the text back
-// by that integer; it never says "done". So occupancy has to be closed
-// somewhere, and the read is the only honest place: a slot is in flight
-// from enqueue() until release(), and enqueue() refuses (counting a
-// drop) rather than trampling a slot still in flight. Allocation walks
-// the ring in order, so the slots a consumer sees are FIFO by
+// Occupancy is closed by RunBridge (run_bridge.h), which parks a
+// payload here and stages it back out from Protocol::dispatchJob(), on
+// the protocol fiber -- release() happens BEFORE the TypeScript handler
+// is called, so a job as long as a whole tour holds no slot. Allocation
+// walks the ring in order, so what a consumer sees is FIFO by
 // construction, and dequeue() exposes that order directly for a caller
-// that wants to drain rather than be pushed.
+// that wants to drain rather than be pushed. The 400 ms same-text
+// suppression in front of the ring (RunBridge::kDedupe) solves a
+// DIFFERENT problem -- duplicate EXECUTION of a host's retransmit --
+// and is not a substitute for occupancy.
 //
 // Host-portable on purpose -- no pxt.h, no CODAL types, nothing but
-// <cstdint>/<cstring> -- following the same split heading_wrap.h and
-// encoder_glitch_armor.h use: the logic worth testing lives where a
-// host test can reach it, and the CODAL-bound file keeps only the parts
-// that genuinely need CODAL.
+// <cstdint>/<cstring> -- the same split heading_wrap.h and
+// encoder_glitch_armor.h use.
 #pragma once
 
 #include <cstdint>

@@ -14,40 +14,25 @@ namespace diffDrive {
 // any object, fiber, scheduler or kernel state -- so it is callable
 // from a fault handler, where none of those can be trusted.
 //
-// WHY THIS EXISTS. MEASURED tigez 2026-08-30 (pyOCD halt on the wedged
-// chip; full forensics in captures/tigez-cal-20260830/): a radio-path
-// memory corruption makes controlStep()
-// dereference a pointer holding the ASCII bytes "PING", taking a
-// precise bus error (CFSR 0x8200, BFAR 0x474E4988). The board then sits
-// in the DEFAULT weak HardFault_Handler -- an infinite loop in
-// codal-nrf52's gcc_startup_nrf52833.S:303 -- so nothing panics,
-// nothing reboots, and THE BRICK KEEPS ITS LAST MOTOR COMMAND. The
-// wheels run until someone reflashes the board. This function is what
-// makes that impossible.
+// WHY THIS EXISTS. Left to codal-nrf52's DEFAULT weak
+// HardFault_Handler -- an infinite loop in gcc_startup_nrf52833.S:303
+// -- a fault panics nothing, reboots nothing, and THE BRICK KEEPS ITS
+// LAST MOTOR COMMAND: the wheels run until someone reflashes the board
+// (MEASURED tigez 2026-08-30, pyOCD halt on the wedged chip, CFSR
+// 0x8200 / BFAR 0x474E4988, forensics in
+// captures/tigez-cal-20260830/notes.md).
 //
-// UPDATE 2026-09-01 -- the "memory corruption" above is probably not
-// heap corruption. A second fault with the IDENTICAL CFSR 0x8200 was
-// root-caused on gopiv that day: CODAL's context switch saves no VFP
-// registers, GCC parks pointers in the callee-saved bank s16-s31, and a
-// fiber switch destroys them. A pointer restored from a clobbered FPU
-// register explains a dereference of "PING"-looking bytes with no heap
-// corruption at all. Anyone reading a fault here should suspect that
-// first: decode BFAR as a float and as ASCII before calling it garbage.
-// See the yield-discipline invariant in this package's design notes.
-//
-// UPDATE 2026-09-02 -- RESOLVED. The VFP-register-clobber theory above
-// was confirmed by retest: the radio-during-motion fault this whole
-// comment describes no longer reproduces. MEASURED tigez 2026-09-02
-// (28 radio-hammer trials -- PING hammered continuously over the radio
-// relay while MOVE_X pivots ran over USB, 14 trials on each of two
-// builds -- plus 6 radio-silent negative-control trials, 0 reset
-// signatures across all of them, full per-trial transcripts in
-// captures/tigez-radio-retest-20260902/): the guarded yield fix that
-// closes the register-clobber window (this file's vfp_guard.h) holds
-// even on the build that predates the emit-queue work, i.e. the guard
-// alone is what stops the fault, not anything downstream of it. This
-// function and the handlers below stay regardless -- a fault handler
-// that fails safe is correct even against a fault that no longer fires.
+// The root cause was the VFP register clobber vfp_guard.h now closes:
+// CODAL's context switch saves no VFP registers, GCC parks pointers in
+// the callee-saved bank s16-s31, and a fiber switch destroys them --
+// which is why that BFAR decoded as the ASCII bytes "PING" with no heap
+// corruption anywhere. Decode a future BFAR as ASCII and as a float
+// before calling it garbage. The fault no longer reproduces (MEASURED
+// tigez 2026-09-02, 28 radio-hammer trials over two builds plus 6
+// radio-silent controls, 0 reset signatures,
+// captures/tigez-radio-retest-20260902/). This function and the
+// handlers below stay regardless: a fault handler that fails safe is
+// correct even against a fault that no longer fires.
 //
 // A plain reboot is NOT sufficient on its own: the Rig (and with it
 // DifferentialDrive::begin()'s boot zero-write) is created LAZILY on
@@ -97,7 +82,8 @@ void diffdriveFaultReport(uint32_t* frame) {
 
   // NOTE: do NOT print here. uBit.serial.printf() is not fault-safe --
   // it blocked forever inside the handler when tried (MEASURED tigez
-  // 2026-08-30: pyOCD showed IPSR=3, PC parked in the handler). The
+  // 2026-08-30, captures/tigez-cal-20260830/notes.md: pyOCD showed
+  // IPSR=3, PC parked in the handler). The
   // motors were already stopped by then, so it was safe, but the board
   // no longer recovered. Forensics go through DIFFDRIVE_FAULT_SPIN.
 #ifdef DIFFDRIVE_FAULT_SPIN
@@ -180,43 +166,15 @@ void NezhaMotorPort::begin() {
   // Median-of-3 atomic reads -> software offset, so position() starts
   // at zero without ever device-resetting the counter.
   //
-  // Bus-hang guard (sprint 010 ticket 004 investigation -- see
-  // clasi/sprints/010-.../tickets/004-...md for the full written
-  // finding). This project's actual resolved build (codal-microbit-v2
-  // v0.3.5, confirmed via .tmp/deploy-head/built/codal.json after a
-  // real `pxt build`) pins codal-nrf52 commit 1fbb724, which is a
-  // confirmed descendant of BOTH upstream fixes the issue's research
-  // flagged: "NRF52I2C: Introduce transaction timeout" (2021-06-30) and
-  // "NRF52I2C::waitForStop: recover from hang" (2022-01/04). So
-  // writeFrame()/readEncoderRaw() below can no longer hang forever --
-  // codal-nrf52's own NRF52I2C::waitForStop() bounds one stuck
-  // transaction to ~NRF52I2C_TIMEOUT10US (1,000,000 x 10us = ~10s)
-  // before it force-recovers the bus, plus up to
-  // ~NRF52I2C_TIMEOUT10US_STOP (~1s) waiting for that recovery's own
-  // STOP to land -- roughly 11s worst case PER CALL, not infinite. That
-  // is a real, confirmed platform-level bound; it is NOT confirmed to
-  // be the exact path a genuinely unpowered (vs. mid-transaction-wedged)
-  // brick hits in practice -- an unpowered device more plausibly NACKs
-  // fast (NRF_TWIM_EVENT_ERROR fires immediately, checked every spin),
-  // which is a separate, much cheaper failure path through the same
-  // function. Only a bench check with a real dead brick (ticket 005)
-  // can settle which path fires.
-  //
-  // Given that ~11s-per-call ceiling is real either way, the original
-  // loop's "try all 3 samples regardless of an earlier failure" shape
-  // multiplies a bad worst case: up to 3 sequential hard failures per
-  // motor (~33s), up to 6 across both wheels in
-  // DifferentialDrive::begin() (~66s) before ever reporting
-  // connected()==false. Stopping at the FIRST hard failure (write or
-  // read) caps this motor's own worst case to one attempt (~11-22s)
-  // instead of three -- a real, bounded, honest delay, not the
-  // "silent, unbounded hang" the issue described, though still not
-  // fast. Trade-off, stated plainly: this also removes the old loop's
-  // tolerance for a single transient blip mid-sequence (e.g. sample 1
-  // NACKs on a cold-boot brownout but samples 2-3 would have been
-  // fine) -- previously that still produced a good median-of-2 boot;
-  // now it reports connected()==false on that motor. No bench evidence
-  // either way yet; ticket 005 should watch for it.
+  // Bus-hang guard. codal-nrf52 commit 1fbb724 -- what this project's
+  // codal-microbit-v2 v0.3.5 actually resolves to -- bounds one stuck
+  // I2C transaction at ~11s rather than forever:
+  // NRF52I2C::waitForStop() times out after ~10s and then waits up to
+  // ~1s for its recovery STOP. Break at the FIRST hard failure so a
+  // dead brick costs one such call per motor instead of three (~33s per
+  // motor, ~66s across both wheels in DifferentialDrive::begin()). The
+  // cost: a single transient NACK mid-sequence now reports
+  // connected() == false where a median-of-2 boot used to survive it.
   int32_t samples[3] = {0, 0, 0};
   int good = 0;
   for (int i = 0; i < 3; ++i) {
@@ -401,37 +359,24 @@ void NezhaMotorPort::collect(uint64_t now) {  // [us]
       // uses, generalized from "map to 0" to "map to the current
       // position."
       //
-      // Hold sampleTime_ here instead of falling through to the
-      // shared accept-path advance. MEASURED gopiv 2026-09-02,
-      // captures/gopiv-frozen-encoder-fix-20260902/notes.md: hardware
-      // acceptance of this ticket's OTHER guard below (raw ==
-      // previousGoodRaw) still reproduced the exact symptom it exists
-      // to eliminate -- i2cf incrementing together with a wire-
-      // reported velocity of exactly 0 and commanded duty stepping
-      // toward the rail -- five times in six tours on gopiv, every one
-      // traced to THIS branch, not the raw-unchanged one. The
-      // pre-existing reasoning here ("pos comes out equal to
-      // lastPosition_ by construction, so velocity_ correctly reads
-      // ~0") is the same "honestly-derived-but-wrong zero" shape this
-      // ticket's Description names for the raw-unchanged case: a
-      // confidently-fresh, honestly-computed zero sample is exactly
-      // what DifferentialDrive::refreshSample() (the vendored kernel)
-      // feeds straight to the velocity PID, and the PID cannot tell
-      // "this sample says 0 because the wheel stopped" apart from
-      // "this sample says 0 because we just discarded an untrustworthy
-      // raw delta." This tick's true velocity is unknown -- the armor
-      // rejected the raw delta as implausible precisely because it
-      // cannot be trusted as motion -- so withhold sampleTime_
-      // exactly as the raw-unchanged guard below and the outright
-      // read-failure branch already do, holding the prior known-good
-      // velocity instead of manufacturing a zero. The position
-      // re-anchor above (encOffset_) is unchanged and still prevents
-      // the multi-m/s reintegration spike a genuine counter restart
-      // would otherwise cause on the FOLLOWING tick; only the "also
-      // mint a fresh zero-velocity sample this same tick" side effect
-      // is removed. i2cFaultCount_ (core/diffdrive.cpp) still
-      // increments for this tick via the same sampleTime-unchanged
-      // condition, so the event stays visible in telemetry.
+      // Hold sampleTime_ here instead of falling through to the shared
+      // accept-path advance, exactly as the raw-unchanged guard below
+      // and the read-failure branch already do. This tick's true
+      // velocity is UNKNOWN -- the armor just rejected the raw delta as
+      // implausible -- and a confidently-fresh zero sample is what
+      // DifferentialDrive::refreshSample() (the vendored kernel) feeds
+      // straight to the velocity PID, which cannot tell "the wheel
+      // stopped" from "we discarded an untrustworthy delta" and steps
+      // the duty toward the rail. MEASURED gopiv 2026-09-02,
+      // captures/gopiv-frozen-encoder-fix-20260902/notes.md: i2cf
+      // incrementing alongside a wire-reported velocity of exactly 0,
+      // five tours in six, every one traced to THIS branch rather than
+      // the raw-unchanged one. The encOffset_ re-anchor above still
+      // prevents the multi-m/s reintegration spike a genuine counter
+      // restart would cause on the FOLLOWING tick, and
+      // i2cFaultCount_ (core/diffdrive.cpp) still increments via the
+      // same sampleTime-unchanged condition, so the event stays
+      // visible in telemetry.
       encOffset_ = raw - static_cast<int32_t>(lastPosition_) * fwdSign_;
       ++rebaselineCount_;
       connected_ = true;
