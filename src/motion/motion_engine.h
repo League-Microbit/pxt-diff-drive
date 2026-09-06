@@ -1,34 +1,15 @@
-// motion_engine.h -- diffDrive::MotionEngine: TWO PRIMITIVES and the
-// reductions onto them. wheelsX() commands per-wheel DISTANCE,
-// ratio-locked to a cruise ceiling so both wheels finish together;
-// wheelsV() commands per-wheel VELOCITY, held for a `duration` that IS
-// the kernel's own lease. moveX()/moveV()/goToR()/goToW() reduce onto
-// those two; each clears any in-flight command first, so exactly one of
-// Segment/Hold is ever live. Canonical spec (read-only, a different
-// repo -- this project conforms to its grammar, it does not vendor its
-// C++): radio-robot-lib/docs/design/motion-api.md S2 and S2.1.
+// diffDrive::MotionEngine -- two primitives and the reductions onto them.
+// wheelsX() commands per-wheel DISTANCE, ratio-locked so both wheels finish
+// together; wheelsV() commands per-wheel VELOCITY for a duration that IS
+// the kernel's lease. moveX()/moveV()/goToR()/goToW() reduce onto those
+// two, each clearing any in-flight command first.
 //
-// SIGN CONVENTION: CCW-positive. A positive twist/rotation turns LEFT
-// and increases camera yaw; the left wheel is the slower one in a left
-// turn. Never re-derived from cable order here --
-// tests/host/test_motion_engine_primitives.py pins it, so a future
-// cable-order "fix" fails a test instead of shipping.
+// SIGN CONVENTION: CCW-positive. A positive twist turns LEFT and increases
+// camera yaw; the left wheel is the slower one in a left turn. Never
+// re-derive this from cable order -- a host test pins it.
 //
-// GEOMETRY: b = effectiveTrackWidth() = trackWidth / rotationalSlip
-// (S2.1), a METHOD and never a stored field, so a config read-back can
-// never report a derived number as though it had been measured.
-// `trackWidth` is the one caliper-reachable number and is NEVER
-// "corrected" to make a turn land; all rotational scrub correction
-// belongs in `rotationalSlip`, which keeps a bad turn diagnosable
-// instead of merely compensated.
-//
-// Host-portable by construction: no pxt.h and no CODAL type in this
-// file or motion_engine.cpp, so the native host test harness
-// (tests/host/) links and exercises this class with no micro:bit
-// involved. ONE implementation, TWO callers: the TypeScript block API
-// arrives through shims.cpp's startMove()/engineGoToRArmed() forwards,
-// the wire adapter (wire_adapter.cpp) through engineMoveX() and its
-// siblings.
+// Grammar spec: radio-robot-lib/docs/design/motion-api.md (read-only, a
+// different repo). Design and rationale: DESIGN.md.
 #pragma once
 
 #include <cstdint>
@@ -40,16 +21,8 @@
 
 namespace diffDrive {
 
-// PoseSource -- a minimal world-pose read port for goToW() (motion-api.md
-// S3.6, S9.3 item 3: "the pose source is pluggable... OTOS when fitted,
-// encoder odometry otherwise"). Three reads, nothing else, no CODAL/PXT
-// dependency -- so a future robot with no OTOS at all (motion-api.md
-// S3.6's own `gopiv` example) can supply a trivial always-stale
-// implementation without breaking the interface, and the host test
-// harness can supply a fake with no OTOS anywhere in the link.
-// `OtosPort` (src/platform/otos_port.h) implements this for hardware;
-// `FakePoseSource` (tests/host/fake_pose_source.h) implements it for
-// tests.
+// A minimal world-pose read port for goToW(). Implemented by OtosPort
+// (hardware), Odometry (encoder fallback) and FakePoseSource (tests).
 class PoseSource {
  public:
   virtual ~PoseSource() = default;
@@ -57,71 +30,36 @@ class PoseSource {
   virtual float x() const = 0;  // [mm] world frame
   virtual float y() const = 0;  // [mm] world frame
 
-  // [rad] world frame, CCW+. Wrap convention is IMPLEMENTATION-DEFINED
-  // -- this interface does NOT mandate wrapped or unwrapped, because
-  // this project's two hardware implementations legitimately disagree
-  // by construction: `OtosPort` (src/platform/otos_port.h) reports heading
-  // WRAPPED to (-pi, pi] (the chip's own int16 register, full scale
-  // +/-pi); a Rig-odometry-backed source (motion-api.md S3.6's
-  // encoder fallback, `Odometry` -- `motion/odometry.h`) is
-  // deliberately UNWRAPPED (it accumulates heading without
-  // normalizing). Both are contractually valid
-  // because `MotionEngine::goToR()`/`goToW()` consume this value ONLY
-  // through cos()/sin() (wrap-invariant) -- resolves code review
-  // KERN-08, which found this comment's former unconditional
-  // "(unwrapped)" claim contradicted by `OtosPort`'s own construction.
-  // A caller that ever DIFFERENCES two heading() reads (rather than
-  // taking their cos/sin) must NOT assume a shared wrap convention
-  // across `PoseSource` implementations.
+  // [rad] world frame, CCW+. Wrap convention is IMPLEMENTATION-DEFINED:
+  // OtosPort wraps to (-pi, pi], Odometry does not. Valid because goToR()/
+  // goToW() consume this only through cos()/sin(). A caller that
+  // DIFFERENCES two reads must not assume a shared convention.
   virtual float heading() const = 0;
 };
 
 class MotionEngine {
  public:
-  // `kernel`/`clock` are constructed and owned by the CALLER (shims.cpp's
-  // Rig for hardware; the host test harness's own fixture for tests) --
-  // this class only ever holds references, the same pattern
-  // DiffDrive::DifferentialDrive itself uses for its own
-  // Motor/Clock/Sleeper/FiberLauncher ports rather than owning them.
-  // This class needs its own Clock reference, separate from the
-  // kernel's: the move engine's shaping (VelocityShaper's own dt) and
-  // its `timeout` backstop both need wall time independent of
-  // whether/when the kernel has last step()'d, and kernel_.drive()'s
-  // own clock_ reference (used to stamp a lease's `validUntil`) is
-  // private to DifferentialDrive. Geometry defaults below are the
-  // measured tovez/vevov bake -- see this class's own field comments for
-  // the measurement behind each.
+  // `kernel`/`clock` are owned by the caller; this class holds references
+  // only. The Clock is separate from the kernel's own because shaping and
+  // the timeout backstop need wall time whether or not the kernel stepped.
   MotionEngine(DiffDrive::DifferentialDrive& kernel,
                const DiffDrive::Clock& clock);
 
-  // ---- geometry (motion-api.md S2.1) ----
+  // ---- geometry ----
 
-  // [mm/deg] wheel travel per shaft degree; 1 count == 0.1 shaft degree,
-  // so counts-per-mm is 10 / travelCalib.
+  // [mm/deg] wheel travel per shaft degree.
   float travelCalib() const { return travelCalib_; }
   void setTravelCalib(float mmPerDeg) { travelCalib_ = mmPerDeg; }
 
-  // [mm] the CALIPER-MEASURED track width. Never adjust this to correct
-  // a turn -- see this file's header comment and motion-api.md S2.1.
+  // [mm] the CALIPER-MEASURED track width. Never adjust it to correct a
+  // turn -- all rotational correction belongs in rotationalSlip.
   float trackWidth() const { return trackWidth_; }
   void setTrackWidth(float mm) { trackWidth_ = mm; }
 
   // [1] physical/odometric rotation ratio (wheel-contact scrub),
-  // camera-measured against ground truth. This is where ALL rotational
-  // correction lives -- never trackWidth. See rotationalSlip_'s own
-  // field comment (below, next to its default) for the full camera
-  // measurement and the derivation chain from that measurement to the
-  // constant -- read that comment in full before setting a new value;
-  // it names exactly the shortcut that would produce a plausible-looking
-  // wrong number.
+  // camera-measured. Read DESIGN.md's derivation before setting a new
+  // value: the obvious shortcut produces a plausible wrong number.
   float rotationalSlip() const { return rotationalSlip_; }
-
-  // The knob UC-013 (calibrating a non-reference chassis) reaches for
-  // instead of `set track width`, which the doctrine above forbids
-  // using for rotation. Validation is inlined here -- ">0, else
-  // silently keep the prior value", the style setGeometry() applies to
-  // trackWidth/travelCalib -- because rotationalSlip has no wire-shaped
-  // wrapper of its own to carry it.
   void setRotationalSlip(float slip) {
     if (slip > 0.0f) rotationalSlip_ = slip;
   }
@@ -129,432 +67,210 @@ class MotionEngine {
   // [counts/mm] 1 count == 0.1 shaft degree.
   float countsPerMm() const { return 10.0f / travelCalib_; }
 
-  // [mm] b = trackWidth / rotationalSlip (motion-api.md S2.1) -- a
-  // METHOD, computed fresh on every call, deliberately never cached into
-  // a field so a config read-back can never report a derived number as
-  // though it had been measured.
+  // [mm] b = trackWidth / rotationalSlip. A method, never a cached field,
+  // so a config read-back cannot report a derived number as a measured one.
   float effectiveTrackWidth() const { return trackWidth_ / rotationalSlip_; }
 
-  // [mm/s] SUC-003: the distance-chosen default cruise speed (design
-  // motion-profile-unification.md S8): v_default(D) = min(limits_.vMax,
-  // sqrt(limits_.decel * D)) -- the triangle whose braking half fits in
-  // D -- for the moveX()/goToR()/goToW() family's `cruise == 0` "use the
-  // configured default" wire sentinel. Same "derived, never cached"
-  // pattern as effectiveTrackWidth() above: computed fresh, every call,
-  // from limits_ alone, so it can never drift from whatever accel/decel
-  // shaping is currently configured. `distance` is clamped to >= 0
-  // before the square root so a negative or degenerate leg length can
-  // never produce NaN. There is no escape hatch: limits_.decel is never
-  // 0 (MotionLimits' own default is 400), so this always resolves
-  // through the formula above.
-  float defaultCruiseForDistance(float distance) const;  // [mm] -> [mm/s]
+  // [mm] -> [mm/s] the default cruise for a leg of this length, for the
+  // `cruise == 0` wire sentinel: min(vMax, sqrt(decel * D)). Derived fresh
+  // every call, same as effectiveTrackWidth().
+  float defaultCruiseForDistance(float distance) const;
 
-  // [mm] SUC-003 input helper for defaultCruiseForDistance() above: the
-  // dominant-axis wheel-travel magnitude moveX()'s own wheels_x-style
-  // reduction would produce for (distance, rotation) -- the same
-  // `dominant` quantity startSegment() computes, restated here in mm
-  // rather than counts so a PURE PIVOT (distance == 0, rotation !=
-  // 0) still has a real, nonzero D instead of always resolving to 0 --
-  // a pivot's wheels genuinely travel `|rotation| *
-  // effectiveTrackWidth() / 2` mm each, even though the chassis itself
-  // does not translate. Approximates the exact
-  // `max(|distance - rotation*b/2|, |distance + rotation*b/2|)` split as
-  // `max(|distance|, |rotation|*b/2)` -- cheaper, and never LARGER
-  // than the exact split (same-signed terms only add), so a blended
-  // move's resolved default cruise is never more optimistic than the
-  // exact reduction would allow. Renamed from dominantAxisTravelMm() --
-  // unit now a trailing comment, per this project's naming rule.
-  float dominantAxisTravel(float distance, float rotation) const;  // [mm] [rad] -> [mm]
+  // [mm] [rad] -> [mm] the dominant-axis wheel travel for (distance,
+  // rotation), as input to defaultCruiseForDistance(). A pure pivot's
+  // wheels genuinely travel |rotation| * b / 2 even though the chassis
+  // does not translate.
+  float dominantAxisTravel(float distance, float rotation) const;
 
-  // A caller-facing pair (moveX()/goToR()) that reports its own
-  // reconciled duration alongside `cruise`, in [s] -- a plain aggregate
-  // (see AxisLimits above for why: no default member initializers, so
-  // it stays a C++11 aggregate).
   struct DualRateReconciliation {
-    float cruise;        // [mm/s] see reconcileDualRateCruise() below
-    float distDuration;  // [s] the distance axis's own ceiling-limited duration
-    float yawDuration;   // [s] the yaw axis's own ceiling-limited duration
+    float cruise;        // [mm/s]
+    float distDuration;  // [s] the distance axis at its own ceiling
+    float yawDuration;   // [s] the yaw axis at its own ceiling
   };
 
-  // The block API (`move`/`goTo`) exposes two INDEPENDENT rate ceilings
-  // -- a distance-axis speed and a yaw-axis rate -- but every native
-  // move-engine entry point (moveX()/goToR()) takes exactly one
-  // `cruise`. This reconciles the two into that one value: whichever
-  // axis takes LONGER at its own ceiling governs a shared `duration`
-  // (`distDuration`/`yawDuration`, both returned so a caller whose own
-  // move splits into sequential phases can budget a deadline off their
-  // SUM instead of this method's own max-based `duration`), and
-  // `cruise` is the dominant WHEEL's speed that reproduces the exact
-  // same commanded velocity/twist a caller driving both axes at this
-  // single ceiling would produce. `distance` [mm] and `rotation` [rad]
-  // are the axis targets (as moveX() itself would receive them, or the
-  // bearing/chord pair goToR()'s own split queues -- see decomposeGoToR()
-  // below); `speed` [mm/s] and `yawRate` [rad/s] must already be
-  // floored to a positive value by the caller (the same "avoid a
-  // divide-by-zero, not a meaningful floor" contract shims.cpp's
-  // startMove() already applies to its own int-scale inputs before
-  // converting them here). Returns cruise/distDuration/yawDuration all
-  // 0 when there is nothing to do (both axes already at target),
-  // matching beginSegment()'s own "dominant <= 0" degenerate contract.
+  // The block API exposes two independent rate ceilings; every native entry
+  // point takes one `cruise`. This collapses them: whichever axis takes
+  // longer governs a shared duration, and `cruise` is the dominant wheel
+  // speed reproducing that motion. Both axis durations are returned so a
+  // caller whose move splits into phases can budget off their sum. `speed`
+  // and `yawRate` must already be floored positive by the caller. All-zero
+  // return means there is nothing to do.
   DualRateReconciliation reconcileDualRateCruise(
       float distance, float rotation, float speed,
       float yawRate) const;  // [mm] [rad] [mm/s] [rad/s]
 
-  // ---- the two primitives (motion-api.md S3.1/S3.2) ----
+  // ---- the two primitives ----
 
-  // wheels_v(left, right, duration): hold each wheel at a commanded
-  // velocity [mm/s] for `duration` [ms] -- duration IS the kernel's
-  // lease, no reinterpretation. velocity = mean(left, right), twist =
-  // half-differential (right - left) -- CCW-positive, per this file's
-  // header comment. Clears any in-flight command first (motion-api.md
-  // S6: "wheels_* clears the planner"). Drives nothing synchronously:
-  // this arms `hold_` (target v, twist, deadline) and resets the
-  // shaper, and service() slews toward the hold and issues the actual
-  // kernel_.drive() call. So the first nonzero command lands one
-  // service() tick (~24 ms) later, as it does at every entry point --
-  // see shims.cpp's isDriving()/commandLooksActive() for how the
-  // continuous-drive tick loop stays alive across that first tick.
+  // Hold each wheel at a velocity for `duration`, which IS the kernel's
+  // lease. Clears the planner. Drives nothing synchronously: this arms the
+  // hold, and the first command lands one service() tick later.
   void wheelsV(float left, float right, uint32_t duration);  // [mm/s] [mm/s] [ms]
 
-  // wheels_x(left, right, cruise, timeout): move each wheel a commanded
-  // DISTANCE [mm] at a ratio locked to `cruise` [mm/s] (the DOMINANT
-  // wheel's ceiling, motion-api.md S3.1) so both wheels finish together.
-  // A Segment, CLOSED-LOOP on encoders like moveX(): `timeout` is the
-  // segment's real deadline backstop, never its stop condition
-  // (motion-api.md S3.1). A zero-magnitude command
-  // (both wheels commanding no distance) or a non-positive cruise
-  // commands nothing NEW -- but it is not purely inert: it also stops
-  // any motion already in progress (stages kernel_.neutral()), including
-  // a still-live wheelsV() hold, since this primitive's own "clear the
-  // planner" step (above) never touches the kernel by itself. Clears
-  // any in-flight command first, same as wheelsV() above.
+  // Move each wheel a distance, ratio-locked to `cruise` (the DOMINANT
+  // wheel's ceiling) so both finish together. Closed-loop on encoders;
+  // `timeout` is a deadline backstop, never the stop condition. A
+  // zero-magnitude command or non-positive cruise commands nothing new but
+  // still stops motion already in progress. Clears the planner.
   void wheelsX(float left, float right, float cruise, uint32_t timeout);  // [mm] [mm] [mm/s] [ms]
 
-  // [rad] the |rotation| threshold moveX() (below) uses to decide
-  // pivot-then-straight vs one blended segment -- the single source of
-  // truth for `kTurnFirstAngle` (private, below), exposed here so a
-  // caller that must mirror moveX()'s own split decision (e.g.
-  // shims.cpp's startMove(), budgeting a caller-supplied timeout) reads
-  // it from this class instead of re-typing the constant a second time.
+  // [rad] the |rotation| at which moveX() splits into pivot-then-straight.
+  // Exposed so a caller mirroring that decision reads it rather than
+  // re-typing the constant.
   static constexpr float turnFirstAngle() { return kTurnFirstAngle; }
 
-  // goToR()'s own bearing-then-chord decomposition of a body-frame
-  // target (x forward, y left, both [mm]), extracted into its own pure
-  // function so a caller that must reconcile a SEPARATE yaw-rate
-  // ceiling against goToR()'s own split decision (e.g. the block API's
-  // go-to entry point) can compute the exact same split goToR() itself
-  // will make, rather than re-deriving it and risking drift -- same
-  // rationale as turnFirstAngle() just above, extended to the whole
-  // decomposition instead of only its threshold. See goToR()'s own
-  // comment (below/motion_engine.cpp) for the derivation of each field;
-  // `bearingRaw`/`chord` are the pivot/straight pair goToR() queues when
-  // `willSplit`, `theta`/`arcLength` are the single blended segment's
-  // own (rotation, distance) pair when it is not. A plain aggregate,
-  // same reason AxisLimits/DualRateReconciliation above are.
+  // goToR()'s bearing-then-chord decomposition, pure so a caller
+  // reconciling a separate yaw-rate ceiling makes the identical split.
   struct GoToRPlan {
     float bearingRaw;  // [rad] atan2(y, x) -- the pivot angle when willSplit
-    float theta;       // [rad] wrapped 2*bearingRaw -- goToR()'s own split-decision angle, and the blended segment's own rotation when !willSplit
-    float chord;       // [mm] hypot(x, y) -- the straight-phase distance when willSplit
-    float arcLength;   // [mm] the blended segment's own signed distance when !willSplit
+    float theta;       // [rad] wrapped 2*bearingRaw -- the blended rotation
+    float chord;       // [mm] hypot(x, y) -- the straight phase when willSplit
+    float arcLength;   // [mm] the blended segment's signed distance
     bool willSplit;    // |theta| >= kTurnFirstAngle
   };
   static GoToRPlan decomposeGoToR(float x, float y);  // [mm] [mm]
 
-  // ---- move engine (motion-api.md S3.3-S3.5) -- see this file's header
-  // comment for the shape of each reduction. ----
+  // ---- move engine ----
 
-  // move_x(distance, rotation, cruise, timeout): see header comment.
-  // Supersedes any in-flight command (this call's own prior phase, or a
-  // previous moveX()/goToR()/wheelsX()/wheelsV() never finished) --
-  // exactly one Segment or Hold is ever active at a time.
+  // Supersedes any in-flight command. Splits into pivot-then-straight above
+  // kTurnFirstAngle when there is also translation.
   void moveX(float distance, float rotation, float cruise,
              uint32_t timeout);  // [mm] [rad] [mm/s] [ms]
 
-  // move_v(vx, omega, duration): the plain wheelsV reduction --
-  // vx +- omega*b/2 -- held for `duration`, no shaping beyond what
-  // wheelsV()'s own hold already gets. CCW-positive, per this file's
-  // header comment.
+  // The plain wheelsV reduction, vx +- omega*b/2, held for `duration`.
   void moveV(float vx, float omega, uint32_t duration);  // [mm/s] [rad/s] [ms]
 
-  // go_to_r(x, y, speed, arrive, timeout): see header comment. `x`
-  // forward, `y` left, both [mm]; `speed` is the resulting segment's
-  // cruise. A target within `arrive` [mm] of the current position
-  // (radially: `hypot(x, y) <= arrive`; (0, 0) with any `arrive >= 0`
-  // is included) is a no-op -- nothing is driven (sprint 006, KERN-04).
-  // Otherwise this method makes its OWN pivot-vs-blend split decision
-  // (sprint 006, KERN-02/03) instead of inheriting moveX()'s generic
-  // one -- see header comment for why, and for the short-arc
-  // normalization applied to the arc angle before that decision.
+  // Drive to a body-frame target (`x` forward, `y` left). A target within
+  // `arrive` of the current position is a no-op. Single-shot: a caller
+  // wanting repeat-until-arrival re-issues the call. Makes its OWN
+  // pivot-vs-blend split rather than inheriting moveX()'s -- see DESIGN.md.
   void goToR(float x, float y, float speed, float arrive,
              uint32_t timeout);  // [mm] [mm] [mm/s] [mm] [ms]
 
-  // go_to_w(x, y, speed, arrive, timeout): see header comment. `x`, `y`
-  // are WORLD-frame [mm]; `pose` supplies the current world pose this
-  // call reads ONCE, at call time -- not stored. Rotates the world-frame
-  // delta (x - pose.x(), y - pose.y()) into the body frame by
-  // -pose.heading() (this file's CCW-positive convention) and delegates
-  // to goToR() above. A target equal to the current pose reduces to a
-  // (0, 0) body-frame delta, which goToR() already treats as a no-op.
+  // World-frame goToR(): reads `pose` ONCE, at call time, rotates the delta
+  // into the body frame and delegates.
   void goToW(const PoseSource& pose, float x, float y, float speed,
              float arrive, uint32_t timeout);  // [mm] [mm] [mm/s] [mm] [ms]
 
-  // The single per-tick advance (design S5, motion-profile-
-  // unification.md): dispatches whichever of seg_/hold_ is active,
-  // through shaper_, at most one kernel_.drive()/neutral() per call.
-  // Callers invoke it once per control cycle while isDriving()/
-  // isMoveActive(), and it owns nothing about odometry -- callers
-  // update that themselves around this call.
+  // The single per-tick advance: dispatches whichever of seg_/hold_ is
+  // active through shaper_, at most one kernel drive()/neutral() per call.
+  // Owns nothing about odometry -- callers update that around this call.
   bool service();
 
-  // True iff a position-mode Segment (MOVE_X/GO_TO_R/GO_TO_W/WHEELS_X)
-  // is in flight; a continuous wheelsV() hold does NOT make this true
-  // (see isDriving() below for the union of both).
+  // A position-mode Segment is in flight. A continuous hold does not count.
   bool isMoveActive() const { return seg_.active; }
 
-  // True iff EITHER a Segment or a continuous Hold is currently driving
-  // the wheels. Because no entry point calls kernel_.drive()
-  // synchronously (design S6.5's lazy start), a caller inferring
-  // "something is driving" from the kernel's own
-  // Output.appliedDutyLeft/Right immediately after arming a hold would
-  // see stale zero duty for one extra tick -- so shims.cpp's
-  // commandLooksActive() reads THIS instead of isMoveActive().
+  // Either a Segment or a Hold is driving. Callers inferring "something is
+  // driving" must read this, not the kernel's applied duty, which is one
+  // tick stale after a command is armed.
   bool isDriving() const { return seg_.active || hold_.active; }
 
-  // True iff the MOST RECENT Segment to go inactive ended because ITS
-  // OWN deadline (seg_.deadline, service()'s own `expired` check) was
-  // reached, rather than by reaching its own goal (step.arriving), an
-  // abort (wrongWay/stallHalted/estopped/a refused drive), or an
-  // external cancelMove()/endMove(). Set ONCE, synchronously, at the
-  // exact service() tick the engine itself ends the segment -- a caller
-  // that reads this an arbitrary time later still gets the answer as of
-  // THAT tick, unlike re-deriving "did it time out" from a wire-side
-  // deadline compared against a clock read fresh at whenever the
-  // caller happens to ask (correct only if that ask lands before the
-  // deadline elapses; wrong for an early-arriving move whose next poll
-  // happens to be late). Persists across the seg_ reset that ends a
-  // segment (it lives on MotionEngine, not on Segment) until the NEXT
-  // segment overwrites it in beginSegment() -- see that method's own
-  // reset -- so it is well-defined at any later read as long as no
-  // newer segment has started since.
+  // The most recent Segment ended on its own deadline rather than by
+  // arriving, aborting or being cancelled. Latched on the exact tick the
+  // segment ended, so a later read still answers as of that tick; valid
+  // until the next segment starts.
   bool lastSegmentEndedByDeadline() const {
     return lastSegmentEndedByDeadline_;
   }
 
-  // Force-end the current command now (no-op if neither a Segment nor a
-  // Hold is active): neutrals the kernel if something was active, resets
-  // the shaper, then clears both seg_/hold_ (design S4.4's table).
+  // Force-end the current command now; no-op if nothing is active.
   void endMove();
 
-  // Fraction of the current Segment's dominant axis completed,
-  // [0..1000]; 1000 if no Segment is active (matches "isMoving()? ->
-  // false" reading as "already there"). A continuous wheelsV() hold has
-  // no notion of "done" -- unaffected by this method, same as before.
+  // [0..1000] dominant-axis fraction completed; 1000 when no Segment is
+  // active. A continuous hold has no notion of done and is unaffected.
   int progress() const;
 
   uint32_t wrongWayCount() const { return wrongWayCount_; }
 
-  // ---- settle-tick decision ----
-  // Steps the kernel up to kSettleMaxSteps times, breaking as soon as
-  // BOTH wheels' measured velocity (Output.velocityLeft/Right) reads
-  // within kSettleRestCountsPerS of zero. Needed because
-  // kernel_.neutral() only STAGES a zero command: delivery to the
-  // motors happens on the kernel's NEXT step(), and that one extra
-  // step's own encoder read can land mid-spin-down, freezing
-  // Output.velocityLeft/Right at a nonzero value forever unless the
-  // kernel keeps stepping until both wheels are MEASURED at rest
-  // (bench-measured 2026-08-20, commit 3e919e5).
-  //
-  // Issues no kernel_.drive()/neutral() of its own -- it only steps the
-  // kernel and reads Output back -- and folds nothing into odometry:
-  // odometry ownership stays with the CALLER (shims.cpp's tickDrive(),
-  // this codebase's one caller and its own single ticker), which
-  // updates it once, immediately after this returns.
+  // Steps the kernel until both wheels MEASURE at rest, bounded. Needed
+  // because neutral() only stages a zero command and the delivering step's
+  // own encoder read can otherwise freeze a nonzero velocity forever.
+  // Issues no command of its own and folds nothing into odometry.
   void settleToRest();
 
-  // The ONE settable shaping surface: accel/decel/jerk/vMax/omegaMax
-  // ceilings, vFloor/omegaFloor floors, and the arrival windows
-  // (stopDistance/arriveDist/arriveYaw) all live on the returned
-  // MotionLimits -- see motion_limits.h for each field's own comment.
-  // This engine holds no shaping knob of its own.
+  // The one settable shaping surface. This engine holds no shaping knob.
   MotionLimits& limits() { return limits_; }
   const MotionLimits& limits() const { return limits_; }
 
  private:
-  // |rotation| at/above this is NOT one blended segment -- pivot to the
-  // new heading first, then travel straight (motion-api.md S3.3,
-  // `navigator.cpp:237-240`'s measured `turn_first_angle`). 50 deg.
+  // [rad] 50 deg. At or above this, pivot first, then travel straight.
   static constexpr float kTurnFirstAngle = 0.8726646f;
 
-  // settleToRest()'s own bound and rest threshold. [steps] /
-  // [counts/s, ~2 mm/s].
-  static constexpr int kSettleMaxSteps = 12;
-  static constexpr float kSettleRestCountsPerS = 25.0f;
+  static constexpr int kSettleMaxSteps = 12;          // [steps]
+  static constexpr float kSettleRestCountsPerS = 25.0f;  // [counts/s] ~2 mm/s
 
-  // [counts] a pivot/blended-arc's yaw axis must have moved at least
-  // this far, in EITHER direction, before wrongWay() (segment.h) is
-  // trusted at all: a cold wheel's brief start-up skew reads backward
-  // before real rotation begins, and segment.h's own kWrongWayMargin
-  // (12 counts) floors out only small noise. 40 sits well above that,
-  // so a real skew of a few tens of counts cannot trip a false abort,
-  // and well below any real pivot's own target.
+  // [counts] the yaw axis must move this far, either way, before
+  // Segment::wrongWay() is trusted -- a cold wheel's start-up skew reads
+  // backward before real rotation begins.
   static constexpr float kMinYawProgressBeforeWrongWay = 40.0f;
 
-  // [mm/s] [mm/s] the pair a caller reads back from axisLimits() below
-  // -- a plain aggregate (no default member initializers, so it stays a
-  // C++11 aggregate; see tests/host/test_cxx11_syntax_gate.py's own
-  // header comment on why that distinction matters in this file).
+  // A plain aggregate: no default member initializers, so it stays C++11.
   struct AxisLimits {
-    float floor;
-    float cap;
+    float floor;  // [mm/s]
+    float cap;    // [mm/s]
   };
 
-  // Continuous-drive state (design S4.4): wheelsV()'s own target, slewed
-  // toward through shaper_ every service() tick while active. Exactly
-  // one of seg_/hold_ is ever live -- cancelMove() (below) clears both.
+  // wheelsV()'s target, slewed toward through shaper_ every tick. Exactly
+  // one of seg_/hold_ is ever live.
   struct Hold {
     bool active = false;
     float v = 0.0f;         // [mm/s] target mean velocity
     float twist = 0.0f;     // [mm/s] target half-differential
-    float dominant = 0.0f;  // [mm/s] max(|v-twist|, |v+twist|) -- the
-                            //   dominant wheel's own target speed
-                            //   (design S5: `target = hold_.dominant`)
+    float dominant = 0.0f;  // [mm/s] max(|v-twist|, |v+twist|)
     uint32_t until = 0;     // [ms] the caller's duration deadline
   };
 
-  // [ms] this engine's own notion of "now" -- see the constructor
-  // comment on why a separate Clock reference is needed at all.
-  uint32_t now() const;
+  uint32_t now() const;  // [ms]
 
-  // design S6.2: converts THIS segment's own axis (pure turn -> deg/s,
-  // else linear mm/s) into the dominant-wheel [mm/s] floor/cap
-  // VelocityShaper::advance() wants, using limits_ and
-  // effectiveTrackWidth(). Pure turn: floor = omegaFloorAsWheelSpeed(b),
-  // cap = omegaMaxAsWheelSpeed(b) if limits_.omegaMax > 0, else +inf.
-  // Anything else (a straight leg or a blended arc): floor = vFloor,
-  // cap = +inf -- motion-api.md S3.3's own "the pivot rate is derived
-  // from cruise, this design adds a ceiling and a floor on that derived
-  // rate" note applies only to the dominant WHEEL speed on a pure turn;
-  // an arc's linear axis has no such wire-facing cap of its own.
+  // Converts this segment's axis into the dominant-wheel floor/cap the
+  // shaper wants. A pure turn uses the omega floor/ceiling; a straight leg
+  // or blended arc uses vFloor and no cap.
   AxisLimits axisLimits(const Segment& seg) const;
 
-  // Builds seg_ from (distance, rotation, cruise): the shared
-  // tail of wheelsX()'s per-wheel reduction and moveX()'s
-  // distance/rotation reduction (both compute distTarget/yawTarget in
-  // counts, then call this). Sets seg_.active/originPending/dominant/
-  // dominantAxis, resets shaper_, and stages NO kernel_.drive() call --
-  // design S6.5's lazy origin capture means the first real command is
-  // issued by the FIRST service() call, not here. A zero-magnitude
-  // command or a non-positive cruise leaves seg_.active false and
-  // stages kernel_.neutral() unconditionally (same degenerate contract
-  // wheelsX()/the old startSegment() always had).
+  // Builds seg_ -- the shared tail of wheelsX()'s per-wheel reduction and
+  // moveX()'s distance/rotation reduction. Stages no drive() call: the
+  // first real command is issued by the first service(). A zero-magnitude
+  // command or non-positive cruise leaves seg_ inactive and neutrals.
   void beginSegment(float distTarget, float yawTarget, float cruise,
                     uint32_t deadline);  // [counts] [counts] [mm/s] [ms]
 
-  // Queue a pivot to `pivotRotation` now, then `straightDistance` [mm]
-  // straight once that pivot completes cleanly -- the shared tail of
-  // moveX()'s own pivot-first split (motion-api.md S3.3) and goToR()'s
-  // above-threshold bearing-pivot-then-chord split (sprint 006,
-  // KERN-02): both are "pivot then straight," differing only in which
-  // (rotation, distance) pair is queued. `deadline` is the ONE
-  // deadline spanning both phases (motion-api.md's single `timeout`
-  // field).
+  // Pivot now, then travel straight once that pivot completes cleanly --
+  // the shared tail of moveX()'s split and goToR()'s. `deadline` spans
+  // both phases.
   void queuePivotThenStraight(float pivotRotation, float straightDistance,
-                               float cruise,
-                               uint32_t deadline);  // [rad] [mm] [mm/s] [ms]
+                              float cruise,
+                              uint32_t deadline);  // [rad] [mm] [mm/s] [ms]
 
-  // service()'s own phase 1 -> phase 2 handoff tail (design S6.4): reads
-  // seg_.pendingDistance/pendingCruise/deadline (captured into locals
-  // BEFORE beginSegment() below resets seg_ to a fresh default), then
-  // starts the straight phase exactly like a fresh beginSegment() call
-  // -- lazy origin capture (S6.5) means this phase's own origin is
-  // captured on the FOLLOWING service() tick, after the caller's own
-  // step() has delivered the neutral service() already staged and K4
-  // has disarmed the kernel's references.
+  // service()'s phase 1 -> phase 2 handoff: captures the pending fields
+  // before beginSegment() resets seg_, then starts phase 2 normally.
   void beginPendingStraightPhase();
 
-  // Clears BOTH seg_ and hold_ without touching the kernel -- the
-  // shared tail of endMove() and of every primitive/reduction's own
-  // "clear the planner" contract (motion-api.md S6). Clears BOTH,
-  // because exactly one of Segment/Hold is ever live and a new command
-  // replaces either.
+  // Clears BOTH seg_ and hold_ without touching the kernel -- every
+  // primitive's "clear the planner" step, and endMove()'s tail.
   void cancelMove();
 
   DiffDrive::DifferentialDrive& kernel_;
   const DiffDrive::Clock& clock_;
 
-  // CAMERA-MEASURED vevov 2026-08-25 on the playfield: twelve
-  // `RUN:straight` legs at 30/55/85 cm, both directions, each bracketed
-  // by overhead-AprilCam fixes taken AT REST (commanded 85 cm ->
-  // odometry believed 85.10 cm -> camera measured 82.7 cm). The error
-  // is SCALE, not offset, which is what makes this constant the right
-  // knob: a zero-intercept fit of shortfall against distance gives
-  // 2.7608% with residuals under 0.21 cm, where a stopping or deadline
-  // overshoot would have fitted as a constant term instead and would
-  // NOT be fixable here.
-  //
-  // KNOCK-ON FOR ROTATION, which must not be "fixed" twice: heading is
-  // (wheel travel)/track, so the same scale error propagated into
-  // rotation. Camera-truthed 90 deg pivots read camera/encoder 0.9805
-  // against the pre-correction travel scale, leaving ~0.9% of
-  // over-rotation -- that residual, never the raw 0.9805, is what
-  // rotationalSlip_ below answers for. Generic kits calibrate via
-  // setTravelCalib()/setTrackWidth() (shims.cpp's setGeometry() block).
-  float travelCalib_ = 0.7878f;  // [mm/deg] wheel travel per shaft degree
-
-  // [mm] MEASURED track (stakeholder tape, 2026-08-19). This is the
-  // robot's geometry; it is never "corrected" -- turning slip is
-  // modeled separately by rotationalSlip_ below.
-  float trackWidth_ = 114.2f;
-
-  // [1] physical/odometric rotation ratio (wheel-contact scrub).
-  // CAMERA-MEASURED 2026-08-20 on the playfield, overhead AprilCam vs
-  // commanded: six steady-state 180 deg pivots turned 164-166 deg
-  // physical, ratio 0.915.
-  //
-  // 0.915 is NOT the slip -- do not set rotationalSlip_ to 0.915 (or to
-  // any number reproduced by re-running this same experiment and
-  // stopping at the ratio). It is the ratio between the ACTUAL physical
-  // rotation and the rotation the firmware commanded that day, and what
-  // the firmware commanded was itself computed through the STALE
-  // effectiveTrackWidth in effect at the time it ran: trackWidth_
-  // (114.2, already tape-measured 2026-08-19, unchanged since) divided
-  // by the 1.040 rotationalSlip_ this entry replaces, i.e.
-  // 114.2/1.040 = 109.8 mm. Since the robot under-rotated (164-166 <
-  // 180), the TRUE effectiveTrackWidth must be LARGER than that 109.8 --
-  // specifically 109.8/0.915 = 120.0 mm (dividing, not multiplying, by
-  // the ratio -- effectiveTrackWidth and commanded-vs-actual rotation
-  // move in opposite directions in motion_engine.cpp's kinematics: a
-  // bigger b means the SAME wheel travel yields LESS rotation, matching
-  // this measurement). Only then: slip = trackWidth_/effectiveTrackWidth
-  // = 114.2/120.0 = 0.952. Reproducing 164-166/180 = 0.915 from the same
-  // experiment and "fixing" 0.952 to match is exactly the bridge this
-  // comment exists to block -- the dropped middle step (109.8 -> 120.0)
-  // is what separates the two numbers.
-  float rotationalSlip_ = 0.952f;
-
-  // ---- move/hold state (design S4.4) ----
+  // Geometry defaults are the measured tovez/vevov bake. The measurements
+  // and their derivations are in DESIGN.md; generic kits recalibrate
+  // through setGeometry() (shims.cpp).
+  float travelCalib_ = 0.7878f;   // [mm/deg] wheel travel per shaft degree
+  float trackWidth_ = 114.2f;     // [mm] tape-measured
+  float rotationalSlip_ = 0.952f; // [1] physical/odometric rotation ratio
 
   Segment seg_;
   Hold hold_;
   VelocityShaper shaper_;
   MotionLimits limits_;
 
-  // [ms] the previous service() tick's own now(), for the shaper's
-  // `dt` -- set at every genuine start (a fresh Segment, or a Hold
-  // transitioning from idle/a superseded Segment) so the FIRST tick's
-  // dt is measured from when the command was armed, not from some
-  // unrelated earlier tick. A dead read before either seg_/hold_ has
-  // ever gone active (service() returns before touching it).
+  // [ms] the previous service() tick, for the shaper's dt. Re-stamped at
+  // every genuine command start so the first tick's dt runs from when the
+  // command was armed.
   uint32_t lastTick_ = 0;
 
-  // Moves aborted because the robot was rotating AWAY from the
-  // commanded direction (service()). Cumulative since construction.
+  // Moves aborted for rotating away from the commanded direction.
   uint32_t wrongWayCount_ = 0;
 
-  // Backing field for lastSegmentEndedByDeadline() above -- see that
-  // accessor's own doc comment. Set at every site in service()/endMove()
-  // that ends a Segment, and reset in beginSegment() when a new one
-  // starts.
   bool lastSegmentEndedByDeadline_ = false;
 };
 

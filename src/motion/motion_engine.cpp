@@ -1,8 +1,4 @@
-// motion_engine.cpp -- see motion_engine.h for the class contract, the
-// two-primitive design (motion-api.md S2), the geometry rationale
-// (S2.1), and the move engine (S3.3-S3.5). Host-portable: this file
-// includes nothing but <cmath>/<limits> and its own header -- no pxt.h,
-// no CODAL type.
+// See motion_engine.h for the class contract and DESIGN.md for rationale.
 #include "motion_engine.h"
 
 #include <cmath>
@@ -12,20 +8,12 @@ namespace diffDrive {
 
 namespace {
 
-// [rad] -- literal, matching this project's existing convention (see
-// e.g. otos_port.h/shims.cpp) rather than relying on <cmath>'s
+// [rad] literal, matching this project's convention rather than <cmath>'s
 // non-standard M_PI.
 constexpr float kPi = 3.14159265f;
 
-// Wrap an angle to the short arc, (-pi, pi].
-// goToR()'s arc-angle formula (`theta = 2*atan2(y, x)`) doubles atan2's
-// own principal value, so it can land up to just under +-2*pi even
-// though atan2(y,x) itself never exceeds +-pi -- that "long way around"
-// value reaches the same (x, y) on the same constant-curvature circle
-// as the short, wrapped angle (the circle is periodic), but only the
-// short one is a sane distance to actually drive. The input here is
-// always bounded to (-2*pi, 2*pi] (twice an atan2 result), so a single
-// conditional wrap suffices -- no loop, no fmod, needed.
+// Wrap to the short arc, (-pi, pi]. The input is always twice an atan2
+// result, so one conditional suffices -- no loop, no fmod.
 float wrapToPi(float angle) {  // [rad]
   if (angle > kPi) return angle - 2.0f * kPi;
   if (angle <= -kPi) return angle + 2.0f * kPi;
@@ -42,15 +30,12 @@ uint32_t MotionEngine::now() const {
   return static_cast<uint32_t>(clock_.nowMicros() / 1000ull);
 }
 
-// See motion_engine.h's own comment on this method for the contract and
-// design motion-profile-unification.md S8's formula.
 float MotionEngine::defaultCruiseForDistance(float distance) const {
-  const float d = distance > 0.0f ? distance : 0.0f;
+  const float d = distance > 0.0f ? distance : 0.0f;  // no NaN from sqrt
   const float vAllow = std::sqrt(limits_.decel * d);
   return vAllow < limits_.vMax ? vAllow : limits_.vMax;
 }
 
-// See motion_engine.h's own comment on this method for the contract.
 float MotionEngine::dominantAxisTravel(float distance,
                                        float rotation) const {
   const float distTravel = std::fabs(distance);
@@ -58,20 +43,14 @@ float MotionEngine::dominantAxisTravel(float distance,
   return yawTravel > distTravel ? yawTravel : distTravel;
 }
 
-// See motion_engine.h's own comment on this method for the contract and
-// derivation. Byte-for-byte the same duration/dominant/cruise algebra
-// shims.cpp's startMove() has always used for its own (distance,
-// rotation, speed, yawRate) call shape -- relocated here, unchanged,
-// so a second caller (the block API's go-to entry point) can share it
-// instead of re-deriving it.
 MotionEngine::DualRateReconciliation MotionEngine::reconcileDualRateCruise(
     float distance, float rotation, float speed, float yawRate) const {
   const float cpm = countsPerMm();
   const float b = effectiveTrackWidth();
-  const float distTarget = distance * cpm;              // [counts]
-  const float yawTarget = rotation * 0.5f * b * cpm;     // [counts]
-  const float distSpeed = speed * cpm;                   // [counts/s]
-  const float twistSpeed = yawRate * 0.5f * b * cpm;     // [counts/s]
+  const float distTarget = distance * cpm;            // [counts]
+  const float yawTarget = rotation * 0.5f * b * cpm;  // [counts]
+  const float distSpeed = speed * cpm;                // [counts/s]
+  const float twistSpeed = yawRate * 0.5f * b * cpm;  // [counts/s]
 
   float distDuration = 0.0f;  // [s]
   if (distTarget != 0.0f) distDuration = std::fabs(distTarget) / distSpeed;
@@ -92,34 +71,20 @@ MotionEngine::DualRateReconciliation MotionEngine::reconcileDualRateCruise(
   return DualRateReconciliation{cruise, distDuration, yawDuration};
 }
 
-// See motion_engine.h's own GoToRPlan comment for why this is pulled
-// out of goToR() below rather than left inline: a second caller (the
-// block API's go-to entry point, reconciling a separate yaw-rate
-// ceiling) must make the exact same split decision goToR() does, and
-// can only be trusted never to drift from it by sharing this function
-// rather than re-deriving atan2/wrap/hypot a second time.
 MotionEngine::GoToRPlan MotionEngine::decomposeGoToR(float x, float y) {
-  // motion-api.md S3.5's arc-angle formula: bearingRaw = atan2(y,x) is
-  // the line-of-sight direction to the target, always already bounded
-  // to (-pi, pi]; thetaRaw = 2*bearingRaw is the constant-curvature
-  // arc's own turn angle, which is NOT similarly bounded -- doubling can
-  // land up to just under +-2*pi. Wrap it to the short arc, (-pi, pi],
-  // BEFORE deciding anything else: the wrapped and unwrapped values
-  // reach the same (x, y) on the same circle (it's periodic), but only
-  // the short one is a sane distance to drive, and only the short one
-  // may correctly decide the split below.
-  const float bearingRaw = std::atan2(y, x);  // [rad] signed, |.| <= pi
-  const float thetaRaw = 2.0f * bearingRaw;   // [rad] signed, |.| < 2*pi
-  const float theta = wrapToPi(thetaRaw);     // [rad] signed, |.| <= pi
+  // thetaRaw doubles atan2's principal value, so it can reach nearly
+  // +-2*pi. Wrap it BEFORE deciding the split: both values reach the same
+  // point on the same circle, but only the short one is sane to drive.
+  const float bearingRaw = std::atan2(y, x);  // [rad] |.| <= pi
+  const float thetaRaw = 2.0f * bearingRaw;   // [rad] |.| < 2*pi
+  const float theta = wrapToPi(thetaRaw);     // [rad] |.| <= pi
   const float chord = std::hypot(x, y);       // [mm] >= 0
   const bool willSplit = std::fabs(theta) >= kTurnFirstAngle;
 
-  // The blended-arc reduction (motion-api.md S3.5), restated via the
-  // signed circle radius R = (x^2+y^2)/(2y), s = R*theta -- the same
-  // formula algebraically as arc length = radius*angle, avoiding a
-  // sin() near theta == 0. Computed unconditionally (cheap, and needed
-  // only when !willSplit) rather than only inside that branch, so this
-  // one function is the single source of truth for BOTH outcomes.
+  // Blended-arc reduction via the signed radius R = (x^2+y^2)/(2y),
+  // s = R*theta -- algebraically arc = radius*angle, but with no sin()
+  // near theta == 0. Computed unconditionally so this one function is the
+  // single source of truth for both outcomes.
   float arcLength;  // [mm] signed
   if (std::fabs(y) < 0.1f) {  // ~0.01 cm: call it straight
     arcLength = x;
@@ -131,8 +96,6 @@ MotionEngine::GoToRPlan MotionEngine::decomposeGoToR(float x, float y) {
   return GoToRPlan{bearingRaw, theta, chord, arcLength, willSplit};
 }
 
-// design S6.2: converts this segment's own axis into the dominant-wheel
-// [mm/s] floor/cap. See motion_engine.h's own comment on this method.
 MotionEngine::AxisLimits MotionEngine::axisLimits(const Segment& seg) const {
   const float b = effectiveTrackWidth();
   const float kInfinity = std::numeric_limits<float>::infinity();
@@ -153,7 +116,7 @@ void MotionEngine::cancelMove() {
 void MotionEngine::wheelsV(float left, float right, uint32_t duration) {
   const bool wasSegActive = seg_.active;
   const bool wasHoldActive = hold_.active;
-  cancelMove();  // motion-api.md S6: wheels_* clears the planner
+  cancelMove();
 
   const float v = 0.5f * (left + right);      // [mm/s] target mean
   const float twist = 0.5f * (right - left);  // [mm/s] target half-diff
@@ -167,33 +130,18 @@ void MotionEngine::wheelsV(float left, float right, uint32_t duration) {
   hold_.until = now() + duration;
   hold_.active = true;
 
-  // A genuinely NEW continuous-drive session (previously idle, or
-  // superseding a position-mode Segment) restarts the shaper from the
-  // floor, same as any fresh Segment (design S4.2: "at every segment
-  // start"). A wheelsV() call that only UPDATES an already-live hold's
-  // own target (e.g. a closed-loop steering correction re-issuing
-  // setWheels() every cycle) does NOT reset -- the shaper keeps slewing
-  // from whatever it is currently commanding toward the new target
-  // instead of re-floor-starting on every call. Design left this exact
-  // choice open (S4.2 only says "at every segment start"); see this
-  // ticket's own report for the alternative considered (always reset)
-  // and why it was rejected.
+  // A genuinely new hold restarts the shaper from the floor. A call that
+  // only RETARGETS a live hold (closed-loop steering re-issuing every
+  // cycle) does not -- it keeps slewing from what it is commanding now.
   if (wasSegActive || !wasHoldActive) {
     shaper_.reset();
     lastTick_ = now();
   }
 }
 
-// Builds seg_ from (distTarget, yawTarget, cruise,
-// deadline) -- the shared tail of wheelsX()'s per-wheel reduction and
-// moveX()'s distance/rotation reduction. See motion_engine.h's own
-// comment on this method.
 void MotionEngine::beginSegment(float distTarget, float yawTarget,
                                 float cruise, uint32_t deadline) {
-  cancelMove();  // motion-api.md S6: a new command supersedes any prior
-                 // Segment/Hold, degenerate or not (see wheelsX()'s own
-                 // doc comment: "not purely inert" -- it must stop a
-                 // still-live wheelsV() hold too).
+  cancelMove();
 
   const float left = distTarget - yawTarget;
   const float right = distTarget + yawTarget;
@@ -201,9 +149,7 @@ void MotionEngine::beginSegment(float distTarget, float yawTarget,
   const float absRight = std::fabs(right);
   const float dominant = absLeft > absRight ? absLeft : absRight;
   if (dominant <= 0.0f || cruise <= 0.0f) {
-    // Nothing NEW to command -- cancelMove() above already cleared any
-    // prior state; unconditionally neutral the kernel too, same
-    // degenerate contract wheelsX()/the old startSegment() always had.
+    // Nothing new to command, but still stop anything already moving.
     kernel_.neutral();
     return;
   }
@@ -217,12 +163,9 @@ void MotionEngine::beginSegment(float distTarget, float yawTarget,
   seg_.originPending = true;
   seg_.deadline = deadline;
   seg_.active = true;
-  // A fresh segment has not ended yet, by either path -- see
-  // lastSegmentEndedByDeadline()'s own doc comment (motion_engine.h)
-  // for why this only matters once THIS segment itself ends.
   lastSegmentEndedByDeadline_ = false;
 
-  shaper_.reset();  // design S4.2: v = 0, a = 0 at every segment start
+  shaper_.reset();
   lastTick_ = now();
 }
 
@@ -240,6 +183,7 @@ void MotionEngine::queuePivotThenStraight(float pivotRotation,
 }
 
 void MotionEngine::beginPendingStraightPhase() {
+  // Captured before beginSegment() below resets seg_.
   const float distance = seg_.pendingDistance;
   const float cruise = seg_.pendingCruise;
   const uint32_t deadline = seg_.deadline;
@@ -258,18 +202,10 @@ void MotionEngine::wheelsX(float left, float right, float cruise,
 
 void MotionEngine::moveX(float distance, float rotation, float cruise,
                          uint32_t timeout) {
-  // One deadline for the WHOLE call (both phases, if the pivot-first
-  // split below fires) -- the wire's own single `timeout` field, a REAL
-  // backstop.
-  const uint32_t deadline = now() + timeout;
+  const uint32_t deadline = now() + timeout;  // spans both phases
 
-  // motion-api.md S3.3's measured table: a rotation this large combined
-  // with an actual translation is NOT one blended segment -- pivot to
-  // the new heading first (distance == 0 here), then travel the
-  // remainder straight (rotation == 0 there). A pure pivot (distance ==
-  // 0 already) or a rotation under the threshold stays one segment --
-  // the degenerate cases motion-api.md S2.1 calls out (move_x(d,0)
-  // straight, move_x(0,theta) pivot) are both single-segment already.
+  // A large rotation combined with actual translation is not one blended
+  // segment. A pure pivot, or a rotation under the threshold, stays one.
   if (distance != 0.0f && std::fabs(rotation) >= kTurnFirstAngle) {
     queuePivotThenStraight(rotation, distance, cruise, deadline);
   } else {
@@ -281,84 +217,45 @@ void MotionEngine::moveX(float distance, float rotation, float cruise,
 }
 
 void MotionEngine::moveV(float vx, float omega, uint32_t duration) {
-  // motion-api.md S2: move_v(v_x, omega) == wheels_v(v_x - omega*b/2,
-  // v_x + omega*b/2). wheelsV() itself clears any in-flight moveX().
   const float twist = omega * 0.5f * effectiveTrackWidth();  // [mm/s] CCW+
   wheelsV(vx - twist, vx + twist, duration);
 }
 
 void MotionEngine::goToR(float x, float y, float speed, float arrive,
                          uint32_t timeout) {
-  // `arrive` is a radial no-op gate, checked ahead of any
-  // split decision -- being within `arrive` [mm] of the target
-  // (including exactly at it, since hypot(0,0) == 0 for any arrive >=
-  // 0) issues no segment at all. This replaces the old exact-float-
-  // equality guard (`x == 0.0f && y == 0.0f`), which a measured pose
-  // (goToW() subtracts two live reads) could essentially never satisfy
-  // -- still single-shot, no supervisory re-solve: a caller wanting
-  // repeat-until-arrival re-issues goToR() itself (see header comment).
+  // Radial no-op gate, ahead of any split decision.
   if (std::hypot(x, y) <= arrive) return;
 
-  // decomposeGoToR() (see motion_engine.h's own comment on it) is this
-  // same bearing-then-chord decomposition, extracted so a second caller
-  // can share it rather than re-derive it -- the formula itself is
-  // unchanged from before that extraction.
   const GoToRPlan plan = decomposeGoToR(x, y);
 
   if (plan.willSplit) {
-    // goToR owns this split instead of inheriting moveX()'s
-    // generic one. moveX()'s own pivot-first split would reissue
-    // theta/arc-length as pivot-then-straight, which lands at a
-    // DIFFERENT endpoint than the blended arc (arc length != chord
-    // length except in the limit) -- e.g. goToR(100, 100) would pivot
-    // 90 deg then drive the 157.1 mm ARC length straight, landing at
-    // (0, 157.1) instead of (100, 100), a 115 mm miss on a 141 mm hop.
-    // Pivoting to the line-of-sight bearing (already short-arc by
-    // construction -- atan2's own principal value) then driving the
-    // straight-line chord instead reaches (x, y) exactly, no matter how
-    // large the bearing is. One deadline for the WHOLE call (both
-    // phases). This call bypasses the public moveX() entirely so it can
-    // force this split regardless of whether |bearingRaw| alone would
-    // have crossed moveX()'s own threshold (see header comment).
+    // Pivot to the line-of-sight bearing, then drive the straight-line
+    // CHORD. Bypasses moveX() so this split fires regardless of whether
+    // the bearing alone would cross moveX()'s threshold -- moveX()'s own
+    // split would drive the ARC length straight and land elsewhere.
     const uint32_t deadline = now() + timeout;
     queuePivotThenStraight(plan.bearingRaw, plan.chord, speed, deadline);
   } else {
-    // Plain arc reduction (motion-api.md S3.5), unchanged below
-    // threshold -- `plan.theta` is already the SHORT-ARC-normalized
-    // value (see decomposeGoToR()'s own comment), not the raw
-    // 2*atan2(y, x).
     moveX(plan.arcLength, plan.theta, speed, timeout);
   }
 }
 
 void MotionEngine::goToW(const PoseSource& pose, float x, float y,
                          float speed, float arrive, uint32_t timeout) {
-  // motion-api.md S2/S3.6: "go_to_w(x, y) == read pose -> world-to-body
-  // -> go_to_r". Read the pose ONCE, here, at call time -- goToW() takes
-  // no supervisory re-solve any more than goToR() does (see that
-  // method's own comment).
   const float dx = x - pose.x();
   const float dy = y - pose.y();
   const float heading = pose.heading();
   const float cosH = std::cos(heading);
   const float sinH = std::sin(heading);
 
-  // World-to-body rotation by -heading, matching this file's CCW-
-  // positive convention (header comment): body x (forward) is the world
-  // delta projected onto the heading direction; body y (left) is the
-  // world delta projected onto the direction 90 deg CCW from heading.
-  // Sign/rotation-direction errors hide exactly here when heading is
-  // both nonzero AND the position offset is nonzero -- see this file's
-  // own test coverage (tests/host/test_motion_engine_gotow.py).
+  // World-to-body rotation by -heading (CCW-positive): body x is the delta
+  // projected onto the heading, body y onto 90 deg CCW of it.
   const float bodyX = dx * cosH + dy * sinH;
   const float bodyY = -dx * sinH + dy * cosH;
 
   goToR(bodyX, bodyY, speed, arrive, timeout);
 }
 
-// The whole per-tick behaviour (design S5): segment-or-hold dispatch,
-// no mode forks. See motion_engine.h's own comment on this method for
-// what changed from the old serviceMove().
 bool MotionEngine::service() {
   if (!seg_.active && !hold_.active) return false;
 
@@ -369,34 +266,19 @@ bool MotionEngine::service() {
   const float cpm = countsPerMm();
 
   if (seg_.active) {
-    // 6.5: first tick after start() -- capture the origin from THIS
-    // tick's already-published Output (the caller's own step() has
-    // already run, and applied any deferred rebase, before service() is
-    // ever called).
+    // First tick after start: capture the origin from this tick's already
+    // published Output, which the caller's step() has produced and any
+    // deferred rebase has already landed in.
     if (seg_.originPending) {
       seg_.posLeft0 = out.positionLeft;
       seg_.posRight0 = out.positionRight;
       seg_.originPending = false;
     }
 
-    // Clamp at 0: Segment::remaining() is a SIGNED "toward the target"
-    // quantity and can land a hair negative on the exact tick the
-    // target is reached or overshot (float rounding in the pivot/
-    // distance arithmetic, or a real overshoot past the target by less
-    // than one tick's travel) -- VelocityShaper::advance()'s own
-    // `remain < 0` branch is reserved for the continuous-hold caller's
-    // "no displacement bound" sentinel (design S6.1: "remain < 0 means
-    // no displacement bound"), never for a Segment, which always has a
-    // real, bounded target. Passing a barely-negative remain through
-    // unclamped would silently flip advance() into that unbounded
-    // branch -- skipping the floor and, more importantly, the
-    // predictive-arrival test itself (`remain >= 0.0f && ...`) -- so a
-    // segment landing exactly on (or a hair past) its target would
-    // never be detected as arrived at all. MEASURED against this
-    // engine (tests/host/test_motion_engine_reductions.py's
-    // behind-robot goToR split cases): an exact-target arm computed
-    // remain = -0.00001, which read arriving=false and kept driving
-    // indefinitely until this clamp was added.
+    // Clamp at 0: remaining() is signed and can land a hair negative on
+    // the tick the target is reached. A negative remain means "no
+    // displacement bound" to the shaper, which would skip the arrival test
+    // entirely and drive forever.
     float remain = seg_.remaining(out) / cpm;
     if (remain < 0.0f) remain = 0.0f;
     const AxisLimits al = axisLimits(seg_);
@@ -404,90 +286,59 @@ bool MotionEngine::service() {
     if (al.cap < target) target = al.cap;
     if (limits_.vMax < target) target = limits_.vMax;
 
-    // design S6.1 step 0: the kernel's own last-measured
-    // dominant-axis speed, on THIS segment's own dominant axis -- a
-    // pure turn's dominant axis is the half-differential (mirrors
-    // axisLimits()'s own pureTurn() branch and Segment::remaining()'s
-    // own kYaw branch, both already scaled in "one wheel's own linear
-    // speed" units); anything else (straight or blended arc) is the
-    // mean of the two wheels. Sign-normalized toward the target via
-    // fabs() -- a wheel briefly moving the WRONG way is already caught
-    // by wrongWay() below, not by this measurement.
+    // The kernel's last-measured speed on THIS segment's dominant axis.
+    // Sign-normalized: a wheel briefly moving the wrong way is wrongWay()'s
+    // problem, not this measurement's.
     const float vAct = seg_.dominantAxis == Segment::Axis::kYaw  // [mm/s]
         ? std::fabs(0.5f * (out.velocityRight - out.velocityLeft) / cpm)
         : std::fabs(0.5f * (out.velocityLeft + out.velocityRight) / cpm);
     const VelocityShaper::Step step =
         shaper_.advance(target, remain, al.floor, al.cap, dt, limits_, vAct);
 
-    // A cold wheel's brief start-up skew can register as backward
-    // progress before real rotation begins -- trust wrongWay()'s own
-    // verdict only once the yaw axis has moved at least
-    // kMinYawProgressBeforeWrongWay in either direction; below
-    // that, hold off and let a later tick's own (by-then-genuine)
-    // progress decide.
+    // Trust wrongWay() only once the yaw axis has genuinely moved.
     const bool wrongWay =
         seg_.wrongWay(out) &&
-        std::fabs(seg_.yawProgress(out)) >=
-            kMinYawProgressBeforeWrongWay;
+        std::fabs(seg_.yawProgress(out)) >= kMinYawProgressBeforeWrongWay;
     const bool expired = static_cast<int32_t>(nowVal - seg_.deadline) >= 0;
     if (wrongWay || out.stallHalted || out.estopped || expired) {
       if (wrongWay) ++wrongWayCount_;
-      // Latched HERE, synchronously, on the exact tick this segment
-      // ends -- see lastSegmentEndedByDeadline()'s own doc comment
-      // (motion_engine.h) for why a caller reading it arbitrarily later
-      // still gets the answer as of THIS tick, not a stale re-derivation
-      // against a since-elapsed clock. `expired` alone decides it:
-      // wrongWay/stallHalted/estopped are all abort reasons, never a
-      // timeout, even if `expired` also happens to be true on the same
-      // tick (deadline had first refusal in the `||` above only for
-      // WHETHER to end the segment, not for WHY).
+      // The deadline had first refusal above only for WHETHER to end the
+      // segment; an abort reason still wins on WHY.
       lastSegmentEndedByDeadline_ = expired && !wrongWay && !out.stallHalted &&
-                                     !out.estopped;
+                                    !out.estopped;
       kernel_.neutral();
       seg_ = Segment();
       return false;
     }
 
-    if (step.arriving) {  // 6.3: the plan says "this is the last tick"
+    if (step.arriving) {
       kernel_.neutral();
       if (seg_.hasPending) {
-        // 6.4: the pivot->straight handoff goes through rest. neutral()
-        // above only STAGES the stop; it lands, and rearmReferences()
-        // disarms the twist-hold/position references, on the caller's
-        // NEXT step(). Phase 2 therefore re-anchors fresh instead of
-        // carrying phase 1's accumulated reference, and issues its own
-        // first command a tick later still (S6.5's lazy start).
+        // The pivot -> straight handoff goes through rest: neutral() above
+        // only stages the stop, and it lands, along with rearmReferences()
+        // disarming the kernel's references, on the caller's next step().
+        // Phase 2 then re-anchors fresh instead of carrying phase 1's
+        // accumulated reference.
         kernel_.rearmReferences();
         beginPendingStraightPhase();
         return seg_.active;
       }
-      // Reached its own goal -- never a timeout, regardless of how
-      // close `nowVal` sits to seg_.deadline on this exact tick.
       lastSegmentEndedByDeadline_ = false;
       seg_ = Segment();
       return false;
     }
 
-    // The (uLeft, uRight) ratio (motion-api.md S4) is implied by
-    // (distTarget, yawTarget): recomputed from step.vCmd EVERY tick,
-    // not stored as a full-rate pair scaled afterwards (design S4.3).
+    // The (uLeft, uRight) ratio is implied by (distTarget, yawTarget),
+    // recomputed from step.vCmd every tick rather than stored.
     const float velocity = (seg_.distTarget / seg_.dominant) * step.vCmd;
     const float twist = (seg_.yawTarget / seg_.dominant) * step.vCmd;
     const DiffDrive::DifferentialDrive::Status driveStatus =
         kernel_.drive(velocity * cpm, twist * cpm, 500u);
-    // this ticket: beginSegment() issues NO drive() of its own
-    // (design S6.5's lazy start), so a refused command (maxDuty == 0,
-    // e-stopped, non-finite target, ...) can only ever be discovered
-    // HERE, on the segment's own first (or any later) service() tick --
-    // never at moveX()/wheelsX() call time the way the old synchronous
-    // startSegment() could. Without this check a permanently-refused
-    // drive() (e.g. an unconfigured kernel) would re-issue every tick,
-    // never land, and spin the segment all the way to its own deadline
-    // exactly like a move that actually ran -- the same defect this
-    // ticket's own test_refused_drive_does_not_arm_move_active guards,
-    // now detected one tick later than before instead of not at all.
+    // Because no entry point drives synchronously, a refused command can
+    // only be discovered here. Without this check a permanently-refused
+    // drive would re-issue every tick and spin out the whole deadline
+    // looking exactly like a move that ran.
     if (driveStatus != DiffDrive::DifferentialDrive::Status::kOk) {
-      // A refused drive ends the segment right now -- never a timeout.
       lastSegmentEndedByDeadline_ = false;
       kernel_.neutral();
       seg_ = Segment();
@@ -496,17 +347,15 @@ bool MotionEngine::service() {
     return true;
   }
 
-  // continuous hold (wheelsV()/moveV()).
+  // Continuous hold (wheelsV()/moveV()).
   const bool holdExpired = static_cast<int32_t>(nowVal - hold_.until) >= 0;
   if (holdExpired) {
     kernel_.neutral();
     hold_.active = false;
     return false;
   }
-  // No single dominant axis to measure against a slewing
-  // continuous-hold target -- the sentinel case (design S5/S6.1's own
-  // "remain < 0 means no displacement bound" branch never uses vAct
-  // for anything but the arrival test, which is unreachable here).
+  // remain < 0: no displacement bound, and no dominant axis worth measuring
+  // against a slewing target.
   const VelocityShaper::Step step = shaper_.advance(
       hold_.dominant, -1.0f, 0.0f, limits_.vMax, dt, limits_, -1.0f);
   const float scale = hold_.dominant > 0.0f ? (step.vCmd / hold_.dominant)
@@ -524,10 +373,8 @@ bool MotionEngine::service() {
 }
 
 void MotionEngine::endMove() {
-  // An explicit external end (STOP/ESTOP) -- never a timeout, and takes
-  // priority over whatever the LAST natural termination happened to be
-  // (only matters if a Segment was actually live; a no-op call here must
-  // not overwrite a still-meaningful earlier value).
+  // An explicit external end is never a timeout, but a no-op call must not
+  // overwrite a still-meaningful earlier verdict.
   if (seg_.active) lastSegmentEndedByDeadline_ = false;
   if (seg_.active || hold_.active) kernel_.neutral();
   seg_ = Segment();
@@ -536,12 +383,6 @@ void MotionEngine::endMove() {
 }
 
 void MotionEngine::settleToRest() {
-  // Extracted verbatim from shims.cpp::tickDrive()'s former inline
-  // loop -- see motion_engine.h's own comment on this method for the
-  // full contract and the bench history
-  // (commit 3e919e5) it guards. Behavior is identical to the loop it
-  // replaces, not merely similar: same bound, same threshold, same
-  // break condition, no new command ever issued.
   for (int i = 0; i < kSettleMaxSteps; ++i) {
     kernel_.step();
     const DiffDrive::DifferentialDrive::Output o = kernel_.output();
@@ -556,11 +397,8 @@ void MotionEngine::settleToRest() {
 
 int MotionEngine::progress() const {
   if (!seg_.active) return 1000;
-  // Lazy origin capture (S6.5): before the first service() tick has
-  // ever run for this segment, posLeft0/posRight0 have not been
-  // captured yet -- reporting a fraction computed against that
-  // uninitialized (0, 0) baseline would be nonsense, not merely stale.
-  // Nothing has happened yet, so 0 is the honest answer.
+  // Before the first service() tick the origin is uncaptured, so a fraction
+  // against it would be nonsense rather than merely stale.
   if (seg_.originPending) return 0;
   const DiffDrive::DifferentialDrive::Output out = kernel_.output();
   return static_cast<int>(seg_.progress(out) * 1000.0f);
