@@ -2,11 +2,22 @@
 // nezha_motor.cpp; the shaping-stage ORDER is load-bearing.
 #include "nezha_port.h"
 
+// Declaration only (`void vfpSafeSleep(uint32_t)`); the pxt-bound
+// definition is vfp_guard.cpp, which the host harness replaces with its
+// own no-op -- there are no fibers to yield to on the host.
 #include "vfp_guard.h"
 
 #include <cmath>
 
+// Host tests exclude CODAL and ARM fault handlers, not motor shaping.
+// Keep DIFFDRIVE_FAULT_SPIN here: make_deploy.py validates it by source.
+#ifndef DIFFDRIVE_HOST_BUILD
+#include "pxt.h"
+#endif
+
 namespace diffDrive {
+
+#ifndef DIFFDRIVE_HOST_BUILD
 
 // ---- fault-context emergency stop -----------------------------------
 //
@@ -55,23 +66,9 @@ extern "C" void diffdrive_emergency_motor_stop() {
 
 // ---- fail-safe fault handlers ---------------------------------------
 //
-// These OVERRIDE the weak defaults in codal-nrf52's
-// gcc_startup_nrf52833.S, every one of which is an infinite loop. That
-// default is what turned a fault into a runaway robot: the CPU stopped,
-// the display stayed blank, every fiber died, and the brick held its
-// last motor command indefinitely (MEASURED tigez 2026-08-30 -- see
-// diffdrive_emergency_motor_stop() above for the full forensics).
-//
-// Order matters:
-//   1. STOP THE MOTORS -- before anything else can go wrong. A reset
-//      alone would leave the brick driving, because the Rig (and its
-//      boot zero-write) is only created on the first motion command.
-//   2. REPORT -- print the fault site so a wedge is diagnosable from a
-//      serial log instead of needing a debugger on the wedged chip.
-//   3. RESET -- the board comes back on its own.
-//
-// Nothing here allocates, takes a lock, or yields: a fault handler must
-// assume memory is already corrupt.
+// Override CODAL's weak infinite-loop handlers: stop the motors first,
+// then reset (or retain the frame for a debugger in a fault-spin build).
+// Do not allocate, lock, print, or yield: memory may already be corrupt.
 extern "C" {
 
 // `frame` is the hardware-stacked exception frame:
@@ -121,6 +118,8 @@ __attribute__((naked)) void UsageFault_Handler() {
 
 }  // extern "C"
 
+#endif  // DIFFDRIVE_HOST_BUILD -- fault handlers are ARM-only
+
 
 namespace {
 float clampf(float value, float lo, float hi) {
@@ -132,25 +131,15 @@ float clampf(float value, float lo, float hi) {
 
 bool NezhaMotorPort::writeFrame(uint8_t arg, uint8_t reg, uint8_t val) {
   uint8_t frame[8] = {0xFF, 0xF9, port_, arg, reg, val, 0xF5, 0x00};
-  // codal-microbit-v2 (V2) I2C takes uint8_t*; classic DAL (V1) takes char*.
-#if MICROBIT_CODAL
-  int status = uBit.i2c.write(kAddress << 1, frame, 8);
-#else
-  int status = uBit.i2c.write(kAddress << 1,
-                              reinterpret_cast<char*>(frame), 8);
-#endif
-  return status == MICROBIT_OK;
+  // The V1/V2 signature split this used to switch on lives in the bus
+  // implementation now (platform/microbit_i2c_bus.cpp); 0 is CODAL's
+  // MICROBIT_OK, which `I2CBus` adopts as its own success convention.
+  return bus_.write(kAddress << 1, frame, 8) == 0;
 }
 
 bool NezhaMotorPort::readEncoderRaw(int32_t* raw) {
   uint8_t data[4] = {0, 0, 0, 0};
-#if MICROBIT_CODAL
-  int status = uBit.i2c.read(kAddress << 1, data, 4);
-#else
-  int status = uBit.i2c.read(kAddress << 1,
-                             reinterpret_cast<char*>(data), 4);
-#endif
-  if (status != MICROBIT_OK) return false;
+  if (bus_.read(kAddress << 1, data, 4) != 0) return false;
   *raw = static_cast<int32_t>(
       static_cast<uint32_t>(data[0]) |
       (static_cast<uint32_t>(data[1]) << 8) |

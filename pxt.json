@@ -27,6 +27,8 @@
         "src/core/bus_guard.h",
         "src/core/motion_owner.h",
         "src/core/fiber_identity.h",
+        "src/platform/i2c_bus.h",
+        "src/platform/microbit_i2c_bus.cpp",
         "src/platform/nezha_port.h",
         "src/platform/nezha_port.cpp",
         "src/platform/otos_port.h",

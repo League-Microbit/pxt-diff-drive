@@ -31,6 +31,10 @@ struct Segment {
 
   uint32_t deadline = 0;  // [ms] the caller's timeout backstop
   bool active = false;
+  bool settling = false;
+  uint8_t restSamples = 0;
+  uint32_t restSampleLeft = 0;
+  uint32_t restSampleRight = 0;
 
   // Rotation only, no translation. A blended arc is NOT a pure turn.
   bool pureTurn() const { return yawTarget != 0.0f && distTarget == 0.0f; }

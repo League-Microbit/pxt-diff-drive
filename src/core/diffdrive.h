@@ -200,7 +200,7 @@ class DifferentialDrive {
   bool running() const { return running_; }
 
   Status drive(float velocity, float twist,
-               uint32_t lease);       // [counts/s] [counts/s] [ms]
+               uint32_t lease, float responseLag = 0.0f);  // [counts/s] [counts/s] [ms] [s]
   Status driveDuty(float dutyLeft, float dutyRight,
                    uint32_t lease);   // [%] [%] [ms]
   void neutral();        // commanded stop through the full stop path
@@ -253,6 +253,7 @@ class DifferentialDrive {
     uint8_t mode = kModeNeutral;
     float velocity = 0.0f;     // [counts/s]
     float twist = 0.0f;        // [counts/s]
+    float responseLag = 0.0f;  // [s]
     float dutyLeft = 0.0f;     // [%]
     float dutyRight = 0.0f;    // [%]
     uint32_t validUntil = 0;   // [ms] absolute kernel clock; computed in drive()
@@ -362,6 +363,8 @@ class DifferentialDrive {
   PositionRef posRefLeft_;
   PositionRef posRefRight_;
   TwistRef twistRef_;
+  float referenceSpeedLeft_ = 0.0f;   // [counts/s]
+  float referenceSpeedRight_ = 0.0f;  // [counts/s]
 
   uint32_t positionEpochLeft_ = 0;
   uint32_t positionEpochRight_ = 0;

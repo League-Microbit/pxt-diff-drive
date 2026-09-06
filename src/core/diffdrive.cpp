@@ -332,8 +332,9 @@ DifferentialDrive::Status DifferentialDrive::checkCommandable(
 }
 
 DifferentialDrive::Status DifferentialDrive::drive(float velocity, float twist,
-                                                   uint32_t lease) {
-  if (!isFinite(velocity) || !isFinite(twist)) {
+                                                   uint32_t lease,
+                                                   float responseLag) {
+  if (!isFinite(velocity) || !isFinite(twist) || !isFinite(responseLag)) {
     noteRefusal(Status::kRefusedNonFinite);
     return Status::kRefusedNonFinite;
   }
@@ -346,6 +347,7 @@ DifferentialDrive::Status DifferentialDrive::drive(float velocity, float twist,
   c.mode = kModeVelocity;
   c.velocity = velocity;
   c.twist = twist;
+  c.responseLag = std::max(0.0f, responseLag);
   c.validUntil = static_cast<uint32_t>(clock_.nowMicros() / 1000) +
                  (lease > kLeaseMax ? kLeaseMax : lease);
   command_ = c;
@@ -566,6 +568,8 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
     twistRef_.armed = false;
     lastSpeedLeft_ = 0.0f;
     lastSpeedRight_ = 0.0f;
+    referenceSpeedLeft_ = 0.0f;
+    referenceSpeedRight_ = 0.0f;
     previousTargetLeft_ = 0.0f;
     previousTargetRight_ = 0.0f;
     cmdAccelLeft_ = 0.0f;
@@ -662,9 +666,15 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
   float speedLeft, speedRight, floorScale;
   applySpeedFloor(targetLeft, targetRight, speedLeft, speedRight, floorScale);
   lastFloorScale_ = floorScale;  // [1] host-test diagnostic (lastFloorScale())
+  const float response = cmd.responseLag > 0.0f
+      ? dt / (cmd.responseLag + dt) : 1.0f;
+  referenceSpeedLeft_ += response *
+      (scaledLeft * floorScale - referenceSpeedLeft_);
+  referenceSpeedRight_ += response *
+      (scaledRight * floorScale - referenceSpeedRight_);
 
   // K1, corrected 2026-09-04 (design §4.5): integrate the FLOORED
-  // COMMANDED twist -- scaledTwist * floorScale, computed from
+  // COMMANDED twist after response-lag filtering, computed from
   // scaledLeft/scaledRight BEFORE trim is folded in -- never the
   // post-floor targets (speedLeft/speedRight), which already contain
   // +/-trim. The first landing (ticket 001) integrated
@@ -678,11 +688,10 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
   // not bind) still applies the floor's rescale to the reference, so
   // K1's original fix (integrate the FLOORED value, not the pre-floor
   // one) is preserved; only the trim contribution is now excluded.
-  // With vMin == 0, floorScale == 1.0 always and this reduces to the
-  // pre-K1-patch line, scaledTwist * dt.
   if (twistHoldActive && dt > 0.0f) {
-    const float scaledTwist = 0.5f * (scaledRight - scaledLeft);
-    twistRef_.reference += scaledTwist * floorScale * dt;
+    const float referenceTwist = 0.5f *
+      (referenceSpeedRight_ - referenceSpeedLeft_);
+    twistRef_.reference += referenceTwist * dt;
     // straightTrim (sprint 031 ticket 019, docs/sprint-031-postmortem.md
     // §2.2): forward legs curve uniformly by a per-robot amount twist
     // hold cannot see, because roughly half of it never reaches the
@@ -733,10 +742,10 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
   const float errLeft = speedLeft - sampleLeft_.velocity;
   const float errRight = speedRight - sampleRight_.velocity;
 
-  const float posErrorLeft = positionError(speedLeft, sampleLeft_, posRefLeft_,
-                                           dt, sampleAdvancedLeft_);
+  const float posErrorLeft = positionError(
+      referenceSpeedLeft_, sampleLeft_, posRefLeft_, dt, sampleAdvancedLeft_);
   const float posErrorRight = positionError(
-      speedRight, sampleRight_, posRefRight_, dt, sampleAdvancedRight_);
+      referenceSpeedRight_, sampleRight_, posRefRight_, dt, sampleAdvancedRight_);
   const float pidLeft =
       (speedLeft == 0.0f) ? 0.0f
                           : fastPid(posErrorLeft, errLeft, cmdAccelLeft_);

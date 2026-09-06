@@ -292,8 +292,9 @@ bool MotionEngine::service() {
     const float vAct = seg_.dominantAxis == Segment::Axis::kYaw  // [mm/s]
         ? std::fabs(0.5f * (out.velocityRight - out.velocityLeft) / cpm)
         : std::fabs(0.5f * (out.velocityLeft + out.velocityRight) / cpm);
-    const VelocityShaper::Step step =
-        shaper_.advance(target, remain, al.floor, al.cap, dt, limits_, vAct);
+    const VelocityShaper::Step step = seg_.settling
+      ? VelocityShaper::Step{0.0f, true}
+      : shaper_.advance(target, remain, al.floor, al.cap, dt, limits_, vAct);
 
     // Trust wrongWay() only once the yaw axis has genuinely moved.
     const bool wrongWay =
@@ -313,12 +314,20 @@ bool MotionEngine::service() {
 
     if (step.arriving) {
       kernel_.neutral();
+      if (limits_.lag > 0.0f) {
+        const bool fresh = out.sampleTimeLeft != seg_.restSampleLeft &&
+                           out.sampleTimeRight != seg_.restSampleRight;
+        const bool stopped = out.connectedLeft && out.connectedRight && fresh &&
+            out.appliedDutyLeft == 0.0f && out.appliedDutyRight == 0.0f &&
+            std::fabs(out.velocityLeft) < kSettleRestCountsPerS &&
+            std::fabs(out.velocityRight) < kSettleRestCountsPerS;
+        seg_.restSamples = seg_.settling && stopped ? seg_.restSamples + 1 : 0;
+        seg_.restSampleLeft = out.sampleTimeLeft;
+        seg_.restSampleRight = out.sampleTimeRight;
+        seg_.settling = true;
+        if (seg_.restSamples < 2) return true;
+      }
       if (seg_.hasPending) {
-        // The pivot -> straight handoff goes through rest: neutral() above
-        // only stages the stop, and it lands, along with rearmReferences()
-        // disarming the kernel's references, on the caller's next step().
-        // Phase 2 then re-anchors fresh instead of carrying phase 1's
-        // accumulated reference.
         kernel_.rearmReferences();
         beginPendingStraightPhase();
         return seg_.active;
@@ -333,7 +342,7 @@ bool MotionEngine::service() {
     const float velocity = (seg_.distTarget / seg_.dominant) * step.vCmd;
     const float twist = (seg_.yawTarget / seg_.dominant) * step.vCmd;
     const DiffDrive::DifferentialDrive::Status driveStatus =
-        kernel_.drive(velocity * cpm, twist * cpm, 500u);
+        kernel_.drive(velocity * cpm, twist * cpm, 500u, limits_.lag);
     // Because no entry point drives synchronously, a refused command can
     // only be discovered here. Without this check a permanently-refused
     // drive would re-issue every tick and spin out the whole deadline
@@ -363,7 +372,7 @@ bool MotionEngine::service() {
   const float velocity = hold_.v * scale;
   const float twist = hold_.twist * scale;
   const DiffDrive::DifferentialDrive::Status holdDriveStatus =
-      kernel_.drive(velocity * cpm, twist * cpm, 500u);
+      kernel_.drive(velocity * cpm, twist * cpm, 500u, limits_.lag);
   if (holdDriveStatus != DiffDrive::DifferentialDrive::Status::kOk) {
     kernel_.neutral();
     hold_.active = false;

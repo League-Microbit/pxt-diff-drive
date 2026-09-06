@@ -26,7 +26,9 @@
 // device-reset -- software offset rebaseline only.
 #pragma once
 
-#include "pxt.h"
+#include <cstdint>
+
+#include "i2c_bus.h"
 #include "../core/diffdrive.h"
 #include "../core/encoder_glitch_armor.h"
 
@@ -36,8 +38,12 @@ class NezhaMotorPort final : public DiffDrive::Motor {
  public:
   // port: 1-based Nezha motor port (M1..M4). fwdSign: +1/-1 so that
   // positive duty is robot-forward for a mirror-mounted wheel pair.
-  NezhaMotorPort(uint8_t port, int8_t fwdSign)
-      : port_(port), fwdSign_(fwdSign) {}
+  //
+  // The default bus preserves the two-argument motor-bake literals in
+  // shims.cpp; host tests inject a simulated bus.
+  NezhaMotorPort(uint8_t port, int8_t fwdSign,
+                 I2CBus& bus = defaultI2CBus())
+      : port_(port), fwdSign_(fwdSign), bus_(bus) {}
 
   // ---- DiffDrive::Motor ----
   void begin() override;
@@ -83,6 +89,7 @@ class NezhaMotorPort final : public DiffDrive::Motor {
 
   uint8_t port_;
   int8_t fwdSign_;
+  I2CBus& bus_;  // the wire; never owned
 
   // shaping config [defaults = firmware shipped values]
   float outputDeadband_ = 0.03f;   // [-1,1]
@@ -110,12 +117,8 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   // Exposed via diagValue() ordinals 21 (left) and 22 (right).
   uint32_t maxDrivenStreak_ = 0;
   uint32_t glitchCount_ = 0;       // rejected implausible encoder reads
-  // Rebaseline-on-discontinuity events (sprint 006 ticket 005,
-  // encoder_glitch_armor.h's kAcceptAsRebaseline outcome): a two-strike
-  // implausible-then-consistent jump treated as a counter restart
-  // (e.g. a brick MCU reset) rather than integrated as a ~4 m
-  // teleport. Should read 0 across a normal session with no
-  // discontinuities. Exposed via diagValue() ordinal 27.
+  // Two-strike counter-restart events, not integrated as motion.
+  // Exposed via diagValue() ordinal 27; normally zero.
   uint32_t rebaselineCount_ = 0;
  private:
   // Two-strike raw-counts plausibility gate; owns the
