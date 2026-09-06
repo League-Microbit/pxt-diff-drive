@@ -418,14 +418,24 @@ class WireAdapter : public Wire::Adapter {
   // without going back through hasLiveMotionObligation() itself --
   // that method now resolves FIRST, and resolvePendingReason() runs
   // AS PART OF that resolution, so the two must never call each other.
+  // resolvePendingReason()'s GOAL-DIRECTED branch (MOVE_X/GO_TO_R/
+  // GO_TO_W) no longer reads this -- it reads engineMoveEndedByDeadline()
+  // instead, latched by the engine itself at the moment a Segment ends,
+  // rather than re-derived from now_() at whatever later moment
+  // resolution happens to run (a late STATUS/ack poll landing after this
+  // method's own deadline had elapsed used to misclassify an early
+  // arrival as kTimeout). Still the only signal the LEASE-STYLE branch
+  // (WHEELS_V/WHEELS_X/MOVE_V) has, and still what
+  // hasLiveMotionObligation() itself reads for its own raw check.
   bool motionObligationDeadlineLive() const;
 
   // Pure function of currently observable state (diagValue()'s estop/
-  // stall flags, motionObligationDeadlineLive() above, and -- for a
-  // goal-directed pending motion only -- engineMoveActive()); never
-  // mutates anything. Returns kNone whenever nothing is pending OR the
-  // pending motion has not yet reached a terminal state -- callers
-  // distinguish those two cases via pendingActive_ themselves.
+  // stall flags; motionObligationDeadlineLive() above for a LEASE-STYLE
+  // pending motion; engineMoveActive()/engineMoveEndedByDeadline() for a
+  // GOAL-DIRECTED one); never mutates anything. Returns kNone whenever
+  // nothing is pending OR the pending motion has not yet reached a
+  // terminal state -- callers distinguish those two cases via
+  // pendingActive_ themselves.
   Wire::DoneReason resolvePendingReason() const;
 
   // Commits resolvePendingReason()'s result into lastDoneId_/

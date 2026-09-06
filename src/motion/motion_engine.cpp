@@ -217,6 +217,10 @@ void MotionEngine::beginSegment(float distTarget, float yawTarget,
   seg_.originPending = true;
   seg_.deadline = deadline;
   seg_.active = true;
+  // A fresh segment has not ended yet, by either path -- see
+  // lastSegmentEndedByDeadline()'s own doc comment (motion_engine.h)
+  // for why this only matters once THIS segment itself ends.
+  lastSegmentEndedByDeadline_ = false;
 
   shaper_.reset();  // design S4.2: v = 0, a = 0 at every segment start
   lastTick_ = now();
@@ -415,10 +419,30 @@ bool MotionEngine::service() {
     const VelocityShaper::Step step =
         shaper_.advance(target, remain, al.floor, al.cap, dt, limits_, vAct);
 
-    const bool wrongWay = seg_.wrongWay(out);
+    // A cold wheel's brief start-up skew can register as backward
+    // progress before real rotation begins -- trust wrongWay()'s own
+    // verdict only once the yaw axis has moved at least
+    // kMinYawProgressBeforeWrongWay in either direction; below
+    // that, hold off and let a later tick's own (by-then-genuine)
+    // progress decide.
+    const bool wrongWay =
+        seg_.wrongWay(out) &&
+        std::fabs(seg_.yawProgress(out)) >=
+            kMinYawProgressBeforeWrongWay;
     const bool expired = static_cast<int32_t>(nowVal - seg_.deadline) >= 0;
     if (wrongWay || out.stallHalted || out.estopped || expired) {
       if (wrongWay) ++wrongWayCount_;
+      // Latched HERE, synchronously, on the exact tick this segment
+      // ends -- see lastSegmentEndedByDeadline()'s own doc comment
+      // (motion_engine.h) for why a caller reading it arbitrarily later
+      // still gets the answer as of THIS tick, not a stale re-derivation
+      // against a since-elapsed clock. `expired` alone decides it:
+      // wrongWay/stallHalted/estopped are all abort reasons, never a
+      // timeout, even if `expired` also happens to be true on the same
+      // tick (deadline had first refusal in the `||` above only for
+      // WHETHER to end the segment, not for WHY).
+      lastSegmentEndedByDeadline_ = expired && !wrongWay && !out.stallHalted &&
+                                     !out.estopped;
       kernel_.neutral();
       seg_ = Segment();
       return false;
@@ -443,6 +467,9 @@ bool MotionEngine::service() {
         beginPendingStraightPhase();
         return seg_.active;
       }
+      // Reached its own goal -- never a timeout, regardless of how
+      // close `nowVal` sits to seg_.deadline on this exact tick.
+      lastSegmentEndedByDeadline_ = false;
       seg_ = Segment();
       return false;
     }
@@ -466,6 +493,8 @@ bool MotionEngine::service() {
     // ticket's own test_refused_drive_does_not_arm_move_active guards,
     // now detected one tick later than before instead of not at all.
     if (driveStatus != DiffDrive::DifferentialDrive::Status::kOk) {
+      // A refused drive ends the segment right now -- never a timeout.
+      lastSegmentEndedByDeadline_ = false;
       kernel_.neutral();
       seg_ = Segment();
       return false;
@@ -501,6 +530,11 @@ bool MotionEngine::service() {
 }
 
 void MotionEngine::endMove() {
+  // An explicit external end (STOP/ESTOP) -- never a timeout, and takes
+  // priority over whatever the LAST natural termination happened to be
+  // (only matters if a Segment was actually live; a no-op call here must
+  // not overwrite a still-meaningful earlier value).
+  if (seg_.active) lastSegmentEndedByDeadline_ = false;
   if (seg_.active || hold_.active) kernel_.neutral();
   seg_ = Segment();
   hold_ = Hold();

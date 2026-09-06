@@ -94,6 +94,14 @@ class DifferentialDrive {
     float kaff = 0.0f;               // [s] accel feedforward
     float pidMax = 0.0f;             // [counts/s] whole-PID output clamp
     float twistHoldGain = 0.0f;      // [1/s] twist-integral ratio hold; 0 = off
+    float straightTrim = 0.0f;       // [1] per-robot dimensionless bias on
+                                     //   the twist-hold REFERENCE, sized
+                                     //   empirically per robot from a
+                                     //   camera-truthed warm run (sprint 031
+                                     //   ticket 019, docs/sprint-031-
+                                     //   postmortem.md §2.2); 0 = no bias.
+                                     //   Positive == RIGHT wheel travels
+                                     //   further than LEFT in encoder space.
     float wheelGain[2][2] = {{1.0f, 1.0f}, {1.0f, 1.0f}};       // [1]
     float wheelIntercept[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};  // [counts/s]
     float vMin = 0.0f;               // [counts/s] speed floor; 0 = off
@@ -164,6 +172,7 @@ class DifferentialDrive {
   DifferentialDrive& setKaff(float kaff);                  // [s]
   DifferentialDrive& setPidMax(float pidMax);              // [counts/s]
   DifferentialDrive& setTwistHoldGain(float gain);         // [1/s]
+  DifferentialDrive& setStraightTrim(float trim);          // [1]
   DifferentialDrive& setWheelCorrection(
       float gainLeftAccel, float interceptLeftAccel,
       float gainLeftDecel, float interceptLeftDecel,

@@ -79,7 +79,9 @@ enum ConfigField {
     //% block="arrive yaw deg"
     ArriveYaw = 36,
     //% block="response lag (s)"
-    Lag = 37
+    Lag = 37,
+    //% block="straight trim"
+    StraightTrim = 38
 }
 
 //% color=#0f9c5a icon="" block="DiffDrive"

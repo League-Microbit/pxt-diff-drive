@@ -67,12 +67,17 @@ static void watchdogEntry(void* context);
 // wire request, a dispatched job, AND a block program's own call, all
 // three. Same same-package forward-declaration convention as
 // protocolEmitLine()/protocolCurrentRunText() elsewhere in this file.
-// protocolTryTakeBlockOwnership() takes ownership and returns true iff
-// nothing else currently holds the drivetrain, else leaves it alone and
-// returns false -- refused, not silently superseded.
+// protocolTryTakeMotionOwnership() returns true either because this
+// call is the CURRENTLY-DISPATCHING RUN job's own move (recognized by
+// fiber identity -- see core/motion_owner.h's tryTakeMotionOwnership()
+// and comms/protocol.cpp's Protocol::tryTakeMotionOwnership()) or
+// because nothing else currently holds the drivetrain, in which case
+// it takes kBlock; otherwise it leaves motionOwner_ alone and returns
+// false -- refused, not silently superseded.
 // protocolReleaseBlockOwnership() is a no-op unless this fiber's own
-// call actually holds it.
-bool protocolTryTakeBlockOwnership();
+// call actually holds kBlock (a dispatched job's own move never does
+// -- dispatchJob() owns clearing kJob itself).
+bool protocolTryTakeMotionOwnership();
 void protocolReleaseBlockOwnership();
 
 // ---- composition ----------------------------------------------------
@@ -297,7 +302,26 @@ static Rig& ensure() {
     // imbalance integrating into heading, rotating the whole square).
     // This is the kernel's own servo for exactly that -- it trims the
     // measured differential toward the commanded one.
-    cfg.twistHoldGain = 2.0f;        // [1/s]
+    //
+    // Raised 2.0 -> 4.0 (sprint 031 ticket 015). MEASURED tovez
+    // 2026-09-05, firmware 1.20260904.5, six-and-twelve alternating
+    // +-600 mm legs at cruise 100 mm/s, camera-truthed, gain applied
+    // live via `SET twist_hold_gain` (captures/session-b-20260905/):
+    //   gain 2 (old default)  mean |dheading| 2.88 deg over 18 legs
+    //                         (g3-cruise100/, g3-cruise100-x12/)
+    //   gain 4                mean |dheading| 2.10 deg over 12 legs
+    //                         (twist-4-x12/)
+    //   gain 6                mean |dheading| 1.67 deg over  6 legs
+    //                         (twist-6/)
+    // Gain 4 is the best of the three on the largest sample (12 legs),
+    // so it is the new default. Two caveats this comment does NOT
+    // smooth over: a 6-leg run at gain 4 gave 0.98 deg and did NOT
+    // replicate at 12 legs (2.10) -- six legs is not enough at this
+    // noise level, trust the 12-leg number. And gain 6's 1.67 deg is
+    // itself only 6 legs, not comparable to the 12/18-leg figures above
+    // -- it is NOT evidence gain 6 beats gain 4; that arm needs its own
+    // 12-leg rerun before anyone bakes it.
+    cfg.twistHoldGain = 4.0f;        // [1/s]
     cfg.cyclePeriod = 24;            // [ms]
     rig->kernel.setConfig(cfg);
     rig->kernel.begin();   // primes encoders, arms boot zero-write
@@ -427,11 +451,12 @@ void setWheels(int left, int right) {  // [mm/s] [mm/s]
 //%
 void driveTwist(int speed, int yawRate) {  // [mm/s] [cdeg/s]
   // Refused (a silent no-op), not superseding, while a wire motion or a
-  // dispatched job already holds the drivetrain -- see
-  // protocolTryTakeBlockOwnership()'s own comment above. Also the entry
+  // GENUINE block/job COLLISION already holds the drivetrain -- a
+  // dispatched RUN job's own call proceeds instead, see
+  // protocolTryTakeMotionOwnership()'s own comment above. Also the entry
   // point startDrive() (blocks/motion.ts) reaches, since it calls this
   // same block-facing driveTwist() before starting its own tick loop.
-  if (!protocolTryTakeBlockOwnership()) return;
+  if (!protocolTryTakeMotionOwnership()) return;
   Rig& r = ensure();
   const float yaw = static_cast<float>(yawRate) * kCdegToRad;  // [rad]
   const float twist = yaw * 0.5f * r.engine.effectiveTrackWidth();  // [mm/s]
@@ -579,15 +604,31 @@ bool engineMoveActive() {
   return rig != nullptr && rig->engine.isMoveActive();
 }
 
+// The SECOND genuinely new read WireAdapter's motion-completion
+// resolution needs, alongside engineMoveActive() above -- true iff the
+// most recent Segment to go inactive ended via its OWN deadline rather
+// than by reaching its own goal, an abort, or an external stop. See
+// MotionEngine::lastSegmentEndedByDeadline()'s own doc comment
+// (motion_engine.h) for why this matters: it is latched once, on the
+// engine's own tick, instead of being re-derived from a wire-side clock
+// comparison whenever a host later happens to ask. `rig == nullptr`
+// answers false, the same honest default engineMoveActive() gives.
+bool engineMoveEndedByDeadline() {
+  return rig != nullptr && rig->engine.lastSegmentEndedByDeadline();
+}
+
 // ---- move engine ----------------------------------------------------
 
 //%
 void startMove(int distance, int yaw, int speed, int yawRate) {
   // [mm] [cdeg] [mm/s] [cdeg/s]
   // Refused (a silent no-op), not superseding, while a wire motion or a
-  // dispatched job already holds the drivetrain -- see
-  // protocolTryTakeBlockOwnership()'s own comment above.
-  if (!protocolTryTakeBlockOwnership()) return;
+  // GENUINE block/job COLLISION already holds the drivetrain -- a
+  // dispatched RUN job's own call (e.g. test.ts's straightRun() ->
+  // tickedMove() -> this function, running synchronously inside
+  // dispatchJob()) proceeds instead: see
+  // protocolTryTakeMotionOwnership()'s own comment above.
+  if (!protocolTryTakeMotionOwnership()) return;
   Rig& r = ensure();
   odomUpdate(r);
   const float distanceF = static_cast<float>(distance);  // [mm]
@@ -1386,6 +1427,13 @@ void setKernelValue(int field, int value) {  // [x1000 scaled]
     // inline" convention case 17 already uses for clearStallLatch()
     // instead of going through clearStall().
     case 33: if (v != 0.0f) k.estopClear(); break;
+    // 38: straight_trim -- a thin forward to the kernel's own
+    // setStraightTrim() (DiffDrive::Config::straightTrim, a real stored
+    // kernel Config field, unlike case 15/16's own Rig/MotionEngine
+    // fields above). No validation beyond setStraightTrim()'s own
+    // finiteness check -- sign and magnitude are both meaningful (see
+    // that setter's own comment, diffdrive.cpp).
+    case 38: k.setStraightTrim(v); break;
     default: break;
   }
 }
@@ -1453,6 +1501,10 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
     // it before this function is ever reached, since a rebase has
     // nothing meaningful to read back.
     case 33: v = r.kernel.output().estopped ? 1.0f : 0.0f; break;
+    // 38: straight_trim's GET side -- read back straight from `c` (it
+    // IS a stored kernel Config field, unlike case 15/16's own
+    // Rig/MotionEngine reads above).
+    case 38: v = c.straightTrim; break;
     default: return 0;
   }
   return static_cast<int>(std::lround(v * 1000.0));
@@ -1564,12 +1616,14 @@ void engineSetGoToYawRate(int yawRate) {  // [cdeg/s]
 //%
 void engineGoToRArmed(float x, float y, float speed, float arrive) {
   // Refused (a silent no-op), not superseding, while a wire motion or a
-  // dispatched job already holds the drivetrain -- see
-  // protocolTryTakeBlockOwnership()'s own comment above (shims.cpp's
+  // GENUINE block/job COLLISION already holds the drivetrain -- a
+  // dispatched RUN job's own call (e.g. test.ts's tickedGoTo(), which
+  // "goto"/"face" run through) proceeds instead: see
+  // protocolTryTakeMotionOwnership()'s own comment above (shims.cpp's
   // own top section). This is startGoTo()'s (blocks/motion.ts) own
   // entry point onto the move engine, the goTo() counterpart of
   // startMove() above.
-  if (!protocolTryTakeBlockOwnership()) return;
+  if (!protocolTryTakeMotionOwnership()) return;
   Rig& r = ensure();
 
   const MotionEngine::GoToRPlan plan = MotionEngine::decomposeGoToR(x, y);

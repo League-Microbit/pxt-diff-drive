@@ -102,6 +102,21 @@ int wheelSpeed(int which);  // [mm/s]; which: 0 = left, 1 = right
 // MotionEngine/Rig -- see this file's own header comment.
 bool engineMoveActive();
 
+// The SECOND genuinely new read, alongside engineMoveActive() above --
+// true iff the most recent Segment to go inactive ended via its OWN
+// deadline rather than by reaching its own goal, an abort, or an
+// external stop. Latched by MotionEngine on the exact tick a Segment
+// ends (motion_engine.h's own doc comment on
+// MotionEngine::lastSegmentEndedByDeadline()), so resolvePendingReason()
+// below can read it an arbitrary time later and still get the answer as
+// of that tick -- not a re-derivation against
+// motionObligationDeadlineLive()'s own now_(), which is only correct if
+// resolution happens to run before the wire-side deadline elapses (an
+// early-arriving goal-directed move otherwise reads `reason=timeout`
+// whenever STATUS/ack traffic happens to poll late). Same "no stored
+// engine reference" contract as engineMoveActive().
+bool engineMoveEndedByDeadline();
+
 namespace {
 
 // The `ConfigField` enum entries (`blocks/motion.ts`) mapped onto
@@ -268,6 +283,16 @@ constexpr FieldEntry kFields[] = {
                                // measured dominant-axis speed. See
                                // shims.cpp's setKernelValue()/
                                // getConfigValue() case (kLimitsFields).
+    {"straight_trim", 38},     // ConfigField.StraightTrim: [1] a
+                               // dimensionless per-robot bias on the
+                               // kernel's OWN twist-hold reference
+                               // (DiffDrive::Config::straightTrim), a
+                               // real stored kernel Config field --
+                               // handled by setKernelValue()/
+                               // getConfigValue() case 38 directly, NOT
+                               // routed through kLimitsFields (this is
+                               // not a MotionLimits member). Default 0;
+                               // no robot's value is baked here.
 };
 constexpr size_t kFieldCount = sizeof(kFields) / sizeof(kFields[0]);
 
@@ -810,18 +835,28 @@ Wire::DoneReason WireAdapter::resolvePendingReason() const {
   if (diagValue(kDiagEstopped) != 0) return Wire::DoneReason::kEstop;
   if (diagValue(kDiagStallHalted) != 0) return Wire::DoneReason::kStall;
   if (pendingGoalDirected_) {
-    // MOVE_X/GO_TO_R/GO_TO_W: the ONE genuinely new read (this file's
-    // own forward declaration above). Still active means not yet
-    // resolved, regardless of the wire-side deadline -- the engine's
-    // own internal deadline/goal/wrong-way checks (serviceMove(),
-    // motion_engine.cpp) are what eventually clear it, and this class
-    // only ever observes the result. Once it goes inactive: the wire-
-    // side lease not yet elapsed means it reached its own stop
-    // condition EARLY (kStop); already elapsed means the deadline is
-    // what ended it (kTimeout).
+    // MOVE_X/GO_TO_R/GO_TO_W: still active means not yet resolved,
+    // regardless of the wire-side deadline -- the engine's own internal
+    // deadline/goal/wrong-way checks (service(), motion_engine.cpp) are
+    // what eventually clear it, and this class only ever observes the
+    // result.
     if (engineMoveActive()) return Wire::DoneReason::kNone;
-    return motionObligationDeadlineLive() ? Wire::DoneReason::kStop
-                                           : Wire::DoneReason::kTimeout;
+    // Once inactive, ask the ENGINE why, via engineMoveEndedByDeadline()
+    // -- NOT motionObligationDeadlineLive(), which this branch used to
+    // read here. That read compared the wire's OWN deadline against
+    // now_() AT WHATEVER MOMENT this method happens to run, which is
+    // only correct if resolution runs before that deadline elapses --
+    // exactly the assumption a late STATUS/ack poll breaks (a move that
+    // arrived early is misread as `kTimeout` the moment its own
+    // deadline has since passed, even though the engine went inactive
+    // long before that). engineMoveEndedByDeadline() instead reports
+    // what the engine itself decided, latched on the tick it decided
+    // it -- immune to how late this method is called afterward. See
+    // this file's own forward declaration of it above and
+    // MotionEngine::lastSegmentEndedByDeadline()'s doc comment
+    // (motion_engine.h) for the full fix.
+    return engineMoveEndedByDeadline() ? Wire::DoneReason::kTimeout
+                                        : Wire::DoneReason::kStop;
   }
   // WHEELS_V/WHEELS_X/MOVE_V: no engine read needed -- these resolve
   // entirely from the SAME lease-deadline bookkeeping

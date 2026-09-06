@@ -443,9 +443,29 @@ void Protocol::dispatchJob() {
   motionOwner_ = MotionOwner::kNone;
 }
 
-bool Protocol::tryTakeBlockOwnership() {
-  if (!diffDrive::tryTakeBlockOwnership(&motionOwner_)) return false;
-  wireAdapter_.setExternalOwner(MotionOwner::kBlock);
+bool Protocol::tryTakeMotionOwnership() {
+  // Same fiber-identity comparison serviceHookEntry() already makes
+  // (diffDrive::shouldServiceHookRun(), core/fiber_identity.h) --
+  // true iff THIS call is executing on Protocol's own fiber, i.e.
+  // inside a dispatched RUN job's own call chain (dispatchJob() calls
+  // the TS handler synchronously, on this fiber). See
+  // diffDrive::tryTakeMotionOwnership()'s own doc comment
+  // (core/motion_owner.h) for why that -- combined with motionOwner_
+  // already being kJob -- means this is the job's OWN move, not a
+  // competing claim.
+  const bool isDispatchingFiber =
+      protocolFiberId_ != nullptr && currentFiberFn_() == protocolFiberId_;
+  if (!diffDrive::tryTakeMotionOwnership(&motionOwner_, isDispatchingFiber))
+    return false;
+  // Only a GENUINE kBlock take changes wireAdapter_'s externalOwner_
+  // mirror -- the job's-own-fiber bypass above leaves motionOwner_ at
+  // kJob unchanged, which dispatchJob() already told wireAdapter_ about
+  // (setExternalOwner(kJob)) before ever calling into this job's
+  // handler; re-asserting kBlock here would be wrong (and would leak,
+  // since nothing on this path calls releaseBlockOwnership()).
+  if (motionOwner_ == MotionOwner::kBlock) {
+    wireAdapter_.setExternalOwner(MotionOwner::kBlock);
+  }
   return true;
 }
 
@@ -459,11 +479,11 @@ void Protocol::releaseBlockOwnership() {
 // forward-declaration convention as registerTickServiceHook()/
 // runDispatch() (this file's own top-of-file forward declarations):
 // only Protocol can see a wire request, a dispatched job, AND a block-
-// motion call together, so a block-motion entry point reaches this
+// motion call together, so a motion entry point reaches this
 // singleton through a plain free function rather than holding a
 // reference of its own.
-bool protocolTryTakeBlockOwnership() {
-  return protocol().tryTakeBlockOwnership();
+bool protocolTryTakeMotionOwnership() {
+  return protocol().tryTakeMotionOwnership();
 }
 void protocolReleaseBlockOwnership() {
   protocol().releaseBlockOwnership();

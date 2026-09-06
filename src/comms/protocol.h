@@ -97,24 +97,41 @@ class Protocol {
   // read through is gone).
   const char* currentRunText() const;
 
-  // The block program's own take/release pair onto motionOwner_,
-  // mirroring how dispatchJob() takes/releases kJob around its own call
-  // span -- except a block-motion call's own "span" is however many
-  // tickDrive() passes its move actually runs for, not one bounded
-  // function call, so shims.cpp's own entry points (startMove()/
-  // driveTwist()/engineGoToRArmed()) call tryTakeBlockOwnership() once,
-  // up front, and tickDrive()/the starvation watchdog/the explicit stop
-  // paths (endMove()/stopAll()/estopAll()) call
-  // releaseBlockOwnership() once the drivetrain next looks idle. Both
-  // apply the SAME pure rule core/motion_owner.h defines (host-tested
-  // there directly): a take succeeds only from kNone -- refused, never
-  // silently superseding a live kWire/kJob move -- and a release is a
-  // no-op unless currently kBlock. Public (not private, unlike
-  // motionOwner_ itself) so the free-function seam beside these methods'
-  // own definitions (protocol.cpp) can reach them from shims.cpp, the
-  // same "public method, free-function forward-declaration wrapper"
-  // shape currentRunText() above already uses for protocolCurrentRunText().
-  bool tryTakeBlockOwnership();
+  // The take/release pair every MOTION entry point in shims.cpp
+  // (startMove()/driveTwist()/engineGoToRArmed()) brackets its own call
+  // span with -- tryTakeMotionOwnership() up front, releaseBlockOwnership()
+  // (below) once tickDrive()/the starvation watchdog/the explicit stop
+  // paths (endMove()/stopAll()/estopAll()) next find the drivetrain idle.
+  //
+  // This used to be a plain kBlock take (tryTakeBlockOwnership()) --
+  // refused unconditionally whenever motionOwner_ was anything but
+  // kNone, INCLUDING kJob. That refused a dispatched RUN job's own
+  // move: dispatchJob() (below) sets motionOwner_ = kJob and then calls
+  // the TS handler SYNCHRONOUSLY, on THIS fiber, so the handler's own
+  // startMove()/driveTwist() call was indistinguishable from a genuine
+  // block-program caller arriving mid-job -- both saw motionOwner_ ==
+  // kJob and were refused, silently (the caller still emitted its
+  // normal completion receipts). tryTakeMotionOwnership() (below)
+  // resolves that: it computes whether THIS call is running on
+  // Protocol's own fiber (the same fiber-identity comparison
+  // serviceHookEntry() already makes, core/fiber_identity.h) and, if
+  // so AND motionOwner_ is already kJob, lets the call through
+  // unchanged -- that is the job's OWN move, not a competitor for the
+  // drivetrain. A genuine block caller (a different fiber -- a button
+  // handler, a student script) still applies the UNCHANGED kBlock
+  // take/refuse rule: refused, never silently superseding, whenever
+  // motionOwner_ is kWire, kJob, or an already-taken kBlock. Both rules
+  // are the SAME pure decision core/motion_owner.h defines
+  // (tryTakeMotionOwnership(), host-tested there directly) -- a release
+  // is a no-op unless currently kBlock, exactly as before (the job-own-
+  // fiber bypass never sets kBlock, so it has nothing here to release;
+  // dispatchJob() itself owns clearing kJob once runDispatch() returns).
+  // Public (not private, unlike motionOwner_ itself) so the free-
+  // function seam beside these methods' own definitions (protocol.cpp)
+  // can reach them from shims.cpp, the same "public method, free-
+  // function forward-declaration wrapper" shape currentRunText() above
+  // already uses for protocolCurrentRunText().
+  bool tryTakeMotionOwnership();
   void releaseBlockOwnership();
 
   // Cleartext RUN payloads refused because every slot was still
@@ -202,8 +219,11 @@ class Protocol {
   // kBlock (the block program's own fiber -- a student's own move()/
   // driveTwist()/startDrive() call, or a MessageBus button handler
   // calling one of those directly -- taken/released via
-  // tryTakeBlockOwnership()/releaseBlockOwnership() below, reached from
-  // shims.cpp through the free-function seam beside those methods).
+  // tryTakeMotionOwnership()/releaseBlockOwnership() below, reached from
+  // shims.cpp through the free-function seam beside those methods; a
+  // dispatched job's OWN call into those same shims.cpp entry points
+  // takes the OTHER branch of tryTakeMotionOwnership() instead, per that
+  // method's own doc comment above, and never touches kBlock at all).
   // Lives HERE, not on WireAdapter or the RUN queue, because this class
   // is the only one that can see a wire request, a dispatched job, AND
   // a block-motion call, all three; wireAdapter_.setExternalOwner()

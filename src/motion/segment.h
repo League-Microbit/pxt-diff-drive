@@ -104,12 +104,22 @@ struct Segment {
   // window) -- a fixed constant, not derived from MotionLimits, since
   // this struct holds no reference to one (by design -- see this
   // struct's own field list, S4.3).
-  bool wrongWay(const DiffDrive::DifferentialDrive::Output& out) const {
-    if (yawTarget == 0.0f) return false;
+  // [counts] signed progress TOWARD the commanded yaw direction --
+  // positive while turning the right way, negative while turning wrong
+  // way. The same quantity wrongWay() (below) judges against its own
+  // margin; exposed separately so a caller can gate WHEN to trust that
+  // judgment at all (a dominant axis that has barely moved yet has no
+  // trustworthy sign) without recomputing it.
+  float yawProgress(const DiffDrive::DifferentialDrive::Output& out) const {
     const float dLeft = out.positionLeft - posLeft0;
     const float dRight = out.positionRight - posRight0;
     const float diffProgress = 0.5f * (dRight - dLeft);
-    const float toward = yawTarget > 0.0f ? diffProgress : -diffProgress;
+    return yawTarget > 0.0f ? diffProgress : -diffProgress;
+  }
+
+  bool wrongWay(const DiffDrive::DifferentialDrive::Output& out) const {
+    if (yawTarget == 0.0f) return false;
+    const float toward = yawProgress(out);
     // The margin scales with the yaw target: on a blended arc the yaw
     // axis is small next to the travel axis, and the wheels do not
     // start together -- MEASURED tovez 2026-09-04,

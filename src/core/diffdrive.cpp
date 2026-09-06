@@ -25,7 +25,7 @@ bool isFinite(float v) { return std::isfinite(v); }
 bool allFinite(const DiffDrive::DifferentialDrive::Config& c) {
   const float scalars[] = {
       c.maxDuty, c.fullDutyVelocity, c.kp, c.ki, c.iMax, c.kaff, c.pidMax,
-      c.twistHoldGain, c.vMin, c.posErrMax, c.biasMax, c.tauAdapt, c.aSteady,
+      c.twistHoldGain, c.straightTrim, c.vMin, c.posErrMax, c.biasMax, c.tauAdapt, c.aSteady,
       c.deficitThreshold, c.deficitWindow, c.stallSpeed, c.stallDemand,
       c.stallWindow, c.crawlPulse,
   };
@@ -126,6 +126,20 @@ DifferentialDrive& DifferentialDrive::setTwistHoldGain(float gain) {
     return *this;
   }
   staged_.twistHoldGain = gain;
+  ++cfgSeq_;
+  return *this;
+}
+
+// straightTrim (sprint 031 ticket 019, docs/sprint-031-postmortem.md
+// §2.2): a per-robot dimensionless bias, sign and magnitude both
+// determined empirically per robot -- no ">0"/range validation beyond
+// finiteness, mirroring setTwistHoldGain() immediately above.
+DifferentialDrive& DifferentialDrive::setStraightTrim(float trim) {
+  if (!isFinite(trim)) {
+    noteRefusal(Status::kRefusedNonFinite);
+    return *this;
+  }
+  staged_.straightTrim = trim;
   ++cfgSeq_;
   return *this;
 }
@@ -669,6 +683,27 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
   if (twistHoldActive && dt > 0.0f) {
     const float scaledTwist = 0.5f * (scaledRight - scaledLeft);
     twistRef_.reference += scaledTwist * floorScale * dt;
+    // straightTrim (sprint 031 ticket 019, docs/sprint-031-postmortem.md
+    // §2.2): forward legs curve uniformly by a per-robot amount twist
+    // hold cannot see, because roughly half of it never reaches the
+    // encoders at all (a ground-side wheel-radius/scrub mismatch) and
+    // the other half DOES reach the encoders but is left as steady-state
+    // error by a proportional-only hold (MEASURED tovez 2026-09-05,
+    // captures/session-b-20260905/discriminator-20260905/legs.json: two
+    // 600 mm legs, camera dh -1.37/+1.65 deg vs encoder-integrated
+    // dh -0.75/+0.63 deg -- roughly half visible, half not). A bias on
+    // the REFERENCE, sized from a camera-truthed warm run, cancels the
+    // TOTAL in steady state under both components: it deliberately
+    // drives the encoders to twist by the fraction that cancels the
+    // invisible half, and it also relieves the proportional hold of the
+    // visible half's residual by giving it a nonzero target instead of
+    // zero. NOT scaled by floorScale -- unlike scaledTwist above, this
+    // is not a commanded twist the speed floor ever rescales; it is an
+    // independent additive term in the same [counts] units the
+    // reference already integrates in. Default 0 (no behavior change);
+    // no robot's value is baked here -- see setStraightTrim()'s own
+    // comment.
+    twistRef_.reference += active_.straightTrim * cmd.velocity * dt;
   }
 
   const float correctedLeft =

@@ -46,4 +46,46 @@ inline void releaseBlockOwnership(MotionOwner* owner) {
   if (*owner == MotionOwner::kBlock) *owner = MotionOwner::kNone;
 }
 
+// The rule a MOTION entry point (src/shims.cpp's startMove()/
+// driveTwist()/engineGoToRArmed()) actually applies before it ever
+// touches the engine -- tryTakeBlockOwnership() above, EXTENDED to
+// recognize a dispatched RUN job's own call.
+//
+// Every one of those entry points is reached from TWO kinds of caller
+// that look identical from inside shims.cpp: the TS RUN handler a
+// dispatched job invoked (comms/protocol.cpp's own dispatchJob(),
+// running SYNCHRONOUSLY on Protocol's own fiber, having already set
+// `*owner` to kJob around the whole call span) -- or a genuine
+// block-program caller (a MessageBus button-handler's own fiber, or a
+// student script's main fiber, neither of which is Protocol's fiber).
+// `isDispatchingFiber` is that distinction: true iff the CURRENT call
+// is executing on Protocol's own fiber, computed by the caller
+// (Protocol::tryTakeMotionOwnership(), comms/protocol.cpp) the SAME
+// way core/fiber_identity.h's shouldServiceHookRun() already compares
+// fiber identity for the tick service hook, and passed in here as a
+// plain bool so this header stays free of any fiber/pointer type.
+//
+// If the caller IS the dispatching fiber AND `*owner` is already kJob,
+// this is that job's own move: let it through UNCHANGED -- take
+// nothing, touch nothing. dispatchJob() itself already owns the kJob
+// take/release pair bracketing the whole call (protocol.cpp), so there
+// is no new ownership here to release later. The `*owner == kJob`
+// conjunct is defensive, not load-bearing: structurally, the ONLY way
+// a motion entry point runs on Protocol's own fiber at all is via a
+// dispatched job's call chain, which already set kJob before invoking
+// it -- but requiring it explicitly means a caller that broke that
+// invariant would fall through to the ordinary rule below instead of
+// bypassing it unconditionally.
+//
+// Otherwise, fall through to the ordinary kBlock take/refuse rule
+// above: refused, never silently superseding a live kWire/kJob move,
+// EXACTLY as before. This is the case that preserves the correct
+// refusal a genuine block call (a button, a script) arriving while a
+// job or wire motion holds the drivetrain -- verified on hardware.
+inline bool tryTakeMotionOwnership(MotionOwner* owner,
+                                    bool isDispatchingFiber) {
+  if (isDispatchingFiber && *owner == MotionOwner::kJob) return true;
+  return tryTakeBlockOwnership(owner);
+}
+
 }  // namespace diffDrive
