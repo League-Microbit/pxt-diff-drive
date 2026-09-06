@@ -317,10 +317,17 @@ class RadioTransport {
 
   static constexpr int kFrameHeaderBytes = 3;  // [SEQ][FLAGS][LEN]
 
-  // Radio convention matching the fleet's RADIOBRIDGE relay: channel 4
-  // (vevov's fleet-assigned channel; the zavaz relay matches: !CG 4 10);
-  // transmit power 7 (matches the reference driver's own
-  // setTransmitPower(7)). kChannel is injected per-robot at DEPLOY time
+  // kChannel/kGroup below are a legacy fleet-wide PLACEHOLDER (4/10),
+  // not any board's address. Every board's real channel and group are
+  // injected per-robot at deploy time from radio-robot-lib's own
+  // per-robot JSON, and the fleet has moved off 4/10 -- the
+  // human-readable mirror of who is on what lives in
+  // .claude/rules/playfield-testing.md. Do not copy a number out of
+  // here into that table, or out of that table into here; the JSON is
+  // the only source either of them should be read from. Transmit power
+  // 7 matches the reference driver's own setTransmitPower(7).
+  //
+  // kChannel is injected per-robot at DEPLOY time
   // into the SCRATCH COPY only (tools/make_deploy.py's
   // _inject_radio_channel()); it is now the DEFAULT for channel_ below
   // rather than the value the radio uses directly, because the "setup
