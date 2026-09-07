@@ -1821,9 +1821,13 @@ void registerRunDispatch(Action cb) {
 // comment line rather than the real problem.
 //%
 void registerRunName(String name, String signature) {
-  if (name == nullptr) return;
+  // Emptiness comes from the PXT String's OWN size: at size 0 the
+  // ManagedString MSTR() builds has no clean "" in toCharArray().
+  // MEASURED gopiv 2026-09-07, fw 1.20260907.1 -- every line read
+  // `funcs <name> \xef\xbf\xbdc`, junk where an omitted signature goes.
+  if (name == nullptr || name->getUTF8Size() == 0) return;
   ManagedString nameStr = MSTR(name);
-  if (signature == nullptr) {
+  if (signature == nullptr || signature->getUTF8Size() == 0) {
     diffDrive::runRegistry().add(nameStr.toCharArray(), "");
     return;
   }

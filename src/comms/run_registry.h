@@ -136,15 +136,23 @@ class RunRegistry {
   // Copies at most Bytes-1 characters plus a NUL. A null or empty
   // source stores the empty string, which is how "no signature" is
   // spelled -- execFuncs omits the field entirely for it.
+  //
+  // NON-PRINTABLE BYTES ARE DROPPED, the same alphabet rule RunBridge
+  // applies to a payload. A caller cannot be trusted to hand clean text:
+  // gopiv shipped two junk bytes into every signature on 2026-09-07 (see
+  // shims.cpp's registerRunName), and while that call site is fixed, a
+  // garbage byte reaching the wire should never have depended on it.
+  // Filtering here means an entry can be WRONG but never unprintable.
   static void copyInto(char* dest, const char* src) {
     if (src == nullptr) {
       dest[0] = '\0';
       return;
     }
     int i = 0;
-    while (src[i] != '\0' && i < Bytes - 1) {
-      dest[i] = src[i];
-      ++i;
+    for (int j = 0; src[j] != '\0' && i < Bytes - 1; ++j) {
+      const unsigned char c = static_cast<unsigned char>(src[j]);
+      if (c < 0x20 || c > 0x7E) continue;
+      dest[i++] = src[j];
     }
     dest[i] = '\0';
   }
