@@ -1,13 +1,13 @@
 // run_registry.h -- the names FUNCS discloses: what this robot can
 // actually be told to run.
 //
-// This repo's runnable surface is the CLEARTEXT `RUN:<name>[:<arg>...]`
-// carve-out (protocol.h), dispatched by name against the handlers a
-// block program bound with `onRun()` (blocks/run.ts). That table lives
-// in TypeScript, is built at program start, and differs per program --
-// a line-following program registers `line`/`linesense`, a tour program
-// registers `tour`/`pivot`/`straight`. Nothing in C++ could see it, so
-// `FUNCS` had nothing to enumerate.
+// This robot's runnable surface is the set of handlers a block program
+// bound with `onRun()` (blocks/run.ts), reached by the v6
+// `RUN <name> [arg...] #<id>` verb. That table lives in TypeScript, is
+// built at program start, and differs per program -- a line-following
+// program registers `line`/`linesense`, a tour program registers
+// `tour`/`pivot`/`straight`. Nothing in C++ could see it, so `FUNCS` had
+// nothing to enumerate.
 //
 // This is the mirror. `onRun()` publishes each name here as it binds
 // its handler (shims.cpp's registerRunName), and WireAdapter reads the
@@ -23,16 +23,15 @@
 // while still dispatching every name. That is honest rather than
 // misleading; a listing that claimed otherwise would be neither.
 //
-// NOT the v6 `RUN <name> #id` verb's registry. The two are told apart by
-// PUNCTUATION, not by verb: protocol.cpp's routeLine() diverts a line
-// whose first four bytes are the literal `RUN:` to the cleartext bridge,
-// and sends everything else -- the space-separated v6 `RUN` verb
-// included -- to the v6 stack. So both forms are reachable; only the
-// colon one has anything behind it, since WireAdapter::onRun registers
-// nothing and answers every name kUnknown. FUNCS therefore lists what
-// `RUN:<name>` will dispatch -- the question an operator or a host UI is
-// actually asking -- rather than reporting the empty v6 allowlist and
-// calling it an answer.
+// This table is also the ALLOWLIST, not merely a listing:
+// WireAdapter::onRun refuses a name that is not in it (`err 1`), so what
+// FUNCS advertises and what RUN will execute cannot drift apart. The one
+// exception is a catch-all handler -- see acceptAnyName() below.
+//
+// (Until 2026-09-07 the runnable surface was instead a cleartext
+// `RUN:<name>` line that protocol.cpp matched by prefix ahead of the v6
+// grammar, because WireAdapter::onRun answered every name kUnknown. That
+// carve-out is gone; onRun now reaches this table.)
 //
 // Host-portable on purpose -- no pxt.h, no CODAL types, nothing but
 // <cstddef>/<cstdint>/<cstring> -- the same split run_queue.h and
