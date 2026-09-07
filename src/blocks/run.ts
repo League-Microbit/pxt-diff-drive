@@ -187,6 +187,22 @@ namespace diffDrive {
     }
 
     /**
+     * Set the WiFi network to join from the program, instead of relying
+     * on credentials baked in at deploy time. Stores the credentials AND
+     * brings the link up in one call -- call it once, from `on start`,
+     * before anything else needs the network. An empty ssid disables the
+     * link (equivalent to no module fitted). A call made after the link
+     * has already started is ignored (see DBG:wifi for a late-call
+     * notice).
+     * @param ssid network name, eg: "Busboom Mesh"
+     * @param password network password
+     */
+    //% blockHidden=true
+    export function setupWifi(ssid: string, password: string = ""): void {
+        _setupWifi(ssid, password)
+    }
+
+    /**
      * Bring the v6 wire up over the Planet X WiFi module (Ai-WB2-12F on
      * RJ11 jack J1), joining the network whose credentials
      * tools/make_deploy.py baked into this build. The robot then answers

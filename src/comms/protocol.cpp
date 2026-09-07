@@ -173,6 +173,14 @@ void Protocol::drainEmitQueue() {
 // dependency scan demand the `radio` package for that file).
 void protocolEmitLine(const char* text) { protocol().emitLine(text); }
 
+// Free-function entry point for shims.cpp's setupWifi shim (ticket
+// 002) -- same boundary reason as protocolEmitLine() above: shims.cpp
+// forward-declares this the same way it forward-declares
+// protocolEmitLine, rather than including protocol.h.
+void protocolSetupWifi(const char* ssid, const char* password) {
+  protocol().setupWifi(ssid, password);
+}
+
 int Protocol::serialDropCount() const {
   return static_cast<int>(transport_.dropCount());
 }
@@ -218,13 +226,61 @@ void Protocol::enableRadio() { radioTransport_.enable(); }
 
 void Protocol::enableWifi() { wifiEnabled_ = true; }
 
+void Protocol::setupWifi(const char* ssid, const char* password) {
+  if (ssid == nullptr) return;
+
+  // Late-call guard: once wifiBegun_ is true, WifiLink::Config's
+  // ssid/password already point into wifiSsid_/wifiPassword_ and
+  // WifiLink::serviceJoin() re-reads them on every join attempt and
+  // backoff retry (wifi_link.cpp) -- not a value snapshotted once at
+  // begin(). Mutating this storage now would reach into a live join
+  // attempt, so the write is refused outright rather than merely
+  // skipped-but-harmless. UNVERIFIED on hardware: reasoned from
+  // reading wifi_link.cpp's serviceJoin(), not measured against a real
+  // in-progress join.
+  if (wifiBegun_) {
+    emitLine("DBG:wifi late setupWifi() ignored");
+    return;
+  }
+
+  // Truncation is computed BEFORE the copy, from the plain C-string
+  // source's own strlen() (no embedded NUL, so this is exact) against
+  // the owned cell's usable length -- so wifiCredsTruncated_ reflects
+  // whether the CALLER's string was too long, not an artifact of the
+  // clipped copy itself. `password == nullptr` counts as length 0, not
+  // truncated (default-argument call with no password supplied).
+  wifiCredsTruncated_ = 0;
+  if (strlen(ssid) >= sizeof(wifiSsid_)) wifiCredsTruncated_ |= 0x1;
+  if (password != nullptr && strlen(password) >= sizeof(wifiPassword_)) {
+    wifiCredsTruncated_ |= 0x2;
+  }
+
+  // snprintf clips safely regardless of the truncation check above --
+  // that check exists to make an already-safe clip VISIBLE, not to
+  // prevent an overflow snprintf would have prevented anyway.
+  snprintf(wifiSsid_, sizeof(wifiSsid_), "%s", ssid);
+  snprintf(wifiPassword_, sizeof(wifiPassword_), "%s",
+           password != nullptr ? password : "");
+
+  // Set unconditionally, even for an empty ssid: setupWifi("") is a
+  // deliberate explicit disable (SUC-002), and this flag is what lets
+  // serviceWifi()'s lazy-begin branch tell that apart from "never
+  // called" -- both otherwise leave wifiSsid_[0] == '\0'.
+  wifiCredsExplicit_ = true;
+
+  // "Store AND enable" in one call, per the stakeholder decision: no
+  // separate enable step, no ordering trap.
+  enableWifi();
+}
+
 void Protocol::emitWifiDebug() {
   // One line, cleartext `DBG:` prefix (the same convention the TS
   // layer's debug output uses), through emitLine() so it reaches
   // serial, radio AND -- once up -- the WiFi host itself.
   snprintf(wifiDbgBuf_, sizeof(wifiDbgBuf_),
            "DBG:wifi state=%d ip=%s peer=%s:%u tcp=%u/%d to=%d restarts=%lu "
-           "sent=%lu rx=%lu drop=%lu mdns=%lu/%d cmd=%s reply=%s",
+           "sent=%lu rx=%lu drop=%lu mdns=%lu/%d cmd=%s reply=%s "
+           "credsrc=%d trunc=%u",
            static_cast<int>(wifiLink_.state()),
            wifiLink_.ownIp()[0] ? wifiLink_.ownIp() : "-",
            wifiLink_.peerIp()[0] ? wifiLink_.peerIp() : "-",
@@ -237,7 +293,9 @@ void Protocol::emitWifiDebug() {
            static_cast<unsigned long>(wifiLink_.dropCount()),
            static_cast<unsigned long>(wifiLink_.mdnsAnnounceCount()),
            wifiLink_.mdnsSocketOpen() ? 1 : 0,
-           wifiLink_.lastCommand(), wifiLink_.lastReply());
+           wifiLink_.lastCommand(), wifiLink_.lastReply(),
+           wifiCredsExplicit_ ? 1 : 0,
+           static_cast<unsigned>(wifiCredsTruncated_));
   emitLine(wifiDbgBuf_);
 }
 
@@ -245,8 +303,18 @@ void Protocol::serviceWifi() {
   if (!wifiBegun_) {
     wifiBegun_ = true;
     WifiLink::Config config;
-    config.ssid = kWifiSsid;
-    config.password = kWifiPassword;
+    if (wifiCredsExplicit_) {
+      // A program called setupWifi() before the link began -- use its
+      // stored credentials (possibly an explicit "", which
+      // WifiLink::begin() treats as a deliberate disable, same
+      // zero-cost outcome as no module fitted; see setupWifi()'s own
+      // comment).
+      config.ssid = wifiSsid_;
+      config.password = wifiPassword_;
+    } else {
+      config.ssid = kWifiSsid;
+      config.password = kWifiPassword;
+    }
     // The mDNS host label is the board's own silicon-derived name --
     // the same authoritative identity ID's `name` field reports -- so
     // `tovez.local` / "tovez robot link" can never be a stale bake.

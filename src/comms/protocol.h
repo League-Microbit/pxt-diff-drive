@@ -194,6 +194,14 @@ class Protocol {
   // name, which is only safe to read there (see buildIdentity()).
   void enableWifi();
 
+  // Runtime alternative to the deploy-time bake: copies (clipped,
+  // truncation recorded) into wifiSsid_/wifiPassword_ and calls
+  // enableWifi() -- one call stores AND enables. `setupWifi("")` is a
+  // deliberate disable (see wifiCredsExplicit_); a call arriving after
+  // wifiBegun_ is a no-op by design, not convention -- see the .cpp,
+  // this path is UNVERIFIED on hardware.
+  void setupWifi(const char* ssid, const char* password);
+
  private:
   static void fiberEntry(void* self);
   void run();
@@ -436,6 +444,23 @@ class Protocol {
   bool wifiBegun_ = false;
   uint32_t lastWifiDbg_ = 0;  // [ms]
 
+  // Program-owned WiFi credentials (setupWifi()), sized to the 802.11
+  // maxima + NUL; WifiLink::Config borrows pointers into these for the
+  // link's life, so setupWifi() copies rather than borrows.
+  char wifiSsid_[33] = {0};
+  char wifiPassword_[64] = {0};
+
+  // True once setupWifi() has been called at all -- distinguishes
+  // setupWifi("") (explicit disable) from "never called", which the
+  // prior-art patch's `wifiSsid_[0] ? ... : kWifiSsid` ternary could
+  // not (both leave wifiSsid_[0] == '\0'). serviceWifi() branches on
+  // this, not on the stored SSID's contents.
+  bool wifiCredsExplicit_ = false;
+
+  // Bitmask (bit0 SSID, bit1 password) set once at the setupWifi()
+  // store, read by emitWifiDebug()'s `trunc=` field.
+  uint8_t wifiCredsTruncated_ = 0;
+
   // NSDMI, not a hand-written constructor: every member below depends
   // only on members declared textually above it, so declaration-order
   // in-class initializers suffice. wireAdapter_ starts with a
@@ -459,10 +484,11 @@ class Protocol {
   TransportSink<WifiLink> wifiSink_{wifiLink_, &Protocol::writeWifi};
   Wire::WireHandler wireHandlerWifi_{wireAdapter_, wifiSink_};
   uint8_t wifiRxBuf_[WifiLink::kMaxLineBytes + 1];
-  // Sized for the worst-case `DBG:wifi ...` line: fixed text plus two
-  // 15-char addresses, six counters, a 47-char command and a 71-char
-  // reply trace (emitLine() clips to the wire cap anyway).
-  char wifiDbgBuf_[320];
+  // Sized for the worst-case `DBG:wifi ...` line: fixed text, two
+  // 15-char addresses, six counters, a 47-char command, a 71-char
+  // reply trace, and `credsrc=%d trunc=%u` (~294/320 used before that
+  // last field -- grown to 384 alongside it, not after, for headroom).
+  char wifiDbgBuf_[384];
 
   // Radio RX scratch -- every line the radio poll receives lands here
   // first, cleartext RUN carve-out or v6 line alike; reused every poll,

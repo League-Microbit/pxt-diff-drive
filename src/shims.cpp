@@ -1766,6 +1766,23 @@ void emitLine(String text) {
   protocolEmitLine(ms.toCharArray());
 }
 
+// Same forward-declaration convention as protocolEmitLine above.
+void protocolSetupWifi(const char* ssid, const char* password);
+
+// Emptiness comes from the PXT String's OWN size, not from MSTR()'s
+// toCharArray() result -- same trap registerRunName() documents below:
+// at size 0, toCharArray() returns junk, not a clean "". Both locals
+// stay in scope across protocolSetupWifi(), which copies before
+// returning, so nothing here can outlive the call.
+//%
+void setupWifi(String ssid, String password) {
+  if (ssid == nullptr) return;
+  ManagedString ssidStr = ssid->getUTF8Size() == 0 ? ManagedString("") : MSTR(ssid);
+  bool passwordEmpty = password == nullptr || password->getUTF8Size() == 0;
+  ManagedString passwordStr = passwordEmpty ? ManagedString("") : MSTR(password);
+  protocolSetupWifi(ssidStr.toCharArray(), passwordStr.toCharArray());
+}
+
 // Read back the text of whichever RUN command is CURRENTLY being
 // dispatched -- valid only during the registered dispatch callback's own
 // call, on this same fiber (registerRunDispatch()/runDispatch(), below).

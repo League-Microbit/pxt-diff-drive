@@ -535,6 +535,8 @@ namespace diffDrive {
     let simRadioChannel = 4
     let simRadioGroup = 10
     let simRadioEnabled = false
+    let simWifiSsid = ""
+    let simWifiPassword = ""
 
     // Params typed `number`, not `int32` -- see _goToR()'s comment
     // above: an int32 param on a function with a TS body fails the
@@ -549,6 +551,14 @@ namespace diffDrive {
     //% shim=diffDrive::enableRadioLink
     export function _enableRadioLink(): void {
         simRadioEnabled = true
+    }
+
+    // Recorded, not modeled, same as _setupRadio above -- lets a sim
+    // test assert what a program passed even with no WiFi module here.
+    //% shim=diffDrive::setupWifi
+    export function _setupWifi(ssid: string, password: string): void {
+        simWifiSsid = ssid
+        simWifiPassword = password
     }
 
     //% shim=diffDrive::enableWifiLink
