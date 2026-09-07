@@ -1,6 +1,6 @@
 {
     "name": "nezha-diffdrive",
-    "version": "1.20260906.7",
+    "version": "1.20260907.1",
     "description": "Closed-loop differential drive for the Nezha brick: encoder-servoed wheel speeds, twist and distance moves, curved go-to, and pose from odometry. The wheel controller runs in its own fiber.",
     "license": "MIT",
     "public": true,
@@ -44,6 +44,8 @@
         "src/comms/run_queue.h",
         "src/comms/run_bridge.h",
         "src/comms/run_bridge.cpp",
+        "src/comms/run_registry.h",
+        "src/comms/run_registry.cpp",
         "src/comms/emit_queue.h",
         "src/comms/transport_sink.h",
         "src/comms/protocol.h",

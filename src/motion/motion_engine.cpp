@@ -202,18 +202,18 @@ void MotionEngine::wheelsX(float left, float right, float cruise,
 
 void MotionEngine::moveX(float distance, float rotation, float cruise,
                          uint32_t timeout) {
-  const uint32_t deadline = now() + timeout;  // spans both phases
-
-  // A large rotation combined with actual translation is not one blended
-  // segment. A pure pivot, or a rotation under the threshold, stays one.
-  if (distance != 0.0f && std::fabs(rotation) >= kTurnFirstAngle) {
-    queuePivotThenStraight(rotation, distance, cruise, deadline);
-  } else {
-    const float cpm = countsPerMm();
-    const float distTarget = distance * cpm;
-    const float yawTarget = rotation * 0.5f * effectiveTrackWidth() * cpm;
-    beginSegment(distTarget, yawTarget, cruise, deadline);
-  }
+  // One blended constant-ratio segment for EVERY (distance, rotation).
+  // R = distance / rotation is always a driveable arc: |R| < b/2 only
+  // means the inner wheel runs backwards, R = 0 is a spot pivot. There
+  // is no angle threshold here. The 50 deg pivot-first rule
+  // (kTurnFirstAngle) is goToR()'s policy for reaching a POINT; applied
+  // here it replaced the requested arc with a different figure ending
+  // somewhere else (reports/move-x-arc-space-20260906.md).
+  const uint32_t deadline = now() + timeout;
+  const float cpm = countsPerMm();
+  const float distTarget = distance * cpm;
+  const float yawTarget = rotation * 0.5f * effectiveTrackWidth() * cpm;
+  beginSegment(distTarget, yawTarget, cruise, deadline);
 }
 
 void MotionEngine::moveV(float vx, float omega, uint32_t duration) {
@@ -286,12 +286,16 @@ bool MotionEngine::service() {
     if (al.cap < target) target = al.cap;
     if (limits_.vMax < target) target = limits_.vMax;
 
-    // The kernel's last-measured speed on THIS segment's dominant axis.
-    // Sign-normalized: a wheel briefly moving the wrong way is wrongWay()'s
-    // problem, not this measurement's.
-    const float vAct = seg_.dominantAxis == Segment::Axis::kYaw  // [mm/s]
-        ? std::fabs(0.5f * (out.velocityRight - out.velocityLeft) / cpm)
-        : std::fabs(0.5f * (out.velocityLeft + out.velocityRight) / cpm);
+    // The kernel's last-measured speed on THIS segment's dominant axis,
+    // scaled into the dominant WHEEL's frame like `remain` above, since
+    // that is the frame the shaper's command, brake budget and arrival
+    // test live in (Segment::dominantScale()). Sign-normalized: a wheel
+    // briefly moving the wrong way is wrongWay()'s problem, not this
+    // measurement's.
+    const float vAct = seg_.dominantScale() *  // [mm/s]
+        (seg_.dominantAxis == Segment::Axis::kYaw
+            ? std::fabs(0.5f * (out.velocityRight - out.velocityLeft) / cpm)
+            : std::fabs(0.5f * (out.velocityLeft + out.velocityRight) / cpm));
     const VelocityShaper::Step step = seg_.settling
       ? VelocityShaper::Step{0.0f, true}
       : shaper_.advance(target, remain, al.floor, al.cap, dt, limits_, vAct);

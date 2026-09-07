@@ -40,6 +40,7 @@
 #include "platform/nezha_port.h"
 #include "platform/otos_port.h"
 #include "platform/platform_ports.h"
+#include "comms/run_registry.h"
 
 #include <cmath>
 
@@ -581,33 +582,16 @@ void startMove(int distance, int yaw, int speed, int yawRate) {
     return;
   }
 
-  // moveX() (motion_engine.cpp) splits a nonzero distance combined with
-  // a large enough rotation into pivot-then-straight -- two SEQUENTIAL
-  // segments sharing the one deadline this call sets (motion_engine.h:
-  // "NOT reset across a pivot-to-straight phase transition") -- rather
-  // than one blended segment where both axes finish together. Budget
-  // the SUM of both axes' durations for that case; reconcileDualRateCruise()'s
-  // own max()-based duration (which ALSO derives `cruise` above,
-  // unaffected by this split-aware budget) only covers the genuinely
-  // simultaneous (non-split) move. Read the split threshold from
-  // MotionEngine itself (turnFirstAngle(), the public accessor for its
-  // own private kTurnFirstAngle) rather than retyping the 50 deg
-  // constant here, so this decision can never drift from moveX()'s own.
-  const bool willSplit =
-      requestedDistance != 0.0f &&
-      std::fabs(rotation) >= MotionEngine::turnFirstAngle();
+  // moveX() is ONE blended segment for any (distance, rotation): both
+  // axes finish together, so the budget is the longer axis's duration,
+  // the same reconciliation that derived `cruise` above.
   const float budgetDuration =
-      willSplit ? (rr.distDuration + rr.yawDuration)
-                : (rr.distDuration > rr.yawDuration ? rr.distDuration
-                                                     : rr.yawDuration);
+      rr.distDuration > rr.yawDuration ? rr.distDuration : rr.yawDuration;
 
-  // Backstop: for a single segment, this covers the end-of-move taper
-  // (service()) -- the last ~15 deg / ~40 mm run at reduced rate,
-  // adding up to ~1 s. When the split above fires, it is ALSO the only
-  // thing paying for the SECOND phase's own ramp/taper overhead, since
-  // one deadline spans both phases. This is moveX()'s own `timeout` --
-  // a REAL backstop the wire's own MOVE_X carries as a required field,
-  // not an internally re-derived one.
+  // Backstop: covers the end-of-move taper (service()) -- the last
+  // ~15 deg / ~40 mm run at reduced rate, adding up to ~1 s. This is
+  // moveX()'s own `timeout` -- a REAL backstop the wire's own MOVE_X
+  // carries as a required field, not an internally re-derived one.
   const uint32_t timeout =
       static_cast<uint32_t>(budgetDuration * 1000.0f) + 1500u;
 
@@ -1813,6 +1797,47 @@ void registerRunDispatch(Action cb) {
   gRunDispatchAction = cb;
   incr(gRunDispatchAction);
 }
+
+// ---- RUN registry: the names FUNCS discloses -------------------------
+// run.ts's onRun() calls this as it binds each handler, so the C++ side
+// can enumerate what this particular block program answers to
+// (comms/run_registry.h). Registration ONLY -- dispatch still matches
+// names in TypeScript, against TypeScript's own arrays, exactly as
+// before; nothing here can make a name runnable or stop one being run.
+//
+// Both arguments cross as ManagedStrings and are copied into the
+// registry's own fixed cells before this returns, so neither the
+// ManagedString nor its buffer needs to outlive the call -- the
+// borrowed-pointer contract Wire::Adapter's runName() keeps is
+// satisfied by the TABLE's storage, not by the caller's.
+//
+// A null `signature` is normal, not an error: it is how a handler bound
+// with no declared signature reaches here, and the registry stores it
+// as the empty string, which makes execFuncs omit the field entirely.
+//
+// NOTE the layout below: PXT's shim scanner requires `//%` to sit
+// IMMEDIATELY above the declaration it annotates. A comment between the
+// two fails the build with "declaration not understood", naming the
+// comment line rather than the real problem.
+//%
+void registerRunName(String name, String signature) {
+  if (name == nullptr) return;
+  ManagedString nameStr = MSTR(name);
+  if (signature == nullptr) {
+    diffDrive::runRegistry().add(nameStr.toCharArray(), "");
+    return;
+  }
+  ManagedString signatureStr = MSTR(signature);
+  diffDrive::runRegistry().add(nameStr.toCharArray(),
+                               signatureStr.toCharArray());
+}
+
+// Declares that a catch-all handler (run.ts's onRunCommand) is bound, so
+// EVERY name is dispatchable and WireAdapter::onRun must stop refusing
+// names the registry does not list. One-way: nothing unsets it, because
+// a handler cannot be unbound.
+//%
+void registerRunCatchAll() { diffDrive::runRegistry().acceptAnyName(); }
 
 // Invokes the registered callback, if one exists, on the CALLER's own
 // fiber -- protocol.cpp reaches this via the same same-package

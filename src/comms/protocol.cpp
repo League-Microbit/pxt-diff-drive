@@ -98,12 +98,6 @@ constexpr uint16_t kWifiHostPort = 7655;
 // USB during a slow join (6-170 s, measured) should see it still alive.
 constexpr uint32_t kWifiDebugPeriod = 10000;  // [ms]
 
-// The old-style cleartext RUN carve-out (see protocol.h's own top-of-file
-// comment): detected directly by its literal prefix now that the v5
-// verb registry that used to recognize it is gone.
-constexpr char kOldRunPrefix[] = "RUN:";
-constexpr size_t kOldRunPrefixLen = 4;
-
 // Poll granularity between transport reads, and the telemetry frame
 // emission cadence for a TLM-subscribed host (2026-08-26: this paces
 // FRAMES only -- the reliability line that used to ride each frame is
@@ -306,32 +300,32 @@ void Protocol::serviceWifi() {
 // that differs between them is which WireHandler the caller passes.
 void Protocol::routeLine(Wire::WireHandler& handler, const uint8_t* data,
                          size_t len) {
-  if (len >= kOldRunPrefixLen &&
-      std::memcmp(data, kOldRunPrefix, kOldRunPrefixLen) == 0) {
-    // Old-style cleartext RUN, preserved unchanged -- see protocol.h's
-    // own top-of-file comment for why it is detected here by literal
-    // prefix rather than through a verb registry (the v5 registry that
-    // used to do this is gone).
-    handleRun(data + kOldRunPrefixLen, len - kOldRunPrefixLen);
-    return;
-  }
-  // Every other line -- including the v6 grammar's own space-separated
-  // "RUN <name> ... #<id>" verb -- goes to the v6 wire stack. feed()
-  // reassembles regardless of chunking; the trailing '\n' it needs to
-  // recognize the line as complete is fed as a second, separate call.
+  // EVERY line goes to the v6 wire stack -- no carve-out left. The
+  // cleartext `RUN:<name>` prefix match deleted from here on 2026-09-07
+  // is now the ordinary `RUN` verb, reaching the same TypeScript
+  // dispatcher through WireAdapter::onRun -> protocolOfferRun (below).
+  //
+  // feed() reassembles regardless of chunking; the trailing '\n' it
+  // needs to see the line as complete is a second, separate call.
   handler.feed(reinterpret_cast<const char*>(data), len);
   handler.feed("\n", 1);
 }
 
 // ---- the old-style cleartext RUN bridge ------------------------------
 
-void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
-  // Sanitizing, repeat suppression and parking all live in runBridge_
-  // (run_bridge.h/.cpp, host-portable and host-tested there). This
-  // fiber supplies the clock reading and makes the one call the bridge
-  // cannot: the dispatch into TypeScript.
-  const uint32_t now = clockNow();  // [ms]
-  if (runBridge_.offer(data, dataLen, now) != RunBridge::Offer::kBypass) return;
+bool Protocol::handleRun(const uint8_t* data, size_t dataLen) {
+  // Sanitizing and parking both live in runBridge_ (run_bridge.h/.cpp,
+  // host-portable and host-tested there). This fiber makes the one call
+  // the bridge cannot: the dispatch into TypeScript.
+  const RunBridge::Offer outcome = runBridge_.offer(data, dataLen);
+  if (outcome == RunBridge::Offer::kMalformed ||
+      outcome == RunBridge::Offer::kDropped) {
+    // Reported back through onRun()'s Result so the host gets an `err`
+    // instead of an ack for a command that will never run. The
+    // cleartext path had no way to say this -- it just returned.
+    return false;
+  }
+  if (outcome != RunBridge::Offer::kBypass) return true;
 
   // "abort"/"clearestop" dispatch RIGHT NOW, on whatever fiber called
   // handleRun() -- run()'s own loop normally, but (crucially) also the
@@ -346,6 +340,20 @@ void Protocol::handleRun(const uint8_t* data, size_t dataLen) {
   // call chain. The payload is already staged in runBridge_ for
   // runCommandText() to read back at the handler's own entry.
   runDispatch();
+  return true;
+}
+
+// shims.cpp-style same-package seam, but pointing the other way: this
+// is what WireAdapter::onRun() calls (wire_adapter.cpp forward-declares
+// it) to turn a decoded `RUN` verb into a dispatched job. It exists
+// because WireAdapter must stay free of pxt.h and cannot reach
+// TypeScript, while Protocol can -- the same split
+// protocolTryTakeMotionOwnership() already uses.
+bool protocolOfferRun(const char* text) {
+  if (text == nullptr) return false;
+  size_t len = 0;
+  while (text[len] != '\0') ++len;
+  return protocol().handleRun(reinterpret_cast<const uint8_t*>(text), len);
 }
 
 void Protocol::dispatchJob() {
@@ -572,9 +580,10 @@ void Protocol::serviceOnce() {
   // the motion verbs, etc.) through its OWN WireHandler
   // (wireHandlerRadio_, its own expectedNext_ -- so a gap on this
   // transport can never nack serial's next command, or vice versa),
-  // with the old-style literal "RUN:" prefix preserved as a fallback,
-  // unchanged, exactly as protocol.h's own top-of-file comment
-  // describes.
+  // including `RUN` itself, which since 2026-09-07 is an ordinary
+  // sequenced verb on this transport like any other -- the literal
+  // "RUN:" prefix fallback that used to bypass the grammar here is
+  // gone.
   //
   // No enable check here: this call is the one that would bring the
   // radio up (it calls ensureRadioReady() internally), and

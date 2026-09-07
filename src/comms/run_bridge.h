@@ -1,20 +1,24 @@
-// run_bridge.h -- RunBridge: everything that happens to a cleartext
-// "RUN:<name>[:<arg>...]" payload between arriving on a transport and
-// being handed to the TypeScript dispatcher.
+// run_bridge.h -- RunBridge: everything that happens to a `RUN` payload
+// between the v6 verb decoding it and the TypeScript dispatcher running
+// it.
 //
-// Three jobs, and only these three: sanitize the payload, suppress a
-// host's own retransmits, and park what survives in the run_queue.h
-// ring until a consumer is ready for it. It does NOT call TypeScript
-// and it does NOT arbitrate the drivetrain -- Protocol keeps both of
-// those, because only Protocol can see a wire request, a dispatched
-// job and a block-program move at the same time. RunBridge just says
-// which text is next and whether it must be dispatched right now.
+// Two jobs, and only these two: sanitize the payload, and park it in
+// the run_queue.h ring until a consumer is ready for it. It does NOT
+// call TypeScript and it does NOT arbitrate the drivetrain -- Protocol
+// keeps both of those, because only Protocol can see a wire request, a
+// dispatched job and a block-program move at the same time. RunBridge
+// just says which text is next and whether it must be dispatched now.
+//
+// Repeat suppression was a third job until 2026-09-07: a 400 ms
+// same-text window standing in for sequence numbers the cleartext
+// `RUN:` carve-out did not have. The v6 reliability layer subsumes it
+// exactly -- a retransmit reuses its ORIGINAL `#<id>`, so it is re-acked
+// WITHOUT re-executing -- and never eats a deliberate repeat under a
+// fresh id the way the window did. The clock parameter went with it.
 //
 // Host-portable on purpose -- no pxt.h, no CODAL types, nothing but
-// <cstddef>/<cstdint> and run_queue.h -- so the parking/dedupe/bypass
-// rules can be exercised with no Protocol, no fiber and no radio. The
-// clock is a parameter (`now`) for the same reason: a test steps time
-// exactly across the dedupe window's edges.
+// <cstddef>/<cstdint> and run_queue.h -- so the parking and bypass
+// rules can be exercised with no Protocol, no fiber and no radio.
 #pragma once
 
 #include <cstddef>
@@ -31,39 +35,24 @@ class RunBridge {
   static constexpr size_t kTextBytes = 48;
   static constexpr int kSlots = 8;
 
-  // Repeat-suppression window. Hosts repeat commands to survive the
-  // robot's single-slot inbound wireless buffer, and without this a
-  // repeated RUN executes once per copy -- the test programs' re-entry
-  // guard has already cleared by the time a retransmit lands. The ring
-  // fixes LOSS; this fixes duplicate EXECUTION, a different failure.
-  // 400 ms swallows a retransmit burst and still lets a deliberate
-  // repeat through, which a parameter sweep sends constantly.
-  static constexpr int32_t kDedupe = 400;  // [ms]
-
   // What offer() did with the payload. The caller only has to act on
   // kBypass (dispatch immediately); every other outcome is already
   // fully handled here.
   enum class Offer : uint8_t {
-    kMalformed,   // empty, oversized, non-printable, or empty name
-    kSuppressed,  // same text as the last accepted one, inside kDedupe
-    kBypass,      // staged into currentText() -- dispatch it NOW
-    kQueued,      // parked for dispatchOne()
-    kDropped,     // every slot still in flight; counted by dropCount()
+    kMalformed,  // empty, oversized, non-printable, or empty name
+    kBypass,     // staged into currentText() -- dispatch it NOW
+    kQueued,     // parked for dispatchOne()
+    kDropped,    // every slot still in flight; counted by dropCount()
   };
 
-  // Take one raw payload (the bytes AFTER "RUN:", not NUL-terminated)
-  // that arrived at `now`, and decide its fate.
-  //
-  // Suppression is by (text, arrival time) HERE, at the point of
-  // arrival, not at handling time -- which is what makes it immune to
-  // however long the payload then sits in the ring. Two commands that
-  // differ only in their arguments are different text, so they are not
-  // each other's repeats.
+  // Take one raw payload -- the colon-joined "<name>[:<arg>...]" text
+  // WireAdapter::onRun() builds, not NUL-terminated -- and decide its
+  // fate.
   //
   // A kBypass payload has already been copied into currentText(); the
   // caller dispatches it without consulting any drivetrain owner. See
   // isBypassName() for why those two names cannot wait in line.
-  Offer offer(const uint8_t* data, size_t len, uint32_t now);  // [ms]
+  Offer offer(const uint8_t* data, size_t len);
 
   // Stage the oldest parked payload into currentText() and release its
   // slot, returning false when nothing is waiting. The slot is released
@@ -95,9 +84,7 @@ class RunBridge {
   // Payloads parked and not yet staged.
   int queued() const { return queue_.count(); }
 
-  // True for the two names that skip the queue entirely -- and the
-  // dedupe window with it: a repeated `abort` inside kDedupe still
-  // executes.
+  // True for the two names that skip the queue entirely.
   //
   // A QUEUED abort would sit behind the very job it is meant to stop,
   // because a consumer refuses to start a second job while one owns the
@@ -122,8 +109,6 @@ class RunBridge {
 
   RunQueue<kSlots, static_cast<int>(kTextBytes)> queue_;
   char currentText_[kTextBytes] = {};
-  char lastText_[kTextBytes] = {};
-  uint32_t lastAccepted_ = 0;  // [ms] arrival time of the last accepted payload
   uint32_t malformedCount_ = 0;
 };
 

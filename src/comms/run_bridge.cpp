@@ -1,4 +1,4 @@
-// run_bridge.cpp -- RunBridge's sanitize/dedupe/park rules. See
+// run_bridge.cpp -- RunBridge's sanitize/bypass/park rules. See
 // run_bridge.h for what each of them is for.
 #include "run_bridge.h"
 
@@ -30,8 +30,7 @@ RunBridge::Offer RunBridge::malformed() {
   return Offer::kMalformed;
 }
 
-RunBridge::Offer RunBridge::offer(const uint8_t* data, size_t len,
-                                  uint32_t now) {  // [ms]
+RunBridge::Offer RunBridge::offer(const uint8_t* data, size_t len) {
   if (data == nullptr || len == 0) return malformed();
 
   // Strip one trailing '\r' (raw-terminal artifact), then copy the
@@ -57,27 +56,7 @@ RunBridge::Offer RunBridge::offer(const uint8_t* data, size_t len,
   text[len] = '\0';
   if (text[0] == ':') return malformed();  // empty name
 
-  // The bypass names are exempt from suppression. The window exists to
-  // stop a HOST'S OWN retransmit executing twice; an operator hammering
-  // `abort` is not retransmitting, and the whole reason these two names
-  // skip the queue is that nothing may stand between them and the
-  // drivetrain. A dropped second `abort` is the one drop this bridge
-  // must never make.
-  //
-  // Executing `abort` twice is harmless in a way an ordinary command's
-  // repeat is not: both bypass handlers are idempotent (stop what is
-  // running; clear a latch that may already be clear), which is what
-  // made them safe to invoke reentrantly in the first place.
-  const bool bypass = isBypassName(text);
-  if (!bypass && std::strcmp(lastText_, text) == 0 &&
-      static_cast<int32_t>(now - lastAccepted_) < kDedupe) {
-    lastAccepted_ = now;  // extend across a burst of repeats
-    return Offer::kSuppressed;
-  }
-  std::memcpy(lastText_, text, len + 1);
-  lastAccepted_ = now;
-
-  if (bypass) {
+  if (isBypassName(text)) {
     stage(text);
     return Offer::kBypass;
   }

@@ -260,11 +260,11 @@ namespace diffDrive {
     // ================= position-mode moves: blocking =================
 
     /**
-     * Drive a distance while turning a yaw angle, then stop. Below
-     * about 50 degrees of yaw, both axes blend into one arc; at or
-     * above that, this pivots to the new heading FIRST, then drives
-     * the distance straight -- two SEQUENTIAL phases, not one blended
-     * arc. Waits until the move is done.
+     * Drive a distance while turning a yaw angle, then stop. The two
+     * always blend into ONE constant-radius arc, R = distance / yaw:
+     * a small distance with a big yaw runs one wheel backwards, a
+     * negative distance drives the same arc in reverse, and a yaw
+     * past 360 keeps going round. Waits until the move is done.
      * @param distance distance to travel, eg: 20
      * @param yaw angle to turn CCW+, eg: 0
      */
@@ -317,8 +317,8 @@ namespace diffDrive {
     //% group="GoTo" weight=350
     export function startGoTo(x: number, y: number): void {
         // goToR() owns the pivot-vs-arc split; never reduce to
-        // (distance, yaw) and go through startMove(), whose own >=50 deg
-        // split would land elsewhere. Two shims, not one: see shims.cpp's
+        // (distance, yaw) and go through startMove(), which is always
+        // the tangent arc. Two shims, not one: see shims.cpp's
         // engineSetGoToDeadline() for the TS9200 arity rule.
         if (x == 0 && y == 0) return
         const goalX = Math.round(x * 10)  // [mm]

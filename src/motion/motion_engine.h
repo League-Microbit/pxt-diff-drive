@@ -113,9 +113,10 @@ class MotionEngine {
   // still stops motion already in progress. Clears the planner.
   void wheelsX(float left, float right, float cruise, uint32_t timeout);  // [mm] [mm] [mm/s] [ms]
 
-  // [rad] the |rotation| at which moveX() splits into pivot-then-straight.
-  // Exposed so a caller mirroring that decision reads it rather than
-  // re-typing the constant.
+  // [rad] the arc angle |theta| at which goToR() reaches its target by
+  // pivot-then-chord instead of the tangent arc. moveX() has NO such
+  // threshold: every (distance, rotation) is one blended arc. Exposed so a
+  // caller mirroring goToR()'s decision reads it rather than re-typing it.
   static constexpr float turnFirstAngle() { return kTurnFirstAngle; }
 
   // goToR()'s bearing-then-chord decomposition, pure so a caller
@@ -131,8 +132,9 @@ class MotionEngine {
 
   // ---- move engine ----
 
-  // Supersedes any in-flight command. Splits into pivot-then-straight above
-  // kTurnFirstAngle when there is also translation.
+  // Supersedes any in-flight command. Always ONE blended constant-radius
+  // segment, R = distance / rotation, for any pair -- including |R| < b/2
+  // (inner wheel reversed) and |rotation| beyond a full turn. Never splits.
   void moveX(float distance, float rotation, float cruise,
              uint32_t timeout);  // [mm] [rad] [mm/s] [ms]
 
@@ -192,7 +194,9 @@ class MotionEngine {
   const MotionLimits& limits() const { return limits_; }
 
  private:
-  // [rad] 50 deg. At or above this, pivot first, then travel straight.
+  // [rad] 50 deg. goToR() only: at or above this arc angle, pivot to the
+  // bearing first, then drive the chord. Inherited from a go-to-a-point
+  // navigator (motion-api.md S3.3); it was never a drivetrain limit.
   static constexpr float kTurnFirstAngle = 0.8726646f;
 
   static constexpr int kSettleMaxSteps = 12;          // [steps]

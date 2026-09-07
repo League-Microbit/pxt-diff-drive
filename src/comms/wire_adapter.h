@@ -260,6 +260,21 @@ class WireAdapter : public Wire::Adapter {
                      char* result, size_t resultCapacity,
                      bool& hasResult) override;
 
+  // ...and yet FUNCS here is NOT empty, the one place the two halves of
+  // "RUN" part company. onRun() above is reached normally by the v6
+  // `RUN <name> #id` verb -- and answers every name kUnknown, because
+  // this class registers nothing. The names this robot really dispatches
+  // are the ones a block program bound with `onRun()` (blocks/run.ts),
+  // reached by the COLON form `RUN:<name>`, which protocol.cpp routes to
+  // the cleartext bridge instead of the v6 stack.
+  //
+  // So these three read run_registry.h's mirror of that TypeScript table
+  // -- FUNCS answers "what can I run here". A listed name is addressable
+  // as `RUN:<name>`, NOT as `RUN <name> #id`, which still errs kUnknown.
+  size_t runCount() const override;
+  const char* runName(size_t index) const override;
+  const char* runSignature(size_t index) const override;
+
  private:
   Wire::Identity identity_;
   Wire::TlmMode mode_ = Wire::TlmMode::kOff;

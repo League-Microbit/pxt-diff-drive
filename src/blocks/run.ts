@@ -62,8 +62,9 @@ namespace diffDrive {
     // lands immediately rather than queueing behind it, and abort/
     // clearestop can arrive nested inside a running handler's tick loop.
     // runCommandText() takes no argument -- the firmware tracks which
-    // command is current -- and arguments ride along as text, so the
-    // wire reads as what it does: RUN:pivot:180, not a magic number.
+    // command is current -- and arguments arrive colon-joined
+    // ("pivot:180"), as WireAdapter::onRun rebuilt them from
+    // `RUN pivot 180`'s own space-separated tokens.
     function wireRunDispatch(): void {
         if (runWired) return
         runWired = true
@@ -100,7 +101,7 @@ namespace diffDrive {
 
     /**
      * Run code when the named command arrives over the wire protocol --
-     * `RUN:<name>` or `RUN:<name>:<arg>`, e.g. RUN:pivot:180. Bind your
+     * `RUN <name> [<arg>] #<id>`, e.g. `RUN pivot 180 #7`. Bind your
      * test functions to names so the bench host can trigger them
      * remotely, the same functions a button handler calls. The handler
      * receives the first argument as a number (0 when there is none);
@@ -124,6 +125,7 @@ namespace diffDrive {
         wireRunDispatch()
         runNames.push(name)
         runHandlers.push(handler)
+        _registerRunName(name, "")  // advertise to FUNCS; see run_registry.h
     }
 
     /**
@@ -140,6 +142,7 @@ namespace diffDrive {
         ensureRunState()
         wireRunDispatch()
         runAnyHandlers.push(handler)
+        _registerRunCatchAll()  // every name becomes dispatchable
     }
 
     /**
@@ -264,7 +267,7 @@ namespace diffDrive {
      *   - PRESENT but unparseable, OR <= minExclusive -> NaN
      *
      * NaN is the sentinel because it never collides with a real
-     * argument value a caller might legitimately pass (RUN:circle:0 is
+     * argument value a caller might legitimately pass (`RUN circle 0` is
      * a valid, if degenerate, radius under the bare two-argument form
      * -- parseFloat("0") is 0, not NaN, so it is returned as-is).
      * NaN is NEVER the same as fallback and NEVER 0: a caller must

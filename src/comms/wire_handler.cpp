@@ -282,6 +282,7 @@ const WireHandler::VerbEntry WireHandler::kCommandTable[] = {
     {"GO_TO_W", &WireHandler::decodeGoToW, &WireHandler::execGoToW},
     {"STOP", &WireHandler::decodeStop, &WireHandler::execStop},
     {"ESTOP", &WireHandler::decodeAlwaysTrue, &WireHandler::execNoop},
+    {"FUNCS", &WireHandler::decodeNoFields, &WireHandler::execFuncs},
     {"RUN", &WireHandler::decodeRun, &WireHandler::execRun},
 };
 
@@ -295,7 +296,7 @@ WireHandler::WireHandler(Adapter& adapter, Sink& sink)
   // unevaluated sizeof operand, and only member/friend context is
   // exempt. Purely compile-time -- this constructor need not run for a
   // mismatched count to fail the build.
-  static_assert(sizeof(kCommandTable) / sizeof(kCommandTable[0]) == 18,
+  static_assert(sizeof(kCommandTable) / sizeof(kCommandTable[0]) == 19,
                 "kCommandTable verb count");
 }
 
@@ -955,6 +956,68 @@ void WireHandler::execHelp(char** fields, size_t fieldCount, uint32_t id,
   // kCommandTable so HELP still appears in its own listing, and this
   // delegates so both paths can never diverge.
   emitHelp();
+}
+
+// FUNCS -- enumerate the adapter's RUN registry, one line per entry
+// (protocol.md's FUNCS section). Bare GET's dump, structurally: walk an
+// adapter-declared count and write one informational line each. The
+// handler holds no function table -- it DISCLOSES the adapter's.
+//
+// Sequenced, so the `ack` terminates the variable-length reply; the
+// `funcs` lines therefore carry no `#<id>` of their own. An empty
+// registry writes NOTHING and is not an error, so errCode is never set.
+// Adapter text is sanitized, as execRun() sanitizes onRun()'s result.
+void WireHandler::execFuncs(char** fields, size_t fieldCount, uint32_t id,
+                             uint8_t& errCode) {
+  (void)fields;
+  (void)fieldCount;
+  (void)id;
+  errCode = 0;
+
+  // Per-token budget: an ARRAY SIZE (content plus NUL). One token may
+  // use the whole budget when the other is empty, so this is sized for
+  // that case and the assembly below enforces the LINE bound.
+  constexpr size_t kTokenBytes = kMaxLineBytes - 7;  // "funcs " + '\n'
+  char name[kTokenBytes];
+  char signature[kTokenBytes];
+  // Room for kMaxLineBytes of wire content INCLUDING the '\n', plus the
+  // NUL -- see execRun()'s note on the same accounting.
+  char buf[kMaxLineBytes + 1];
+
+  // Appends what fits and silently stops at the cap, leaving one byte
+  // for the '\n' the caller adds. Written as an explicit bounded copy
+  // rather than one snprintf of three strings: two adapter-supplied
+  // tokens that may EACH be token-sized can jointly exceed the line, so
+  // truncation here is expected rather than exceptional -- and stating
+  // it in the loop bound is both clearer and free of the
+  // -Wformat-truncation the equivalent snprintf raises. Same shape as
+  // buildHelpLine()'s own append.
+  const auto append = [&buf](size_t pos, const char* text) -> size_t {
+    while (*text != '\0' && pos < kMaxLineBytes - 1) buf[pos++] = *text++;
+    return pos;
+  };
+
+  const size_t total = adapter_.runCount();
+  for (size_t i = 0; i < total; ++i) {
+    sanitizeLineText(adapter_.runName(i), name, sizeof(name));
+    if (name[0] == '\0') continue;  // an unnamed entry is not addressable
+    sanitizeLineText(adapter_.runSignature(i), signature, sizeof(signature));
+
+    size_t pos = append(0, "funcs ");
+    pos = append(pos, name);
+    // An empty signature omits the field entirely rather than leaving a
+    // dangling separator space -- the grammar has no empty token.
+    if (signature[0] != '\0') {
+      pos = append(pos, " ");
+      pos = append(pos, signature);
+    }
+    // Unconditional, and reachable because append() always leaves room:
+    // every emitted line ends in '\n' even when the adapter's own
+    // strings overran the cap.
+    buf[pos++] = '\n';
+    buf[pos] = '\0';
+    writeLine(buf);
+  }
 }
 
 // ---- configuration: pure delegation, no storage here (protocol.md S7) ----

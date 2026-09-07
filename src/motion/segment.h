@@ -39,19 +39,35 @@ struct Segment {
   // Rotation only, no translation. A blended arc is NOT a pure turn.
   bool pureTurn() const { return yawTarget != 0.0f && distTarget == 0.0f; }
 
-  // [counts] dominant-axis distance still to travel. Signed "toward the
-  // target" on the yaw axis, so a pivot briefly rotating the wrong way is
-  // never credited as progress; unsigned magnitude on the distance axis.
+  // [1] counts on the dominant AXIS -> counts on the dominant WHEEL. A
+  // straight or a pure turn has its dominant wheel on the axis (1.0). A
+  // blended arc's outer wheel travels dominant/|distTarget| times farther
+  // than the mean axis -- for a tight arc many times farther -- and the
+  // shaper's command, brake budget and arrival window are all in the
+  // wheel's frame, so anything measured on the axis is scaled by this
+  // before it meets them (reports/move-x-arc-space-20260906.md, fig 5).
+  float dominantScale() const {
+    const float axisTarget = dominantAxis == Axis::kYaw
+        ? std::fabs(yawTarget) : std::fabs(distTarget);
+    return axisTarget > 0.0f ? dominant / axisTarget : 1.0f;
+  }
+
+  // [counts] distance still to travel, in the dominant WHEEL's frame.
+  // Measured on the dominant axis and scaled by dominantScale(). Signed
+  // "toward the target" on the yaw axis, so a pivot briefly rotating the
+  // wrong way is never credited as progress; unsigned magnitude on the
+  // distance axis.
   float remaining(const DiffDrive::DifferentialDrive::Output& out) const {
     const float dLeft = out.positionLeft - posLeft0;     // [counts]
     const float dRight = out.positionRight - posRight0;  // [counts]
     if (dominantAxis == Axis::kYaw) {
       const float diffProgress = 0.5f * (dRight - dLeft);
       const float toward = yawTarget > 0.0f ? diffProgress : -diffProgress;
-      return std::fabs(yawTarget) - toward;
+      return (std::fabs(yawTarget) - toward) * dominantScale();
     }
     const float meanProgress = 0.5f * (dLeft + dRight);
-    return std::fabs(distTarget) - std::fabs(meanProgress);
+    return (std::fabs(distTarget) - std::fabs(meanProgress)) *
+           dominantScale();
   }
 
   // [counts] signed progress TOWARD the commanded yaw direction. Exposed

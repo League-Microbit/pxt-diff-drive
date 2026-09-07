@@ -5,11 +5,11 @@
 // that lives behind wireHandler_/wireHandlerRadio_/wireHandlerWifi_/
 // wireAdapter_.
 //
-// Cleartext "RUN:<name>[:<arg>...]" is the ONE carve-out, matched by
-// its literal "RUN:" prefix before a line reaches the v6 stack, on
-// every transport. It exists because v6's own RUN verb
-// (WireAdapter::onRun()) answers kUnknown, so this is the only path
-// into the by-name test-trigger dispatch test.ts uses.
+// There is NO carve-out: every inbound line goes to the v6 stack.
+// `RUN <name> [arg...] #<id>` reaches the by-name dispatch test.ts uses
+// via WireAdapter::onRun() -> protocolOfferRun() -> handleRun() below,
+// with the reliability layer. routeLine()'s cleartext "RUN:" prefix
+// match, and the 400 ms window standing in for it, went 2026-09-07.
 //
 // Each transport gets its OWN WireHandler over the SAME wireAdapter_ --
 // never a second adapter: two adapters would let a sequence gap on one
@@ -72,7 +72,9 @@ class Protocol {
   void emitLine(const char* text);
 
   // The text of whichever RUN command is CURRENTLY being dispatched --
-  // the whole payload after `RUN:`, e.g. "pivot:180". Valid only while
+  // name and arguments colon-joined ("pivot:180"), as
+  // WireAdapter::onRun() rebuilt it from the verb's own space-separated
+  // tokens. Valid only while
   // the registered RUN dispatch callback is executing, on THIS fiber;
   // see RunBridge::currentText() for why a nested reentrant dispatch
   // (an abort arriving mid-job) cannot corrupt an outer job's
@@ -103,14 +105,26 @@ class Protocol {
   // definitions (protocol.cpp) can reach them from shims.cpp, the same
   // shape currentRunText() above uses.
   bool tryTakeMotionOwnership();
+
   void releaseBlockOwnership();
 
-  // Cleartext RUN payloads refused because every slot was still
+  // ---- the RUN bridge ----------------------------------------------
+  // A decoded `RUN <name> [arg...] #<id>` arrives as the colon-joined
+  // text WireAdapter::onRun() built, via protocolOfferRun(). runBridge_
+  // parks it for dispatchJob(), or -- for "abort"/"clearestop" --
+  // stages it back for immediate dispatch. Public for
+  // tryTakeMotionOwnership()'s reason: a free function outside this
+  // class calls it. False means the bridge REFUSED the payload
+  // (malformed, or every slot in flight), which onRun() makes an `err`
+  // rather than an ack for a command that never runs.
+  bool handleRun(const uint8_t* data, size_t dataLen);
+
+  // RUN payloads refused because every slot was still
   // in flight. Saturates rather than wrapping -- a drop count
   // that rolls to zero reads as "nothing was lost".
   uint32_t runDropCount() const;
 
-  // Cleartext RUN payloads refused by RunBridge's own sanitizer --
+  // RUN payloads refused by RunBridge's own sanitizer --
   // empty, overlong, non-printable, or an empty name -- surfaced for
   // shims.cpp's diagValue(30)/probe(30). Kept apart from
   // runDropCount() above on purpose: a malformed line and a full ring
@@ -195,8 +209,8 @@ class Protocol {
   // One pass of the WiFi transport's own servicing, called from
   // serviceOnce() when wifiEnabled_: lazily begin()s the link, pumps
   // its AT state machine, greets a newly-learned host with the banner,
-  // polls its inbound lines into wireHandlerWifi_ (with the same
-  // cleartext RUN: carve-out serial and radio get), and emits one
+  // polls its inbound lines into wireHandlerWifi_ (through the same
+  // carve-out-free routeLine() serial and radio use), and emits one
   // `DBG:wifi ...` diagnostic line per state change.
   void serviceWifi();
   void emitWifiDebug();
@@ -270,12 +284,9 @@ class Protocol {
 
   // The ONE path an inbound line takes, whichever transport produced
   // it: `data`/`len` is one complete line, delimiter already stripped
-  // by the transport that framed it. A line whose first bytes are the
-  // literal "RUN:" prefix goes to the cleartext bridge (handleRun(),
-  // below); everything else -- including the v6 grammar's own
-  // space-separated "RUN <name> ... #<id>" verb -- is fed to `handler`,
-  // followed by the separate "\n" feed() needs to see the line as
-  // complete.
+  // by the transport that framed it. Every line is fed to `handler`,
+  // followed by the separate "\n" feed() needs to see it as complete --
+  // no prefix fork here any more (see this file's own top comment).
   //
   // `handler` is the CALLER's own WireHandler, never a fixed one: each
   // transport has its own, each with its own expectedNext_, so a
@@ -348,17 +359,7 @@ class Protocol {
   static constexpr int kEmitSlots = 8;
   EmitQueue<kEmitSlots, static_cast<int>(kEmitTextBytes)> emitQueue_;
 
-  // ---- the old-style cleartext RUN bridge --------------------------
-  // RUN:<name>[:<arg>...] (cleartext, e.g. "RUN:pivot:180") goes to
-  // runBridge_ below, which sanitizes it, suppresses a host's own
-  // retransmits, and either parks it for dispatchJob() to drain in
-  // arrival order or -- for "abort"/"clearestop" -- stages it straight
-  // back for immediate dispatch. This method is the thin seam between
-  // that object and the transports: read the clock, offer the payload,
-  // and make the one TypeScript call a bypass asks for.
-  void handleRun(const uint8_t* data, size_t dataLen);
-
-  // Parking, dedupe and hand-off for the cleartext RUN bridge, with the
+  // Parking and hand-off for the RUN bridge, with the
   // run_queue.h ring inside it -- host-portable and host-tested on its
   // own (run_bridge.h). Its overflow count is readable as diagValue
   // ordinal 28. Ordinal 28 is diagValue()'s own numbering, which is a

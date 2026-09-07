@@ -16,17 +16,6 @@ namespace diffDrive {
     let simMoveRemainYaw = 0  // [rad]
     let simMoveActive = false
 
-    // Pivot-then-straight split bookkeeping, mirroring the real motion
-    // engine's own queued-second-phase fields (a pivot segment that,
-    // once finished, hands off to a queued straight segment). Needed
-    // because simMoveRemainDist/simMoveRemainYaw alone can't express
-    // "there is a second phase still to come" once the pivot phase has
-    // legitimately driven simMoveRemainDist to 0 for its own duration
-    // -- see _startMove()/simIntegrate() below.
-    let simMoveHasPendingStraight = false
-    let simMovePendingDistance = 0  // [mm] signed
-    let simMovePendingSpeed = 0  // [mm/s]
-
     // E-stop latch (sprint 007 ticket 004, closes R-13/BLK-07): mirrors
     // hardware's estopLatch_ (diffdrive.h/.cpp). Set by _estopAll(),
     // cleared only by _estopClear(); gates _setWheels()/_driveTwist()/
@@ -80,32 +69,9 @@ namespace diffDrive {
             simMoveRemainDist -= Math.abs(dDist)
             simMoveRemainYaw -= Math.abs(dYaw)
             if (simMoveRemainDist <= 0 && simMoveRemainYaw <= 0) {
-                if (simMoveHasPendingStraight) {
-                    // The pivot phase just finished -- start the
-                    // queued straight phase now, the same sequential
-                    // hand-off the real motion engine performs once
-                    // its own pivot segment ends.
-                    simMoveHasPendingStraight = false
-                    const straightDistance = simMovePendingDistance
-                    const straightSpeed = simMovePendingSpeed
-                    simYawRate = 0
-                    const straightDuration =
-                        straightDistance != 0 && straightSpeed > 0
-                            ? Math.abs(straightDistance) / straightSpeed : 0
-                    if (straightDuration > 0) {
-                        simMoveRemainDist = Math.abs(straightDistance)
-                        simMoveRemainYaw = 0
-                        simVel = straightDistance / straightDuration
-                        simMoveActive = true
-                    } else {
-                        simMoveActive = false
-                        simVel = 0
-                    }
-                } else {
-                    simMoveActive = false
-                    simVel = 0
-                    simYawRate = 0
-                }
+                simMoveActive = false
+                simVel = 0
+                simYawRate = 0
             }
         }
         const mid = simHeading + stepYawRate * stepDt / 2
@@ -152,39 +118,15 @@ namespace diffDrive {
         simMoveActive = false
     }
 
-    // [rad] a nonzero distance combined with a rotation at/above this
-    // is NOT one blended segment on the real motion engine -- pivot to
-    // the new heading FIRST, then drive the distance straight, as two
-    // SEQUENTIAL phases (see _startMove() below). Read, not re-typed:
-    // drift-tested against the real firmware constant this mirrors so
-    // the two copies can't diverge silently.
-    const kSimTurnFirstAngle = 0.8726646  // [rad]
-
     //% shim=diffDrive::startMove
     export function _startMove(distance: number, yaw: number, speed: number,
         yawRate: number): void {
         simIntegrate()
         if (simEstopped) return
-        simMoveHasPendingStraight = false
         const yawMagnitude = Math.abs(yaw / 100) * Math.PI / 180  // [rad]
-        // Mirrors the real motion engine's own split condition exactly
-        // (nonzero distance AND |rotation| at/above the shared
-        // threshold): below the threshold, or a pure pivot/pure
-        // straight, behavior is UNCHANGED -- one blended segment, the
-        // `else` branch below.
-        if (distance != 0 && yawMagnitude >= kSimTurnFirstAngle) {
-            const yawDur = Math.abs(yaw) / yawRate
-            if (yawDur <= 0) return
-            simMoveRemainYaw = yawMagnitude
-            simMoveRemainDist = 0
-            simVel = 0
-            simYawRate = ((yaw / 100) * Math.PI / 180) / yawDur
-            simMoveHasPendingStraight = true
-            simMovePendingDistance = distance
-            simMovePendingSpeed = speed
-            simMoveActive = true
-            return
-        }
+        // One blended segment for ANY (distance, yaw), mirroring
+        // MotionEngine::moveX(): both axes share one duration, so the
+        // path is a constant-radius arc. No pivot-first threshold.
         simMoveRemainDist = Math.abs(distance)
         simMoveRemainYaw = yawMagnitude
         let duration = 0
@@ -236,10 +178,10 @@ namespace diffDrive {
     // MotionEngine::goToR() (motion_engine.cpp): bearing = atan2(y, x),
     // turn angle theta = 2*bearing wrapped to the short arc (|theta| <=
     // pi, KERN-03) so a target behind the robot turns the short way.
-    // Sim reaches (x, y) as one blended arc; hardware's >=50 deg
-    // pivot-then-chord split lands at the same point, so no split is
-    // modelled here. FOUR params, not five -- the fifth (`timeout`)
-    // moved to _setGoToDeadline() above.
+    // Sim reaches (x, y) as one blended arc; hardware's pivot-then-chord
+    // split (goToR()'s own, at |theta| >= 50 deg) lands at the same
+    // point, so no split is modelled here. FOUR params, not five -- the
+    // fifth (`timeout`) moved to _setGoToDeadline() above.
     //
     // Params typed `number`, not `int32`: an int32 local/param on a
     // function with a TS body fails the JS->Blocks decompiler with
@@ -559,6 +501,23 @@ namespace diffDrive {
     // and never dequeues one, so this has nothing to model.
     //% shim=diffDrive::registerRunDispatch
     export function _registerRunDispatch(cb: () => void): void {
+        return
+    }
+
+    // Publishes one name bound by onRun()/onRunCommand() into the C++
+    // mirror the FUNCS wire verb enumerates (comms/run_registry.h).
+    // Registration only -- it changes nothing about how a command is
+    // dispatched, so the simulator, which has no wire and answers no
+    // FUNCS, has nothing to model.
+    //% shim=diffDrive::registerRunName
+    export function _registerRunName(name: string, signature: string): void {
+        return
+    }
+
+    // Declares that a catch-all handler is bound, so every name is
+    // dispatchable. Registration only, same as _registerRunName.
+    //% shim=diffDrive::registerRunCatchAll
+    export function _registerRunCatchAll(): void {
         return
     }
 

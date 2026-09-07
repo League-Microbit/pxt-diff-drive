@@ -326,6 +326,18 @@ class Adapter {
   virtual Result onRun(const char* name, const char* const* argv, size_t argc,
                        char* result, size_t resultCapacity,
                        bool& hasResult) = 0;
+
+  // ---- the RUN registry, made readable (protocol.md's FUNCS section)
+  // -- the shape fieldCount()/fieldName() give the config surface, and
+  // walked by execFuncs() the way a bare GET walks that one. This class
+  // still holds no function table; it discloses the adapter's.
+  // runCount() 0 is VALID (an empty allowlist). runName(i)/
+  // runSignature(i) are borrowed, never null, "" out of range; a
+  // signature is an OPTIONAL single token nothing parses. Both are
+  // sanitized before the sink -- neither may forge a wire line. ----
+  virtual size_t runCount() const = 0;
+  virtual const char* runName(size_t index) const = 0;
+  virtual const char* runSignature(size_t index) const = 0;
 };
 
 class WireHandler {
@@ -633,6 +645,12 @@ class WireHandler {
   bool decodeStop(char** fields, size_t fieldCount);
   void execStop(char** fields, size_t fieldCount, uint32_t id,
                uint8_t& errCode);
+
+  // No data fields (shares decodeNoFields with ID/VER/STATUS/HELP), but
+  // SEQUENCED unlike those four: its reply is variable-length and the
+  // ack is the terminator. See execFuncs().
+  void execFuncs(char** fields, size_t fieldCount, uint32_t id,
+                uint8_t& errCode);
 
   bool decodeRun(char** fields, size_t fieldCount);
   void execRun(char** fields, size_t fieldCount, uint32_t id,

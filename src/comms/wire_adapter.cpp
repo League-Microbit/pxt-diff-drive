@@ -2,6 +2,8 @@
 #include "wire_adapter.h"
 
 #include "config_fields.h"
+#include "run_bridge.h"
+#include "run_registry.h"
 
 #include <cmath>
 
@@ -98,6 +100,16 @@ int wheelSpeed(int which);  // [mm/s]; which: 0 = left, 1 = right
 // motion_engine.cpp). This class still holds no stored reference to
 // MotionEngine/Rig -- see this file's own header comment.
 bool engineMoveActive();
+
+// The one call that makes `RUN` do anything: hands the colon-joined
+// "<name>[:<arg>...]" text to Protocol's RunBridge, which stages it for
+// immediate dispatch (the abort/clearestop bypass) or parks it for
+// dispatchJob(). Defined in protocol.cpp -- same forward-declaration
+// convention as every block above, same reason: only Protocol can call
+// TypeScript, and this class must stay free of pxt.h. False means the
+// bridge refused (malformed, or every slot in flight), which onRun()
+// reports as a merits rejection rather than a false accept.
+bool protocolOfferRun(const char* text);
 
 // The SECOND genuinely new read, alongside engineMoveActive() above --
 // true iff the most recent Segment to go inactive ended via its OWN
@@ -917,15 +929,76 @@ const Wire::Snapshot& WireAdapter::buildSnapshot() {
   return snapshot_;
 }
 
-Wire::Result WireAdapter::onRun(const char* /*name*/,
-                                const char* const* /*argv*/,
-                                size_t /*argc*/, char* /*result*/,
+Wire::Result WireAdapter::onRun(const char* name, const char* const* argv,
+                                size_t argc, char* /*result*/,
                                 size_t /*resultCapacity*/, bool& hasResult) {
-  // No registration table -- see wire_adapter.h's own doc comment on
-  // this override. Every RUN is ERR_UNKNOWN, the same wire outcome as
-  // any name a real registration table would not recognize.
+  // Void by construction: the TypeScript handlers this reaches return
+  // nothing, and a queued one has not even started when this returns.
   hasResult = false;
-  return Wire::Result::kUnknown;
+  if (name == nullptr || name[0] == '\0') return Wire::Result::kUnknown;
+
+  // An unregistered name is refused HERE, before the bridge, so a typo
+  // answers `err 1` instead of being queued and silently matching no
+  // handler -- which is what the cleartext path did, and why a wrong
+  // name used to look exactly like a dead robot. This is the same table
+  // FUNCS lists, so the listing and the allowlist cannot disagree.
+  //
+  // A catch-all handler (run.ts's onRunCommand) makes EVERY name
+  // dispatchable, so its presence disables the check rather than
+  // pretending the registry is exhaustive.
+  if (!runRegistry().acceptsAnyName() && runRegistry().find(name) < 0) {
+    return Wire::Result::kUnknown;
+  }
+
+  // Re-join into the colon-separated text the TypeScript dispatcher
+  // already splits on (run.ts's `text.split(":")`), leaving the whole
+  // block layer untouched by the wire format change. The verb's tokens
+  // are space-separated; this is the ONE place the spellings meet.
+  char text[RunBridge::kTextBytes];
+  size_t pos = 0;
+  const auto append = [&text, &pos](const char* src) {
+    while (*src != '\0' && pos < RunBridge::kTextBytes - 1) text[pos++] = *src++;
+  };
+  append(name);
+  for (size_t i = 0; i < argc; ++i) {
+    // Truncation is refused, not silently shipped: a half-copied
+    // argument is a DIFFERENT command (RUN pivot 180 -> "pivot:18"),
+    // which would turn an over-long line into a wrong move rather than
+    // an error.
+    if (pos + 1 + std::strlen(argv[i]) >= RunBridge::kTextBytes) {
+      return Wire::Result::kRange;
+    }
+    append(":");
+    append(argv[i]);
+  }
+  text[pos] = '\0';
+
+  return protocolOfferRun(text) ? Wire::Result::kOk : Wire::Result::kFull;
+}
+
+// ---- the RUN registry, disclosed (protocol.md's FUNCS section) --------
+//
+// Pure delegation to run_registry.h's shared table, which is WRITTEN
+// from the TypeScript side (shims.cpp's registerRunName, called by
+// run.ts's onRun() as each handler binds). Nothing here ever adds to
+// it, so a name lists if and only if a block program bound a handler
+// for it -- and a program that bound none leaves the count at 0, which
+// FUNCS answers with no lines. See wire_adapter.h on why these read
+// this table and not onRun()'s (empty) v6 allowlist.
+size_t WireAdapter::runCount() const {
+  const int count = runRegistry().count();
+  return count > 0 ? static_cast<size_t>(count) : 0u;
+}
+
+// Both borrow from that table, a static outliving every wire call --
+// Wire::Adapter's borrowed-pointer contract. Out of range answers "",
+// never null.
+const char* WireAdapter::runName(size_t index) const {
+  return runRegistry().name(static_cast<int>(index));
+}
+
+const char* WireAdapter::runSignature(size_t index) const {
+  return runRegistry().signature(static_cast<int>(index));
 }
 
 }  // namespace diffDrive

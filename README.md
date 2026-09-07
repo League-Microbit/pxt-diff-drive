@@ -165,10 +165,10 @@ The extension speaks a line-oriented wire protocol over USB serial —
 and over the radio once `setup radio` has been called — so a computer
 can drive and observe the robot. Two blocks let a program answer to it:
 
-- `on run %name` — run code when `RUN:<name>` or `RUN:<name>:<arg>`
+- `on run %name` — run code when `RUN <name>` or `RUN <name> <arg>`
   arrives; the first argument comes in as a number. Bind test routines
   to names so a bench host can trigger them.
-- `on run command` — run code for *any* `RUN:` command.
+- `on run command` — run code for *any* `RUN` command.
 
 And two send things back:
 
