@@ -1431,9 +1431,9 @@ void WireHandler::execRun(char** fields, size_t fieldCount, uint32_t id,
 void WireHandler::sendBanner() {
   Identity identity;
   adapter_.identity(identity);
-  char buf[96];
-  snprintf(buf, sizeof(buf), "device NEZHA2 robot %s %s\n", identity.name,
-                identity.serial);
+  char buf[96];  // worst case 74 bytes -- ample margin
+  snprintf(buf, sizeof(buf), "device %s %s %s %s\n", identity.role,
+                identity.commonName, identity.name, identity.serial);
   writeLine(buf);
 }
 

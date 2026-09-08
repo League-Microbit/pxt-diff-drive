@@ -203,6 +203,39 @@ namespace diffDrive {
     }
 
     /**
+     * Set the HELLO banner's role and common name, instead of the fixed
+     * `NEZHA2 robot` pair baked into this firmware. The banner is
+     * space-separated and parsed positionally by every consumer, so any
+     * whitespace in either string is stripped (leading, trailing, and
+     * internal) before it is stored -- eg. "my robot" becomes "myrobot".
+     * The call always succeeds; whitespace never causes rejection (see
+     * DBG:role).
+     * Picked up by the next banner regardless of whether this is called
+     * before or after the protocol fiber starts -- no ordering trap.
+     * @param role firmware family, eg: "NEZHA2"
+     * @param commonName generic name within that family, eg: "robot"
+     */
+    //% blockHidden=true
+    export function setDeviceRole(role: string, commonName: string): void {
+        _setDeviceRole(role, commonName)
+    }
+
+    /**
+     * Report which robot's config this program has actually loaded, in
+     * the `id` reply's `profile` field -- eg. after pasting a calibration
+     * block at runtime. Unlike setupWifi(), a call made after the first
+     * `id` reply has already gone out still succeeds and is reflected in
+     * the next one. Any whitespace in `name` is stripped (leading,
+     * trailing, and internal) before it is stored; the call always
+     * succeeds (see DBG:profile).
+     * @param name the robot config name, eg: "vevov"
+     */
+    //% blockHidden=true
+    export function setProfile(name: string): void {
+        _setProfile(name)
+    }
+
+    /**
      * Bring the v6 wire up over the Planet X WiFi module (Ai-WB2-12F on
      * RJ11 jack J1), joining the network whose credentials
      * tools/make_deploy.py baked into this build. The robot then answers

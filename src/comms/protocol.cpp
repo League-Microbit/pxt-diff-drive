@@ -4,6 +4,7 @@
 #include "../core/fiber_identity.h"
 #include "../platform/vfp_guard.h"
 
+#include <cctype>  // isspace(), for setDeviceRole()'s whitespace strip
 #include <cstdio>  // plain snprintf, not std::snprintf: newlib-nano's
                    // <cstdio> declares it globally but never puts it in
                    // namespace std (same gotcha wire_handler.cpp
@@ -82,9 +83,18 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20260907.5";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20260908.1";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
+
+// kRole/kCommonName: the HELLO banner's literal "NEZHA2"/"robot"
+// prefix, named so Protocol::Protocol() has a source to seed
+// roleBuf_/commonNameBuf_ from. NOT deploy-injected like kProfile --
+// make_deploy.py's `_inject_profile()` regex matches only the exact
+// name `kProfile`, so this is safe, but re-check before adding a third
+// `k*Profile`-adjacent name.
+constexpr const char* kRole = "NEZHA2";
+constexpr const char* kCommonName = "robot";
 
 // WiFi credentials, injected into the SCRATCH COPY ONLY by
 // tools/make_deploy.py's _inject_wifi_secrets() from the gitignored
@@ -122,6 +132,15 @@ constexpr uint32_t kTelemetryEmitPeriod = 50;  // [ms]
 constexpr uint32_t kPollInterval = 5;  // [ms]
 
 }  // namespace
+
+// Seeds roleBuf_/commonNameBuf_ from kRole/kCommonName -- a char array
+// member can't be NSDMI'd from a runtime const char*; see protocol.h's
+// "NSDMI, not a hand-written constructor" comment.
+Protocol::Protocol() {
+  snprintf(roleBuf_, sizeof(roleBuf_), "%s", kRole);
+  snprintf(commonNameBuf_, sizeof(commonNameBuf_), "%s", kCommonName);
+  snprintf(profileBuf_, sizeof(profileBuf_), "%s", kProfile);
+}
 
 void Protocol::emitLine(const char* text) {
   if (text == nullptr) return;
@@ -194,6 +213,16 @@ void protocolEmitLine(const char* text) { protocol().emitLine(text); }
 void protocolSetupWifi(const char* ssid, const char* password) {
   protocol().setupWifi(ssid, password);
 }
+
+// Free-function entry point for shims.cpp's setDeviceRole shim (ticket
+// 003) -- same boundary reason as protocolEmitLine() above.
+void protocolSetDeviceRole(const char* role, const char* commonName) {
+  protocol().setDeviceRole(role, commonName);
+}
+
+// Free-function entry point for shims.cpp's setProfile shim (ticket
+// 003) -- same boundary reason as protocolEmitLine() above.
+void protocolSetProfile(const char* name) { protocol().setProfile(name); }
 
 int Protocol::serialDropCount() const {
   return static_cast<int>(transport_.dropCount());
@@ -285,6 +314,83 @@ void Protocol::setupWifi(const char* ssid, const char* password) {
   // "Store AND enable" in one call, per the stakeholder decision: no
   // separate enable step, no ordering trap.
   enableWifi();
+}
+
+namespace {
+
+// Copies every non-whitespace (isspace()) byte of `src` into `dst` --
+// leading, trailing, AND internal removed, a strip not a trim --
+// clipped to fit `dstSize` (NUL-terminated). Separately counts the
+// FULL stripped length past what fit and returns it, so a caller can
+// judge truncation against the true stripped length without an
+// intermediate buffer sized to the unbounded input.
+size_t stripWhitespaceInto(const char* src, char* dst, size_t dstSize) {
+  size_t strippedLen = 0;
+  size_t written = 0;
+  for (const char* p = src; *p != '\0'; ++p) {
+    unsigned char c = static_cast<unsigned char>(*p);
+    if (isspace(c)) continue;
+    ++strippedLen;
+    if (dstSize > 0 && written + 1 < dstSize) {
+      dst[written++] = static_cast<char>(c);
+    }
+  }
+  if (dstSize > 0) dst[written] = '\0';
+  return strippedLen;
+}
+
+}  // namespace
+
+// Stakeholder decision (ticket 001): whitespace is STRIPPED AND
+// ACCEPTED, not rejected -- the null-argument check below is the only
+// rejection path. Strip first, then measure the STRIPPED length, then
+// clip: judging truncation from the raw strlen() would wrongly flag a
+// value that only overflows because of whitespace about to be removed.
+void Protocol::setDeviceRole(const char* role, const char* commonName) {
+  if (role == nullptr || commonName == nullptr) {
+    emitLine("DBG:role rejected: null argument");
+    return;
+  }
+
+  size_t roleLen = stripWhitespaceInto(role, roleBuf_, sizeof(roleBuf_));
+  size_t commonNameLen = stripWhitespaceInto(commonName, commonNameBuf_,
+                                              sizeof(commonNameBuf_));
+
+  deviceRoleTruncated_ = 0;
+  if (roleLen >= sizeof(roleBuf_)) deviceRoleTruncated_ |= 0x1;
+  if (commonNameLen >= sizeof(commonNameBuf_)) deviceRoleTruncated_ |= 0x2;
+
+  // Budget: fixed text (33) + role (<=23) + commonName (<=23) + one
+  // digit + NUL = 81 against 96 -- 15 bytes margin.
+  char dbgBuf[96];
+  snprintf(dbgBuf, sizeof(dbgBuf), "DBG:role role=%s commonName=%s trunc=%u",
+           roleBuf_, commonNameBuf_,
+           static_cast<unsigned>(deviceRoleTruncated_));
+  emitLine(dbgBuf);
+}
+
+// Same strip-then-accept rule as setDeviceRole() above, extended to
+// `profile` by sprint 037's stakeholder decision even though the source
+// issue's literal text doesn't ask for it: `profile` sits inside the
+// same space-separated, positionally-parsed `id` reply. No late-call
+// guard -- see setProfile()'s own doc comment (protocol.h).
+void Protocol::setProfile(const char* name) {
+  if (name == nullptr) {
+    emitLine("DBG:profile rejected: null argument");
+    return;
+  }
+
+  size_t nameLen = stripWhitespaceInto(name, profileBuf_, sizeof(profileBuf_));
+  profileTruncated_ = nameLen >= sizeof(profileBuf_);
+  profileSetAtRuntime_ = true;
+
+  // Budget: fixed text (29) + "runtime" (7) + name (<=31) + one digit +
+  // NUL = 69 against 84 -- 15 bytes margin.
+  char dbgBuf[84];
+  snprintf(dbgBuf, sizeof(dbgBuf), "DBG:profile src=%s name=%s trunc=%u",
+           profileSetAtRuntime_ ? "runtime" : "baked", profileBuf_,
+           static_cast<unsigned>(profileTruncated_));
+  emitLine(dbgBuf);
 }
 
 void Protocol::emitWifiDebug() {
@@ -587,7 +693,9 @@ Wire::Identity Protocol::buildIdentity() {
   identity.name = microbit_friendly_name();
   identity.serial = serialBuf_;
   identity.drivetrain = kDrivetrain;
-  identity.profile = kProfile;
+  identity.role = roleBuf_;
+  identity.commonName = commonNameBuf_;
+  identity.profile = profileBuf_;
   identity.version = kVersion;
   return identity;
 }

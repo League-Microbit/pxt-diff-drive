@@ -1783,6 +1783,29 @@ void setupWifi(String ssid, String password) {
   protocolSetupWifi(ssidStr.toCharArray(), passwordStr.toCharArray());
 }
 
+// Same forward-declaration convention as protocolEmitLine above.
+void protocolSetDeviceRole(const char* role, const char* commonName);
+
+// Same emptiness trap as setupWifi() above.
+//%
+void setDeviceRole(String role, String commonName) {
+  if (role == nullptr || commonName == nullptr) return;
+  ManagedString roleStr = role->getUTF8Size() == 0 ? ManagedString("") : MSTR(role);
+  ManagedString commonNameStr = commonName->getUTF8Size() == 0 ? ManagedString("") : MSTR(commonName);
+  protocolSetDeviceRole(roleStr.toCharArray(), commonNameStr.toCharArray());
+}
+
+// Same forward-declaration convention as protocolEmitLine above.
+void protocolSetProfile(const char* name);
+
+// Same emptiness trap as setupWifi() above.
+//%
+void setProfile(String name) {
+  if (name == nullptr) return;
+  ManagedString nameStr = name->getUTF8Size() == 0 ? ManagedString("") : MSTR(name);
+  protocolSetProfile(nameStr.toCharArray());
+}
+
 // Read back the text of whichever RUN command is CURRENTLY being
 // dispatched -- valid only during the registered dispatch callback's own
 // call, on this same fiber (registerRunDispatch()/runDispatch(), below).

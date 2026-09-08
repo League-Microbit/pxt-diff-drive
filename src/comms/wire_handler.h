@@ -88,15 +88,20 @@ class Sink {
 };
 
 // Everything HELLO/ID/VER read off. Every pointer is borrowed: the
-// adapter owns the storage (a string literal or a robot-config field)
-// and must keep it alive at least until the identity() call that
-// requested it returns. `name` (read from silicon) is the authoritative
-// board-identity field, NOT `profile` (build provenance) -- see
-// protocol.cpp's own kProfile comment.
+// adapter owns the storage -- a string literal, a robot-config field,
+// or (sprint 037) a Protocol-owned buffer seeded from a literal at
+// construction and mutable at runtime via a setter (`role`/
+// `commonName` via `Protocol::setDeviceRole()`) -- and must keep it
+// alive at least until the identity() call that requested it returns.
+// `name` (read from silicon) is the authoritative board-identity
+// field, NOT `profile` (build provenance) -- see protocol.cpp's own
+// kProfile comment.
 struct Identity {
   const char* name = "";
   const char* serial = "";
   const char* drivetrain = "";
+  const char* role = "";
+  const char* commonName = "";
   const char* profile = "";
   const char* version = "";
 };

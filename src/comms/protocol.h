@@ -48,6 +48,10 @@ namespace diffDrive {
 // ---- Protocol loop -----------------------------------------------------
 class Protocol {
  public:
+  // Seeds roleBuf_/commonNameBuf_ from kRole/kCommonName -- see the
+  // NSDMI comment near those members' declaration below.
+  Protocol();
+
   // Starts the protocol loop on its own CODAL fiber via
   // CodalFiberLauncher. Idempotent, mirroring
   // DifferentialDrive::start()'s own idempotent guard.
@@ -201,6 +205,24 @@ class Protocol {
   // wifiBegun_ is a no-op by design, not convention -- see the .cpp,
   // this path is UNVERIFIED on hardware.
   void setupWifi(const char* ssid, const char* password);
+
+  // Runtime alternative to the constructor-seeded kRole/kCommonName
+  // defaults: copies (stripped, clipped, truncation recorded) into
+  // roleBuf_/commonNameBuf_. No late-call guard needed, unlike
+  // setupWifi(): sendBanner() dereferences identity.role/commonName at
+  // EMIT time, not at some earlier "begin" time a late write could
+  // corrupt, so a call at any point is picked up by the next banner.
+  void setDeviceRole(const char* role, const char* commonName);
+
+  // Runtime alternative to the constructor-seeded kProfile default:
+  // copies (stripped, clipped, truncation recorded) into profileBuf_.
+  // Same reasoning as setDeviceRole() above, not setupWifi(): execId()'s
+  // snprintf dereferences identity.profile at reply time, so no
+  // "begin"-time state exists for a late call to corrupt -- a call
+  // after the first `id` reply has already gone out is picked up by the
+  // next one. This is the one deliberate, tested divergence from
+  // setupWifi()'s late-call refusal.
+  void setProfile(const char* name);
 
  private:
   static void fiberEntry(void* self);
@@ -385,6 +407,21 @@ class Protocol {
   // serialBuf_, a member because WireAdapter borrows a pointer into it.
   static constexpr size_t kSerialBufBytes = 16;  // 10 decimal digits + NUL, with margin
   char serialBuf_[kSerialBufBytes] = {};
+
+  // Program-owned role/common-name (setDeviceRole()), seeded from
+  // kRole/kCommonName by the constructor. Deliberately NOT NSDMI'd --
+  // see the "NSDMI, not a hand-written constructor" comment below.
+  char roleBuf_[24];        // seeded from kRole, overwritten by setDeviceRole()
+  char commonNameBuf_[24];  // seeded from kCommonName, overwritten by setDeviceRole()
+  uint8_t deviceRoleTruncated_ = 0;  // bit0 role, bit1 commonName
+
+  // Program-owned profile (setProfile()), seeded from kProfile by the
+  // constructor. Sized against the `id` reply's own 48-char field
+  // budget (wire_handler.cpp) -- 32 leaves headroom inside it.
+  char profileBuf_[32];               // seeded from kProfile, overwritten by setProfile()
+  bool profileTruncated_ = false;     // set once at the setProfile() store
+  bool profileSetAtRuntime_ = false;  // true once setProfile() has been called at all
+
   Wire::Identity buildIdentity();
 
   // Real clock for WireAdapter::now()/its motion-obligation tracking
@@ -461,13 +498,17 @@ class Protocol {
   // store, read by emitWifiDebug()'s `trunc=` field.
   uint8_t wifiCredsTruncated_ = 0;
 
-  // NSDMI, not a hand-written constructor: every member below depends
-  // only on members declared textually above it, so declaration-order
-  // in-class initializers suffice. wireAdapter_ starts with a
-  // placeholder Wire::Identity(); run() supplies the real one via
-  // setIdentity() once it is safe to read (buildIdentity(), above).
-  // wireHandlerRadio_ shares this SAME wireAdapter_ -- never a second
-  // one, see this file's top comment -- but keeps its own expectedNext_.
+  // NSDMI for every member below except roleBuf_/commonNameBuf_ above
+  // (and, after ticket 002, profileBuf_), which Protocol::Protocol()
+  // seeds explicitly -- a char array can't be NSDMI'd from a runtime
+  // const char*. Every member below still depends only on members
+  // declared textually above it, so declaration-order in-class
+  // initializers suffice for those. wireAdapter_ starts with a
+  // placeholder Wire::Identity(); run()
+  // supplies the real one via setIdentity() once it is safe to read
+  // (buildIdentity(), above). wireHandlerRadio_ shares this SAME
+  // wireAdapter_ -- never a second one, see this file's top comment --
+  // but keeps its own expectedNext_.
   TransportSink<SerialTransport> serialSink_{transport_, &Protocol::writeSerial};
   TransportSink<RadioTransport> radioSink_{radioTransport_,
                                            &Protocol::writeRadio};

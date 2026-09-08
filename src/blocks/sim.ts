@@ -537,6 +537,9 @@ namespace diffDrive {
     let simRadioEnabled = false
     let simWifiSsid = ""
     let simWifiPassword = ""
+    let simDeviceRole = ""
+    let simCommonName = ""
+    let simProfile = ""
 
     // Params typed `number`, not `int32` -- see _goToR()'s comment
     // above: an int32 param on a function with a TS body fails the
@@ -559,6 +562,19 @@ namespace diffDrive {
     export function _setupWifi(ssid: string, password: string): void {
         simWifiSsid = ssid
         simWifiPassword = password
+    }
+
+    // Recorded, not modeled, same as _setupWifi above.
+    //% shim=diffDrive::setDeviceRole
+    export function _setDeviceRole(role: string, commonName: string): void {
+        simDeviceRole = role
+        simCommonName = commonName
+    }
+
+    // Recorded, not modeled, same as _setupWifi above.
+    //% shim=diffDrive::setProfile
+    export function _setProfile(name: string): void {
+        simProfile = name
     }
 
     //% shim=diffDrive::enableWifiLink
