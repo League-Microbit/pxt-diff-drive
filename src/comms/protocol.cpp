@@ -50,17 +50,30 @@ namespace {
 //   - kProfile: which robot's config this hex was BUILT AGAINST
 //     (radio-robot-lib's per-robot config filename stem, e.g. "vevov").
 //     Build PROVENANCE, never board identity.
-//   - kVersion: the BUILD version, `0.YYYYMMDD.n`, from pyproject.toml.
-//     NOT pxt.json's extension semver, which moves only on release and
-//     so answers "which build is on this robot?" identically for every
-//     firmware between two releases; that semver still governs how
-//     MakeCode resolves the extension, a different question.
+//   - kVersion: the PROJECT version, `1.YYYYMMDD.n`, kept identical
+//     across pyproject.toml / package.json / config/dotconfig.yaml /
+//     pxt.json by dotconfig. NOT pxt.json's old extension-only semver
+//     story -- this IS pxt.json's version now, dotconfig's single
+//     source of truth, so VER answers "which revision is this?" for
+//     every build, not just release builds.
 //
-// kProfile and kVersion are injected at DEPLOY time into the SCRATCH
-// COPY only (tools/make_deploy.py's _inject_profile()/_inject_version()),
-// the same substitution _inject_radio_channel() performs on
-// radio_transport.h's kChannel -- so the checked-in "unbaked" literals
-// below can never impersonate a fleet board or a real build.
+// kProfile is injected at DEPLOY time into the SCRATCH COPY only
+// (tools/make_deploy.py's _inject_profile()), the same substitution
+// _inject_radio_channel() performs on radio_transport.h's kChannel --
+// so the checked-in "unbaked" literal below can never impersonate a
+// fleet board. `unbaked` is the honest answer until a robot config is
+// actually loaded, and nothing short of a real deploy loads one.
+//
+// kVersion is different: 2026-09-07 stakeholder direction moved it OFF
+// the deploy-only path. config/hooks/version_bump now bakes it straight
+// into this checked-in literal on every `dotconfig version bump`, so a
+// plain `git clone` and the generated extension (assembled by
+// tools/publish_extension.py and built in MakeCode's cloud compiler,
+// which never runs make_deploy.py) both ship a real version instead of
+// the old placeholder every consumer board used to answer with.
+// tools/make_deploy.py's _inject_version() still re-injects the same
+// value into the deploy scratch copy -- belt and braces, covering a
+// tree whose pyproject.toml was hand-edited between bumps.
 //
 // `profile` and `name` can legitimately DISAGREE on one ID reply:
 // profile says which robot's config the hex targeted, name says which
@@ -69,8 +82,9 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "unbaked";  // injected by make_deploy.py;
-                                              // see the note above
+constexpr const char* kVersion = "1.20260907.5";  // baked by config/hooks/version_bump
+                                              // at `dotconfig version bump`; see the
+                                              // note above
 
 // WiFi credentials, injected into the SCRATCH COPY ONLY by
 // tools/make_deploy.py's _inject_wifi_secrets() from the gitignored
