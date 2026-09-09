@@ -81,7 +81,12 @@ class RunRegistry {
   // this one is about the table's own fixed cells.)
   //
   // Idempotent by name: re-registering an existing name updates its
-  // signature instead of adding a second row. A block program that
+  // signature instead of adding a second row -- unless the new
+  // signature is EMPTY, which leaves the stored one alone. onRun()
+  // always registers with "" and runSignature() may run before it
+  // (measured on gopiv 2026-09-09: `clear`/`diag` declared above their
+  // onRun() lost their `()`), so "no signature given" must mean "no
+  // opinion", never "erase". A block program that
   // binds two handlers to one name -- legal, and run.ts dispatches to
   // both -- must still appear once in the listing, because the listing
   // enumerates addressable NAMES, not handler bindings.
@@ -93,7 +98,9 @@ class RunRegistry {
 
     const int existing = find(name);
     if (existing >= 0) {
-      copyInto(signatures_[existing], signature, SigBytes);
+      if (signature != nullptr && signature[0] != '\0') {
+        copyInto(signatures_[existing], signature, SigBytes);
+      }
       return true;
     }
     if (count_ >= Slots) {

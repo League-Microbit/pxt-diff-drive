@@ -151,10 +151,11 @@ namespace diffDrive {
      * The whole token is kept to 63 bytes (run_registry.h's SigBytes).
      *
      * Call it next to the onRun() it describes; order does not matter
-     * (the registry updates a known name's signature in place, and a
-     * declaration for a name never bound is listed but never
-     * dispatches -- an honest "advertised, not implemented"). Declaring
-     * a name twice keeps the last declaration.
+     * (the registry updates a known name's signature in place, an
+     * onRun() after the declaration leaves it alone, and a declaration
+     * for a name never bound is listed but never dispatches -- an
+     * honest "advertised, not implemented"). Declaring a name twice
+     * keeps the last declaration.
      * @param name the command name onRun() was given, eg: "square"
      * @param signature the parameter declaration, eg: "(side_mm:number=60)"
      */
