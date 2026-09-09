@@ -129,6 +129,41 @@ namespace diffDrive {
     }
 
     /**
+     * Declare the parameters of a name bound with onRun(), so a host
+     * listing the robot's functions (`FUNCS`) can offer typed inputs
+     * instead of a blank argument box. The declaration rides the
+     * `funcs <name> <signature>` reply as its second token (2026-09-09;
+     * before this, that slot was always empty).
+     *
+     * Grammar -- ONE token, no spaces, so it survives the wire's
+     * space-separated field split:
+     *
+     *     ()                                   takes no arguments
+     *     (dist_mm)                            one, untyped
+     *     (dist_mm:number,speed_pct:number=60) typed, second has a default
+     *
+     * Each parameter is `name[:type][=default]`, comma-separated,
+     * positional -- parameter i is what runArg(i) reads. Types are
+     * documentation for the host (every argument still reaches the
+     * handler as a number, see runArg()); a default tells the host
+     * what the handler substitutes when the argument is omitted, so
+     * keep it equal to the `runArgOr()`/fallback value in the handler.
+     * The whole token is kept to 63 bytes (run_registry.h's SigBytes).
+     *
+     * Call it next to the onRun() it describes; order does not matter
+     * (the registry updates a known name's signature in place, and a
+     * declaration for a name never bound is listed but never
+     * dispatches -- an honest "advertised, not implemented"). Declaring
+     * a name twice keeps the last declaration.
+     * @param name the command name onRun() was given, eg: "square"
+     * @param signature the parameter declaration, eg: "(side_mm:number=60)"
+     */
+    //% blockHidden=true
+    export function runSignature(name: string, signature: string): void {
+        _registerRunName(name, signature)
+    }
+
+    /**
      * Run code when ANY run command arrives, name-bound or not. Runs
      * after every matching onRun() handler, so it can log or reject
      * unknown names.

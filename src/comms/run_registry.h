@@ -57,14 +57,24 @@ namespace diffDrive {
 // which is exactly the "short list read as the whole list" failure the
 // protocol's FUNCS section refuses. overflowCount() is what tells a
 // reader the listing is partial.
-template <int Slots = 32, int Bytes = 24>
+// SigBytes (2026-09-09): the signature cell is sized separately from
+// the name cell. A name is a short token; a signature is a declaration
+// the UI parses into parameters -- `(dist:number,speed:number=60)` --
+// and 24 bytes truncated the second parameter of exactly that example.
+// 64 bytes holds three typed, defaulted parameters; the wire's own
+// per-token budget (execFuncs, kMaxLineBytes - 7) is far above it.
+template <int Slots = 32, int Bytes = 24, int SigBytes = 64>
 class RunRegistry {
  public:
   static constexpr int kSlots = Slots;
-  static constexpr int kBytes = Bytes;  // name/signature, content + NUL
+  static constexpr int kBytes = Bytes;        // name, content + NUL
+  static constexpr int kSigBytes = SigBytes;  // signature, content + NUL
 
   // Publish one registered name, with an optional single-token
-  // signature. Both are TRUNCATED to fit rather than refused: a name
+  // signature (run.ts's runSignature() documents the token's grammar:
+  // `(name[:type][=default],...)`, no spaces, so it stays ONE field on
+  // the `funcs <name> <signature>` line). Both are TRUNCATED to fit
+  // rather than refused: a name
   // too long to store is still a name the dispatcher will answer to,
   // and half of it in the listing beats none. (The wire's own
   // sanitize/truncate pass in execFuncs is a separate, later defence --
@@ -83,15 +93,15 @@ class RunRegistry {
 
     const int existing = find(name);
     if (existing >= 0) {
-      copyInto(signatures_[existing], signature);
+      copyInto(signatures_[existing], signature, SigBytes);
       return true;
     }
     if (count_ >= Slots) {
       if (overflow_ < UINT32_MAX) ++overflow_;
       return false;
     }
-    copyInto(names_[count_], name);
-    copyInto(signatures_[count_], signature);
+    copyInto(names_[count_], name, Bytes);
+    copyInto(signatures_[count_], signature, SigBytes);
     ++count_;
     return true;
   }
@@ -132,7 +142,7 @@ class RunRegistry {
   }
 
  private:
-  // Copies at most Bytes-1 characters plus a NUL. A null or empty
+  // Copies at most cap-1 characters plus a NUL. A null or empty
   // source stores the empty string, which is how "no signature" is
   // spelled -- execFuncs omits the field entirely for it.
   //
@@ -142,13 +152,13 @@ class RunRegistry {
   // shims.cpp's registerRunName), and while that call site is fixed, a
   // garbage byte reaching the wire should never have depended on it.
   // Filtering here means an entry can be WRONG but never unprintable.
-  static void copyInto(char* dest, const char* src) {
+  static void copyInto(char* dest, const char* src, int cap) {
     if (src == nullptr) {
       dest[0] = '\0';
       return;
     }
     int i = 0;
-    for (int j = 0; src[j] != '\0' && i < Bytes - 1; ++j) {
+    for (int j = 0; src[j] != '\0' && i < cap - 1; ++j) {
       const unsigned char c = static_cast<unsigned char>(src[j]);
       if (c < 0x20 || c > 0x7E) continue;
       dest[i++] = src[j];
@@ -157,7 +167,7 @@ class RunRegistry {
   }
 
   char names_[Slots][Bytes] = {};
-  char signatures_[Slots][Bytes] = {};
+  char signatures_[Slots][SigBytes] = {};
   int count_ = 0;
   uint32_t overflow_ = 0;
   bool acceptsAny_ = false;
