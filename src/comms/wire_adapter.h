@@ -275,6 +275,24 @@ class WireAdapter : public Wire::Adapter {
   const char* runName(size_t index) const override;
   const char* runSignature(size_t index) const override;
 
+  // ---- the WiFi credential store, disclosed -- delegates to
+  // WifiCredentialStore via wifiCredentialStore()'s singleton seam
+  // (wifi_credential_store.h's own comment on that function), which is
+  // confirmed as the SAME instance
+  // Protocol's own WifiJoinSequencer walks -- not a stopgap this class
+  // will later be re-pointed off of. This class still stores no
+  // credential table of its own -- same "disclose, don't hold" shape
+  // as runCount()/runName()/runSignature() directly above. NEVER calls
+  // WifiCredentialStore::get() -- only hasPassword() and the
+  // ssid-only form of get() (passwordOut == nullptr), so the real
+  // password can never reach this class, let alone the wire. ----
+  size_t wifiCredCount() const override;
+  bool wifiCredSlot(size_t index, char* ssidOut, size_t ssidCap,
+                    bool& hasPasswordOut) const override;
+  Wire::Result wifiCredSet(int slot, const char* ssid,
+                           const char* password) override;
+  Wire::Result wifiCredClear(int slot) override;
+
  private:
   Wire::Identity identity_;
   Wire::TlmMode mode_ = Wire::TlmMode::kOff;

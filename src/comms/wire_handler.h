@@ -343,6 +343,39 @@ class Adapter {
   virtual size_t runCount() const = 0;
   virtual const char* runName(size_t index) const = 0;
   virtual const char* runSignature(size_t index) const = 0;
+
+  // ---- the WiFi credential store, made readable -- the SAME shape
+  // as the RUN registry seam directly above:
+  // adapter-declared count, walked by execWifiCred() the way execFuncs()
+  // walks runCount()/runName()/runSignature(). This class still holds
+  // no credential table of its own; it discloses the adapter's.
+  //
+  // wifiCredCount() is the store's FIXED slot count (NOT the occupied
+  // count) -- index IS the slot number 1:1, so execWifiCred() can print
+  // it straight through with no separate slot-number channel. A slot
+  // that is not occupied answers false (skip it -- the enumeration
+  // lists occupied slots only, same as execFuncs() skipping an
+  // unnamed RunRegistry entry); an occupied slot answers true with
+  // ssidOut filled (borrowed capacity ssidCap, always NUL-terminated)
+  // and hasPasswordOut set. NEVER the password itself -- this mirrors
+  // WifiCredentialStore's own get()/hasPassword() split
+  // (wifi_credential_store.h's header comment) precisely so the wire
+  // layer cannot accidentally wire up the wrong one; hasPassword() is
+  // the only accessor this seam may call.
+  //
+  // wifiCredSet()/wifiCredClear() mutate one slot and report the
+  // outcome as an ordinary Result -- kRange for an out-of-range slot
+  // or a string that does not fit (WifiCredentialStore::set() rejects
+  // rather than truncates; see that file's header comment), kOk
+  // otherwise. Both are on the SEQUENCED half of this verb -- see
+  // kCommandTable's own WIFICRED row comment (wire_handler.cpp) for
+  // why. ----
+  virtual size_t wifiCredCount() const = 0;
+  virtual bool wifiCredSlot(size_t index, char* ssidOut, size_t ssidCap,
+                            bool& hasPasswordOut) const = 0;
+  virtual Result wifiCredSet(int slot, const char* ssid,
+                            const char* password) = 0;
+  virtual Result wifiCredClear(int slot) = 0;
 };
 
 class WireHandler {
@@ -476,6 +509,17 @@ class WireHandler {
   // whitespace (protocol.md S2/S3.2). Returns the TRUE total token
   // count (verb included), which may exceed `maxTokens` -- only the
   // first `maxTokens` pointers are stored.
+  //
+  // A token whose first byte is '"' is a QUOTED token (WIFICRED SET's
+  // <ssid>/<password>, the only fields that may contain spaces): reads
+  // to the next '"' followed by a separator/EOL, decoding `\"` to a
+  // literal '"' (the only escape). Only a LEADING '"' triggers this, so
+  // every other verb's fields -- always keywords or integers -- are
+  // unaffected. An unterminated quote swallows the rest of the line
+  // (id included), which just starves the verb of a data field; the id
+  // itself is unaffected since it is resolved from the raw line before
+  // this runs (findLastFieldToken()), and the arity check downstream
+  // (e.g. decodeWifiCred()) rejects the short field count normally.
   static size_t tokenizeLine(char* line, char** tokens, size_t maxTokens);
 
   // Resolves the mandatory trailing id against expectedNext_ (protocol.md
@@ -656,6 +700,21 @@ class WireHandler {
   // ack is the terminator. See execFuncs().
   void execFuncs(char** fields, size_t fieldCount, uint32_t id,
                 uint8_t& errCode);
+
+  // WIFICRED -- bare enumeration OR a `SET`/
+  // `CLEAR` sub-verb in fields[0], NOT three separate kCommandTable
+  // rows: the bare form's own arity (zero data fields) already needs
+  // its own case, so folding SET/CLEAR's field-count checks into the
+  // same decode function costs nothing extra and keeps one verb name
+  // on the wire for the whole feature, matching how GET's bare vs.
+  // named forms already share one row. decodeWifiCred() only checks
+  // SHAPE (which sub-verb, how many fields, does the slot parse as an
+  // integer) -- see execWifiCred()'s own comment for why the slot
+  // RANGE check and the ssid/password LENGTH check both live in exec,
+  // not here.
+  bool decodeWifiCred(char** fields, size_t fieldCount);
+  void execWifiCred(char** fields, size_t fieldCount, uint32_t id,
+                    uint8_t& errCode);
 
   bool decodeRun(char** fields, size_t fieldCount);
   void execRun(char** fields, size_t fieldCount, uint32_t id,

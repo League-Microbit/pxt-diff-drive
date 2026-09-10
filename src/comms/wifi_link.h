@@ -106,8 +106,29 @@ class WifiLink {
     uint16_t port;         // our UDP protocol port (7654) -- and the TCP server's
     uint16_t hostPort;     // the host's fixed port (7655), CIPSTART's remote placeholder
     bool tcpServer;        // also accept TCP clients on `port` (AT+CIPSERVER)
+
+    // When true, serviceJoin()'s step 0 sends AT+CWQAP (disassociate,
+    // tolerant of ERROR -- "nothing was associated" is expected) and
+    // skips the AT+CWJAP? poll entirely, going straight to the
+    // existing explicit AT+CWJAP= send below. Default false: every
+    // existing caller (setupWifi()/baked single-credential path
+    // included) keeps the poll-first LANDMINE-avoidance behavior
+    // byte-for-byte -- see serviceJoin()'s own comment, wifi-link note
+    // section 5.3.
+    //
+    // WifiJoinSequencer (src/comms/wifi_join_sequencer.h) sets this
+    // true on every Config it builds. Why: MEASURED gopiv 2026-09-09,
+    // captures/wifi-join-codes-20260909/notes.md (badpw-boot.log) --
+    // the Ai-WB2 module auto-rejoins its own remembered AP after the
+    // AT+RST that begins every kConfigure pass, which the AT+CWJAP?
+    // poll (matched on SSID name alone) cannot distinguish from the
+    // module actually using the credential this Config carries. A
+    // list-walker that cannot force the credential under test is
+    // walking a list the module may simply ignore.
+    bool forceExplicitJoin;
+
     Config() : ssid(""), password(""), hostname("robot"), port(7654), hostPort(7655),
-               tcpServer(true) {}
+               tcpServer(true), forceExplicitJoin(false) {}
   };
 
   // Wire-line ceiling, matching Wire::WireHandler::kMaxLineBytes /
@@ -195,11 +216,37 @@ class WifiLink {
   uint16_t peerPort() const { return peerPort_; }
   const char* ownIp() const { return ownIp_; }
   uint32_t restartCount() const { return restartCount_; }
+
+  // The module's own `+CWJAP:<code>` from the most recent join attempt
+  // (`AT+CWJAP="ssid","pw"`), retained across the kJoin -> kBackoff
+  // transition. 0 = no code was captured for the current attempt (a
+  // plain timeout with no `+CWJAP:` reply at all counts as this, not
+  // a stale value from a previous attempt -- reset every time a new
+  // AT+CWJAP command is sent, see serviceJoin()).
+  //
+  // This is the RAW vendor number, deliberately UNMAPPED: the
+  // ESP-AT/Ai-WB2 documented meanings (1=timeout, 2=wrong password,
+  // 3=AP not found, 4=connect failed) are read from vendor
+  // documentation, not measured, and are UNVERIFIED on the
+  // Ai-WB2-12F. Do not add a word mapping here; that is explicitly out
+  // of scope until a real wrong-password join on real hardware
+  // confirms the codes.
+  int lastJoinError() const { return lastJoinError_; }
+
   uint32_t dropCount() const { return dropCount_; }
   uint32_t sentCount() const { return sentCount_; }
   uint32_t receivedCount() const { return receivedCount_; }
   uint32_t mdnsAnnounceCount() const { return mdnsAnnounceCount_; }
   bool mdnsSocketOpen() const { return mdnsSocketOpen_; }
+
+  // The most recent AT command sent, for the DBG:wifi trace and bench
+  // tools. Contract: this string NEVER contains a WiFi passphrase, in
+  // any state -- startCommand()'s optional trace-override parameter is
+  // how a caller composing a secret-carrying command (only
+  // serviceJoin()'s explicit AT+CWJAP= step, today) substitutes a
+  // redacted string here while the real command still reaches the UART
+  // unchanged. Protocol::emitWifiDebug() reports this verbatim on the
+  // strength of that contract -- see its own comment.
   const char* lastCommand() const { return lastCommand_; }
   const char* lastReply() const { return lastReply_; }
 
@@ -284,8 +331,15 @@ class WifiLink {
 
   // AT command/await mechanics (one in flight at a time)
   enum Await : uint8_t { kPending, kMatched, kRejected, kTimedOut };
-  bool startCommand(const char* command, const char* expect,
-                    uint32_t timeout);  // [ms]
+  // `traceOverride`, when non-null, is recorded into lastCommand_ IN
+  // PLACE OF `command` -- the real `command` still reaches the UART
+  // byte-for-byte either way. Every caller but one passes nullptr and
+  // is byte-for-byte unchanged (lastCommand_ == command, as before).
+  // The one exception is serviceJoin()'s AT+CWJAP= step, which is the
+  // only startCommand() call site that ever composes a passphrase into
+  // `command` -- see lastCommand()'s doc comment above.
+  bool startCommand(const char* command, const char* expect, uint32_t timeout,
+                    const char* traceOverride = nullptr);  // [ms]
   void startAwait(const char* expect, uint32_t timeout);  // [ms]
   Await pollAwait();
 
@@ -324,6 +378,11 @@ class WifiLink {
   uint32_t restartCount_;
   bool stateChanged_;
 
+  // See lastJoinError() above: 0 = no code captured this attempt.
+  // Reset at the start of each AT+CWJAP=... send in serviceJoin(),
+  // not just once at construction.
+  int lastJoinError_;
+
   bool awaiting_;
   uint32_t deadline_;
   Matcher expect_;
@@ -347,6 +406,17 @@ class WifiLink {
   bool ownIpCapturing_;
   char ownIp_[16];
   uint8_t ownIpLen_;
+
+  // `+CWJAP:<code>` capture (mirrors ownIpTag_ above, but the terminal
+  // is "first non-digit" rather than a literal '"'): watches for the
+  // token during byte feed and, on match, accumulates up to 2 ASCII
+  // digits into lastJoinError_. Runs unconditionally -- the token also
+  // appears (quoted, not digits) in the AT+CWJAP? poll reply, which
+  // never enters joinErrorCapturing_ because '"' is not a digit.
+  Matcher joinErrorTag_;
+  bool joinErrorCapturing_;
+  int joinErrorValue_;
+  uint8_t joinErrorDigits_;
 
   // peer (the host), learned from +IPD headers on kProtocolLink
   char peerIp_[16];

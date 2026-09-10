@@ -284,6 +284,14 @@ const WireHandler::VerbEntry WireHandler::kCommandTable[] = {
     {"ESTOP", &WireHandler::decodeAlwaysTrue, &WireHandler::execNoop},
     {"FUNCS", &WireHandler::decodeNoFields, &WireHandler::execFuncs},
     {"RUN", &WireHandler::decodeRun, &WireHandler::execRun},
+    // Sequenced (see execWifiCred()'s own comment): the bare
+    // enumeration reads what the sequenced SET/CLEAR
+    // half of this SAME verb mutates, the identical reasoning
+    // config_fields.h's own comment gives for why GET is sequenced
+    // despite being read-only -- given `WIFICRED SET home pw #7` /
+    // `WIFICRED #8`, if #7 is lost an unsequenced bare enumeration would
+    // hand back the pre-SET list with nothing marking it as stale.
+    {"WIFICRED", &WireHandler::decodeWifiCred, &WireHandler::execWifiCred},
 };
 
 WireHandler::WireHandler(Adapter& adapter, Sink& sink)
@@ -296,7 +304,7 @@ WireHandler::WireHandler(Adapter& adapter, Sink& sink)
   // unevaluated sizeof operand, and only member/friend context is
   // exempt. Purely compile-time -- this constructor need not run for a
   // mismatched count to fail the build.
-  static_assert(sizeof(kCommandTable) / sizeof(kCommandTable[0]) == 19,
+  static_assert(sizeof(kCommandTable) / sizeof(kCommandTable[0]) == 20,
                 "kCommandTable verb count");
 }
 
@@ -392,6 +400,35 @@ size_t WireHandler::tokenizeLine(char* line, char** tokens,
   while (true) {
     while (*p == ' ') ++p;  // skip a run of separator spaces (sp ::= ' '+)
     if (*p == '\0') break;  // end of line -- no more tokens
+
+    if (*p == '"') {
+      // Quoted token (see this function's header comment). `out` only
+      // ever trails `scan` (never leads it), so the in-place decode
+      // never writes past what it has already read.
+      ++p;  // step past the opening quote
+      char* tokenStart = p;
+      char* out = p;
+      char* scan = p;
+      while (*scan != '\0') {
+        if (scan[0] == '\\' && scan[1] == '"') {
+          *out++ = '"';
+          scan += 2;
+          continue;
+        }
+        if (scan[0] == '"' && (scan[1] == '\0' || scan[1] == ' ')) {
+          ++scan;  // step past the closing quote
+          break;
+        }
+        *out++ = *scan++;
+      }
+      *out = '\0';
+      if (count < maxTokens) tokens[count] = tokenStart;
+      ++count;
+      p = scan;
+      if (*p == '\0') break;  // ran off the end -- unterminated, see above
+      continue;               // `p` is the separator right after the quote
+    }
+
     if (count < maxTokens) tokens[count] = p;
     ++count;
     while (*p != '\0' && *p != ' ') ++p;  // scan to next separator or end
@@ -1018,6 +1055,136 @@ void WireHandler::execFuncs(char** fields, size_t fieldCount, uint32_t id,
     buf[pos] = '\0';
     writeLine(buf);
   }
+}
+
+// WIFICRED -- enumerate/mutate the adapter's WiFi credential store
+// (sprint architecture Design Rationale #4).
+// Bare enumeration is execFuncs()'s shape exactly: walk an
+// adapter-declared count and write one sanitized line per occupied
+// slot; this handler holds no credential table of its own, it
+// DISCLOSES the adapter's (see wire_handler.h's Adapter comment on
+// this seam, right below runSignature()). `SET`/`CLEAR` share this
+// same verb name as a sub-verb in fields[0] rather than becoming their
+// own kCommandTable rows -- see decodeWifiCred()'s own comment.
+//
+// HARD CONSTRAINT (this ticket's own acceptance criteria, and the
+// reason the passphrase-redaction fix landed as a prerequisite before
+// this verb did): a passphrase must never reach the
+// wire from this function, under ANY input, on ANY path -- success,
+// rejection, or a malformed SET. Only wifiCredSlot()'s hasPasswordOut
+// FLAG is ever read here; the Adapter interface does not even expose a
+// real-password accessor for the wire to reach by accident (see that
+// interface's own comment). A malformed/oversized SET's own rejection
+// path never echoes fields[2]/fields[3] back either -- see the SET
+// branch below.
+
+bool WireHandler::decodeWifiCred(char** fields, size_t fieldCount) {
+  if (fieldCount == 0) return true;  // bare enumeration
+  if (std::strcmp(fields[0], "SET") == 0) {
+    if (fieldCount != 4) return false;  // SET <slot> <ssid> <password>
+    int32_t discard = 0;
+    return parseInt32(fields[1], discard);
+  }
+  if (std::strcmp(fields[0], "CLEAR") == 0) {
+    if (fieldCount != 2) return false;  // CLEAR <slot>
+    int32_t discard = 0;
+    return parseInt32(fields[1], discard);
+  }
+  // Unrecognized sub-verb: same bucket as an unrecognized top-level
+  // verb -- a decode failure (nack), not a merits rejection. The slot
+  // RANGE check and the ssid/password LENGTH check both live in
+  // execWifiCred(), not here -- same split motion verbs use for
+  // timeout/cruise: the line's SHAPE is fine, only its CONTENT may be
+  // out of range, and that is a MERITS rejection (ack + err), not a
+  // decode failure.
+  return false;
+}
+
+void WireHandler::execWifiCred(char** fields, size_t fieldCount, uint32_t id,
+                               uint8_t& errCode) {
+  (void)id;
+  errCode = 0;
+
+  if (fieldCount == 0) {
+    // One adapter-supplied string (the ssid) plus this function's own
+    // two fixed tokens (slot, haspw) -- same per-line accounting as
+    // execFuncs(). 64 bytes comfortably exceeds
+    // WifiCredentialStore::kSsidBytes (33): this file deliberately does
+    // not depend on that constant, the same way it does not depend on
+    // RunRegistry's own template parameters.
+    constexpr size_t kSsidCap = 64;
+    char ssid[kSsidCap];
+    char sanitizedSsid[kSsidCap];
+    char buf[kMaxLineBytes + 1];
+
+    const size_t total = adapter_.wifiCredCount();
+    for (size_t i = 0; i < total; ++i) {
+      bool hasPassword = false;
+      if (!adapter_.wifiCredSlot(i, ssid, sizeof(ssid), hasPassword)) {
+        continue;  // unoccupied slot -- not addressable, not listed
+      }
+      // Adapter text is sanitized before the sink, same as execFuncs()
+      // -- flash content is not trusted to be free of '\n'/'\r' any
+      // more than a RunRegistry entry is.
+      sanitizeLineText(ssid, sanitizedSsid, sizeof(sanitizedSsid));
+      // %zu is NOT supported by this target's printf -- MEASURED gopiv
+      // 2026-09-09, captures/wifi-credential-store-20260909/: the
+      // embedded newlib-nano printf emits the two characters "zu"
+      // literally and shifts every remaining argument, so
+      // `WIFICRED #3` enumerated `wificred zu 0` instead of
+      // `wificred 0 TestNet038 1`. Host tests pass regardless because
+      // the host's own printf DOES support %zu, which is exactly why
+      // this needs a source-pin guard
+      // (test_no_percent_z_format_specifier_source_pin.py) and not just
+      // this one fix. Explicit cast to unsigned + %u, matching
+      // replyErr()'s own `static_cast<unsigned>(code)` precedent above.
+      //
+      // ssid is the LAST field, deliberately -- an 802.11 SSID may
+      // contain spaces (MEASURED gopiv 2026-09-10,
+      // captures/wifi-credential-store-20260909/: the real fleet SSID
+      // "Busboom Mesh" would enumerate as `wificred 0 Busboom Mesh 1`
+      // under the old mid-line `<slot> <ssid> <haspw>` shape, and a
+      // consumer splitting on whitespace could not tell where the
+      // SSID ended). Putting haspw BEFORE ssid means a consumer that
+      // does not know the SSID in advance can split the line on
+      // whitespace with a maxsplit of 3 (`"wificred"`, slot, haspw,
+      // then everything left over is the SSID) and get it right no
+      // matter what the SSID contains -- no quoting/escaping needed.
+      // tools/robotlink.py's wificred_list() and
+      // docs/robot-connections.md's WIFICRED section use this same
+      // convention; Protocol::emitWifiDebug() (protocol.cpp) puts its
+      // own ssid= field last for the identical reason.
+      snprintf(buf, sizeof(buf), "wificred %u %d %s\n",
+               static_cast<unsigned>(i), hasPassword ? 1 : 0,
+               sanitizedSsid);
+      writeLine(buf);
+    }
+    return;
+  }
+
+  if (std::strcmp(fields[0], "SET") == 0) {
+    int32_t slot = 0;
+    parseInt32(fields[1], slot);  // decodeWifiCred() already proved this
+                                   // succeeds
+    // fields[2]/fields[3] (ssid/password) are handed to the Adapter
+    // RAW -- never copied into a buffer this function logs, sanitizes,
+    // or echoes. The only thing done with `password` here is pass the
+    // pointer straight through; it is never read, formatted, or
+    // written to any local buffer, on ANY path, including this one's
+    // own rejection below (Result::kRange -> `err <code> #<id>`, a
+    // bare numeric code, never field content).
+    Result result = adapter_.wifiCredSet(static_cast<int>(slot), fields[2],
+                                         fields[3]);
+    errCode = resultCode(result);
+    return;
+  }
+
+  // CLEAR <slot> -- decodeWifiCred() already proved fields[0] ==
+  // "CLEAR" and fields[1] parses.
+  int32_t slot = 0;
+  parseInt32(fields[1], slot);
+  Result result = adapter_.wifiCredClear(static_cast<int>(slot));
+  errCode = resultCode(result);
 }
 
 // ---- configuration: pure delegation, no storage here (protocol.md S7) ----

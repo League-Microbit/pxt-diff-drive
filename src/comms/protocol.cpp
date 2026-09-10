@@ -3,6 +3,9 @@
 
 #include "../core/fiber_identity.h"
 #include "../platform/vfp_guard.h"
+#include "wifi_credential_store.h"  // wifiCredentialStore(): the shared
+                                    // flash-backed store used by
+                                    // serviceWifi()'s lazy-begin
 
 #include <cctype>  // isspace(), for setDeviceRole()'s whitespace strip
 #include <cstdio>  // plain snprintf, not std::snprintf: newlib-nano's
@@ -83,7 +86,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20260909.2";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20260910.2";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 
@@ -397,10 +400,75 @@ void Protocol::emitWifiDebug() {
   // One line, cleartext `DBG:` prefix (the same convention the TS
   // layer's debug output uses), through emitLine() so it reaches
   // serial, radio AND -- once up -- the WiFi host itself.
+  //
+  // join=<code> is the module's RAW `+CWJAP:<code>` from the most
+  // recent join attempt (WifiLink::lastJoinError()), or "-" when no
+  // code was captured this attempt (a plain timeout). No word mapping
+  // -- the vendor code semantics are UNVERIFIED on this hardware, see
+  // lastJoinError()'s own comment in wifi_link.h. This is a bare
+  // integer, never the credential itself -- the passphrase must never
+  // leave the board.
+  //
+  // cmd=%s below is `wifiLink_.lastCommand()`, reported verbatim and
+  // safe to: `lastCommand()`'s contract (wifi_link.h) guarantees it
+  // NEVER contains a passphrase, in any state. The redaction happens
+  // at the source (WifiLink::startCommand()'s trace-override
+  // parameter, used by the one call site -- the AT+CWJAP= join step --
+  // that ever composes one), so this function needs no change to stay
+  // safe.
+  //
+  // credsrc=<n> reports which source serviceWifi()'s lazy-begin used,
+  // per that function's own precedence comment: 0 = baked
+  // (kWifiSsid/kWifiPassword), 1 = set by setupWifi() (wifiCredsExplicit_),
+  // 2 = a stored WifiCredentialStore flash slot (wifiCredsFromFlash_).
+  // Like join=, this is a bare integer -- never the credential itself.
+  //
+  // ssid=<...>/haspw=<0|1> -- R1: is a module/link enabled (with
+  // state=), what SSID is current/attempted, does it have a password
+  // -- never the password. Same precedence credsrc= above reports, so
+  // the two can't disagree: 2=wifiJoinSequencer_'s slot,
+  // 1=wifiSsid_/wifiPassword_, 0=kWifiSsid/kWifiPassword. No credential
+  // at the active source -> `ssid=- haspw=0`, never a bare empty field.
+  //
+  // ssid= is the LAST field on the line, deliberately -- an 802.11
+  // SSID may contain spaces (MEASURED gopiv 2026-09-10,
+  // captures/wifi-credential-store-20260909/: the real fleet SSID
+  // "Busboom Mesh" made a mid-line `ssid=%s haspw=%u` unparseable --
+  // `ssid=Busboom` plus a stray `Mesh` token). Putting haspw= BEFORE
+  // ssid= and ssid= after it means a consumer that does not know the
+  // SSID in advance can take everything from `ssid=` to end-of-line as
+  // the SSID, unambiguously, with no quoting/escaping needed and no
+  // byte cost -- see docs/robot-connections.md's DBG:wifi section.
+  // execWifiCred()'s `wificred` enumeration line (wire_handler.cpp)
+  // uses the identical convention for the same reason.
+  const char* ssidField = "-";
+  bool haspwField = false;
+  if (wifiCredsFromFlash_) {
+    if (wifiJoinSequencer_.currentSsid()[0] != '\0') {
+      ssidField = wifiJoinSequencer_.currentSsid();
+      haspwField = wifiJoinSequencer_.currentHasPassword();
+    }
+  } else if (wifiCredsExplicit_) {
+    if (wifiSsid_[0] != '\0') {
+      ssidField = wifiSsid_;
+      haspwField = (wifiPassword_[0] != '\0');
+    }
+  } else if (kWifiSsid[0] != '\0') {
+    ssidField = kWifiSsid;
+    haspwField = (kWifiPassword[0] != '\0');
+  }
+
+  char joinBuf[4];  // "-" or up to 2 ASCII digits (see lastJoinError())
+  if (wifiLink_.lastJoinError() != 0) {
+    snprintf(joinBuf, sizeof(joinBuf), "%d", wifiLink_.lastJoinError());
+  } else {
+    joinBuf[0] = '-';
+    joinBuf[1] = '\0';
+  }
   snprintf(wifiDbgBuf_, sizeof(wifiDbgBuf_),
            "DBG:wifi state=%d ip=%s peer=%s:%u tcp=%u/%d to=%d restarts=%lu "
            "sent=%lu rx=%lu drop=%lu mdns=%lu/%d cmd=%s reply=%s "
-           "credsrc=%d trunc=%u",
+           "credsrc=%d trunc=%u join=%s haspw=%u ssid=%s",
            static_cast<int>(wifiLink_.state()),
            wifiLink_.ownIp()[0] ? wifiLink_.ownIp() : "-",
            wifiLink_.peerIp()[0] ? wifiLink_.peerIp() : "-",
@@ -414,16 +482,48 @@ void Protocol::emitWifiDebug() {
            static_cast<unsigned long>(wifiLink_.mdnsAnnounceCount()),
            wifiLink_.mdnsSocketOpen() ? 1 : 0,
            wifiLink_.lastCommand(), wifiLink_.lastReply(),
-           wifiCredsExplicit_ ? 1 : 0,
-           static_cast<unsigned>(wifiCredsTruncated_));
+           wifiCredsFromFlash_ ? 2 : (wifiCredsExplicit_ ? 1 : 0),
+           static_cast<unsigned>(wifiCredsTruncated_),
+           joinBuf, haspwField ? 1u : 0u, ssidField);
   emitLine(wifiDbgBuf_);
 }
 
 void Protocol::serviceWifi() {
+  const bool firstPoll = !wifiBegun_;
   if (!wifiBegun_) {
     wifiBegun_ = true;
     WifiLink::Config config;
-    if (wifiCredsExplicit_) {
+    // The mDNS host label is the board's own silicon-derived name --
+    // the same authoritative identity ID's `name` field reports -- so
+    // `tovez.local` / "tovez robot link" can never be a stale bake.
+    // Shared by every precedence branch below, so it is set once,
+    // ahead of the branch that picks ssid/password.
+    config.hostname = microbit_friendly_name();
+    config.port = kWifiPort;
+    config.hostPort = kWifiHostPort;
+
+    // Precedence, most to least preferred: a stored flash credential
+    // beats a setupWifi()-supplied credential, which beats the baked
+    // kWifiSsid/kWifiPassword fallback (sprint architecture Design
+    // Rationale #3). An EMPTY store leaves wifiCredsFromFlash_ false,
+    // which falls through to the pre-existing wifiCredsExplicit_/baked
+    // branch below UNCHANGED -- that case stays byte-for-byte
+    // identical to before this credential source existed, AND
+    // wifiJoinSequencer_.begin() is never called for it, which is what
+    // makes WifiJoinSequencer::service() (below, called
+    // unconditionally every poll) a pure pass-through to
+    // wifiLink_.service() in that case -- see that class's own header
+    // comment on why that equivalence is the point.
+    wifiCredsFromFlash_ = wifiCredentialStore().anyOccupied();
+    if (wifiCredsFromFlash_) {
+      // WifiJoinSequencer (sprint 038 ticket 005) owns the walk
+      // entirely from here -- which slot, when to advance,
+      // forceExplicitJoin -- this class supplies only the
+      // non-credential parts of Config above; ssid/password on this
+      // local `config` are left at Config's own defaults ("") and
+      // ignored, since begin() below never reaches wifiLink_ directly.
+      wifiJoinSequencer_.begin(config);
+    } else if (wifiCredsExplicit_) {
       // A program called setupWifi() before the link began -- use its
       // stored credentials (possibly an explicit "", which
       // WifiLink::begin() treats as a deliberate disable, same
@@ -431,22 +531,34 @@ void Protocol::serviceWifi() {
       // comment).
       config.ssid = wifiSsid_;
       config.password = wifiPassword_;
+      wifiLink_.begin(config);
     } else {
       config.ssid = kWifiSsid;
       config.password = kWifiPassword;
+      wifiLink_.begin(config);
     }
-    // The mDNS host label is the board's own silicon-derived name --
-    // the same authoritative identity ID's `name` field reports -- so
-    // `tovez.local` / "tovez robot link" can never be a stale bake.
-    config.hostname = microbit_friendly_name();
-    config.port = kWifiPort;
-    config.hostPort = kWifiHostPort;
-    wifiLink_.begin(config);
+  }
+
+  // WifiJoinSequencer::service() is a pure pass-through to
+  // wifiLink_.service() whenever wifiJoinSequencer_.begin() was never
+  // called above (the wifiCredsExplicit_/baked branches) -- see that
+  // class's own header comment. So this single call replaces a direct
+  // wifiLink_.service() call for EVERY precedence branch, not just the
+  // flash one.
+  wifiJoinSequencer_.service();
+
+  if (firstPoll) {
+    // Emitted AFTER the first service() above, not inside the
+    // lazy-begin block: for the flash-store branch, wifiLink_ is not
+    // actually begin()'d until WifiJoinSequencer's own first
+    // service() call (it owns picking the slot) -- emitting here
+    // instead of right after wifiJoinSequencer_.begin() means this
+    // first DBG:wifi line reports the link's REAL post-begin() state
+    // (e.g. state=1/CONFIGURE) for every precedence branch alike,
+    // never a transient state=0/DISABLED reading for the flash case.
     lastWifiDbg_ = clockNow();
     emitWifiDebug();
   }
-
-  wifiLink_.service();
 
   const uint32_t now = clockNow();  // [ms]
   if (wifiLink_.pollStateChanged() ||

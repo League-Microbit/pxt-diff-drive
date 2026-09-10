@@ -4,6 +4,7 @@
 #include "config_fields.h"
 #include "run_bridge.h"
 #include "run_registry.h"
+#include "wifi_credential_store.h"
 
 #include <cmath>
 
@@ -999,6 +1000,73 @@ const char* WireAdapter::runName(size_t index) const {
 
 const char* WireAdapter::runSignature(size_t index) const {
   return runRegistry().signature(static_cast<int>(index));
+}
+
+// ---- the WiFi credential store, disclosed -----------------------------
+
+size_t WireAdapter::wifiCredCount() const {
+  // The store's FIXED slot count, not how many are occupied --
+  // wifiCredSlot()'s own bool return is what tells execWifiCred()
+  // which of these to skip. See wire_handler.h's Adapter comment on
+  // this seam for why index == slot number depends on that.
+  return static_cast<size_t>(WifiCredentialStore::kSlots);
+}
+
+bool WireAdapter::wifiCredSlot(size_t index, char* ssidOut, size_t ssidCap,
+                               bool& hasPasswordOut) const {
+  const int slot = static_cast<int>(index);
+  WifiCredentialStore& store = wifiCredentialStore();
+  if (!store.occupied(slot)) return false;
+  // passwordOut == nullptr: the real password is never copied out of
+  // the store by this call, let alone handed to the wire -- get()'s
+  // own contract (wifi_credential_store.h) is that a nullptr output
+  // skips that copy entirely. hasPassword() is the ONLY thing here
+  // that ever learns whether a password exists.
+  store.get(slot, ssidOut, nullptr);
+  hasPasswordOut = store.hasPassword(slot);
+  return true;
+}
+
+Wire::Result WireAdapter::wifiCredSet(int slot, const char* ssid,
+                                      const char* password) {
+  // Slot range and string length are both CONTENT checks, not SHAPE
+  // checks (decodeWifiCred() already proved the line parses) -- kRange
+  // covers both, same as clampMotionTimeout()'s own kRange precedent:
+  // "the line's shape is fine, the one value in it is outside its
+  // declared bound." WifiCredentialStore::set() itself already refuses
+  // (returns false, no write) an out-of-range slot or an oversized
+  // ssid/password -- see that file's header comment on REJECT-not-
+  // truncate -- so a single failure->kRange mapping covers every
+  // rejection reason this call can have without this function
+  // duplicating the store's own bounds.
+  //
+  // Takes effect WITHOUT a reboot once WifiJoinSequencer is walking the
+  // store (sprint 038 ticket 005): its service() re-reads the store
+  // fresh (WifiCredentialStore::begin()) every time its walk wraps
+  // back to slot 0, and set()/clear() also update this SAME store
+  // instance's in-RAM cache immediately -- so a write reaches a link
+  // that's already mid-walk on its NEXT lap, whichever comes first. If
+  // the store was EMPTY at Protocol::serviceWifi()'s lazy-begin (no
+  // walk was ever armed -- see wifi_join_sequencer.h's own header
+  // comment on the empty-store case), this write still only takes
+  // effect at the next boot: the already-running WifiLink was
+  // begin()'d directly on the setupWifi()/baked credential and nothing
+  // re-reads this store for it. This function's return is deliberately
+  // just kOk/kRange
+  // (-> a bare `ack`/`err` reply, wire_handler.cpp's execWifiCred()),
+  // never a claim that the join was reconfigured -- do not add
+  // reply text implying otherwise here.
+  if (!wifiCredentialStore().set(slot, ssid, password)) {
+    return Wire::Result::kRange;
+  }
+  return Wire::Result::kOk;
+}
+
+Wire::Result WireAdapter::wifiCredClear(int slot) {
+  if (!wifiCredentialStore().clear(slot)) {
+    return Wire::Result::kRange;
+  }
+  return Wire::Result::kOk;
 }
 
 }  // namespace diffDrive

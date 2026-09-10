@@ -36,6 +36,7 @@
 #include "radio_transport.h"  // radio transport -- now a full v6 sink too
 #include "serial_transport.h"
 #include "wifi_link.h"        // WiFi transport (host-portable AT state machine)
+#include "wifi_join_sequencer.h"  // walks WifiCredentialStore on boot (038-005)
 #include "wifi_uart.h"        // ...over NRF_UARTE1 (CODAL-free header)
 #include "wire_adapter.h"
 #include "run_bridge.h"
@@ -498,6 +499,15 @@ class Protocol {
   // store, read by emitWifiDebug()'s `trunc=` field.
   uint8_t wifiCredsTruncated_ = 0;
 
+  // True iff serviceWifi()'s lazy-begin found the flash-backed
+  // WifiCredentialStore non-empty and handed the join to
+  // WifiJoinSequencer -- the credsrc=2 case. An EMPTY store leaves
+  // this false forever, so the explicit/baked-credential path below
+  // runs unchanged (the wifiJoinSequencer_ member, below wifiLink_,
+  // owns its own ssid/password cells now -- this class no longer
+  // needs to, since it no longer copies a slot's credentials itself).
+  bool wifiCredsFromFlash_ = false;
+
   // NSDMI for every member below except roleBuf_/commonNameBuf_ above
   // (and, after ticket 002, profileBuf_), which Protocol::Protocol()
   // seeds explicitly -- a char array can't be NSDMI'd from a runtime
@@ -522,13 +532,25 @@ class Protocol {
   // each transport keeps its own expectedNext_, so a sequence gap on
   // WiFi can never nack serial's or radio's next command.
   WifiLink wifiLink_{wifiUart_, &Protocol::wireNow};
+  // Walks WifiCredentialStore's occupied slots on boot (sprint 038
+  // ticket 005); serviceWifi() calls THIS class's service() every poll
+  // now, not wifiLink_.service() directly. Shares the SAME store
+  // instance WireAdapter's WIFICRED verb reaches through
+  // wifiCredentialStore() (wifi_credential_store.h) -- one singleton,
+  // two callers, exactly that header's own "STOPGAP ... until then"
+  // comment anticipated.
+  WifiJoinSequencer wifiJoinSequencer_{wifiLink_, wifiCredentialStore()};
   TransportSink<WifiLink> wifiSink_{wifiLink_, &Protocol::writeWifi};
   Wire::WireHandler wireHandlerWifi_{wireAdapter_, wifiSink_};
   uint8_t wifiRxBuf_[WifiLink::kMaxLineBytes + 1];
   // Sized for the worst-case `DBG:wifi ...` line: fixed text, two
   // 15-char addresses, six counters, a 47-char command, a 71-char
-  // reply trace, and `credsrc=%d trunc=%u` (~294/320 used before that
-  // last field -- grown to 384 alongside it, not after, for headroom).
+  // reply trace, `credsrc=%d trunc=%u join=%s`, plus (038-006's R1
+  // fields) a 32-octet `ssid=%s` and a `haspw=%u` digit. Worst case is
+  // 368 bytes + NUL = 369/384 used, pinned in Python by
+  // test_wifi_join_error_debug_source_pin.py -- 15 bytes of headroom
+  // remain; re-check a new field's own width before assuming that
+  // covers it.
   char wifiDbgBuf_[384];
 
   // Radio RX scratch -- every line the radio poll receives lands here
