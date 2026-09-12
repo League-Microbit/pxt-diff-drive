@@ -66,14 +66,17 @@ class NezhaMotorPort final : public DiffDrive::Motor {
                         // [-1,1] [ms] [pct/tick] [us]
 
   // Re-point this side at a different port and/or reverse it at RUN
-  // time. Out-of-range is ignored; no-change is free. Zeroes the port
-  // being left, then re-anchors the encoder on the new one over I2C --
-  // caller holds the bus guard and nothing is driving (configureMotor()
-  // in shims.cpp is the only caller).
+  // time. Out-of-range ignored, no-change free. Zeroes the port being
+  // left, re-anchors on the new one: caller holds the bus guard.
   void configureWiring(uint8_t port, int8_t fwdSign);  // [M1..M4] [+1/-1]
 
   uint8_t wiredPort() const { return port_; }
   int8_t wiredSign() const { return fwdSign_; }
+
+  // The brick's OWN counter, before encOffset_ and fwdSign_: position()
+  // applies both and cannot witness a direction change; this can.
+  // MEASURED tovez 2026-09-12, captures/configmotor-hardware-20260912/.
+  int32_t rawCount() const { return glitchArmor_.lastGoodRaw(); }
 
   // PUBLIC so the fault-context emergency stop
   // (diffdrive_emergency_motor_stop(), nezha_port.cpp) can build the

@@ -1064,6 +1064,27 @@ int diagValue(int what) {
     case 32: return protocolRadioRxAcceptedCount();
     case 33: return protocolRadioRxOverrunDropCount();
     case 34: return protocolRadioRxOversizeDropCount();
+    // 35-38: the live motor wiring -- which brick port each side is
+    // driving and which way round it runs. What `configure motor`
+    // (configureMotor(), above) writes, read back from the ports
+    // themselves rather than from any copy of the request.
+    //
+    // Exposed because the wiring was otherwise unobservable from the
+    // host: the block shipped as a silent no-op on 2026-09-12 and
+    // nothing short of watching the wheels could tell. Encoder and duty
+    // ordinals cannot -- fwdSign multiplies duty AND encoder, so a
+    // flipped side reads back perfectly self-consistent.
+    case 35: return static_cast<int>(ensure().left.wiredPort());
+    case 36: return static_cast<int>(ensure().left.wiredSign());
+    case 37: return static_cast<int>(ensure().right.wiredPort());
+    case 38: return static_cast<int>(ensure().right.wiredSign());
+    // 39-40: the brick's own encoder counters, raw -- not rebased, not
+    // multiplied by fwdSign. The ONLY readout here that moves when a
+    // side's direction is flipped, and therefore the only one that can
+    // witness a `configure motor` direction change without someone
+    // watching the wheel.
+    case 39: return static_cast<int>(ensure().left.rawCount());
+    case 40: return static_cast<int>(ensure().right.rawCount());
     default: return 0;
   }
 }
