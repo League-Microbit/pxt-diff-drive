@@ -609,9 +609,9 @@ namespace diffDrive {
      *
      * Use "reversed" when a wheel turns the wrong way: a robot that
      * drives backwards on a forward command has both sides reversed, one
-     * that spins instead of driving straight has one. The two sides
-     * cannot share a port -- a call that would put both wheels on one
-     * motor is ignored.
+     * that spins instead of driving straight has one. Naming the port
+     * the other wheel is on swaps the pair, so setting one side is
+     * enough to exchange them.
      * @param side which wheel this is
      * @param port the brick port it is plugged into
      * @param direction forward, or reversed if the wheel runs backwards

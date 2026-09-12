@@ -73,6 +73,7 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   void configureWiring(uint8_t port, int8_t fwdSign);  // [M1..M4] [+1/-1]
 
   uint8_t wiredPort() const { return port_; }
+  int8_t wiredSign() const { return fwdSign_; }
 
   // PUBLIC so the fault-context emergency stop
   // (diffdrive_emergency_motor_stop(), nezha_port.cpp) can build the

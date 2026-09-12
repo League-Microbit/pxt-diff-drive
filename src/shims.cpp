@@ -35,6 +35,7 @@
 #include "pxt.h"
 #include "core/bus_guard.h"
 #include "core/diffdrive.h"
+#include "core/motor_wiring.h"
 #include "motion/motion_engine.h"
 #include "motion/odometry.h"
 #include "platform/nezha_port.h"
@@ -1127,7 +1128,20 @@ void configureMotor(int side, int port, int fwdSign) {
   Rig& r = ensure();
   NezhaMotorPort& target = (side == 0) ? r.left : r.right;
   NezhaMotorPort& other = (side == 0) ? r.right : r.left;
-  if (port == other.wiredPort()) return;  // would strand a wheel
+
+  // The decision -- including whether this is a swap -- is
+  // motor_wiring.h's, so that it is host-testable; this function only
+  // APPLIES the result. Computed before the stop so a request that
+  // changes nothing costs nothing.
+  const WiringPair now{MotorWiring{target.wiredPort(), target.wiredSign()},
+                       MotorWiring{other.wiredPort(), other.wiredSign()}};
+  const WiringPair next = applyWiringRequest(now.target, now.other,
+                                             port, fwdSign);
+  if (next.target.port == now.target.port &&
+      next.target.sign == now.target.sign &&
+      next.other.port == now.other.port &&
+      next.other.sign == now.other.sign)
+    return;
 
   // Stop first, through the same soft-stop path a block-level stop
   // uses: rewiring under a held commanded velocity would leave the
@@ -1140,8 +1154,13 @@ void configureMotor(int side, int port, int fwdSign) {
   // races whatever fiber is parked inside kernel.step()'s encoder
   // settle sleep, which is the exact collision the guard exists for.
   r.busGuard.acquire(r.sleeper);
-  target.configureWiring(static_cast<uint8_t>(port),
-                         static_cast<int8_t>(fwdSign));
+  // The OTHER wheel moves FIRST when this is a swap: it is the one
+  // vacating the port the target is about to take, and doing it in this
+  // order means the two are never both addressing one port, not even
+  // between two I2C writes.
+  if (next.other.port != now.other.port || next.other.sign != now.other.sign)
+    other.configureWiring(next.other.port, next.other.sign);
+  target.configureWiring(next.target.port, next.target.sign);
   r.busGuard.release();
 }
 
