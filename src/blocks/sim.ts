@@ -353,6 +353,18 @@ namespace diffDrive {
         if (trackWidth > 0) simTrackWidth = trackWidth * 0.1
     }
 
+    // Motor wiring (which brick port each side is on, and which way
+    // round it runs). The simulator has no ports and no motors -- it
+    // integrates simVel directly -- so there is nothing here for a
+    // rewire to change, and this is a no-op rather than a silent
+    // native-only shim (see the retired-shaping comment below for why
+    // an empty body would crash the simulator at the call site).
+    //% shim=diffDrive::configureMotor
+    export function _configureMotor(side: number, port: number,
+        fwdSign: number): void {
+        return
+    }
+
     //% shim=diffDrive::setKernelValue
     export function _setKernelValue(field: number, value: number): void {  // [x1000 scaled]
         const v = value * 0.001

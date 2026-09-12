@@ -1107,6 +1107,44 @@ void setGeometry(int trackWidth, int calib) {  // [0.1 mm] [1e-4 mm/deg]
   if (calib > 0) r.engine.setTravelCalib(static_cast<float>(calib) * 1e-4f);
 }
 
+// Which port each side of the drivetrain is on, and which way round
+// that motor runs, decided at RUN time rather than by the Rig's motor
+// literals above -- which carry vevov's wiring, and until now could
+// only be changed by a rebuild through tools/make_deploy.py's
+// `geometry.firmware_bake.motors` injection, out of reach of anyone
+// working in the MakeCode editor.
+//
+// side: 0 = left, 1 = right. port: 1-based (M1..M4). fwdSign: +1/-1.
+//
+// TWO WHEELS ON ONE PORT IS REFUSED: a swap done one call at a time
+// passes through that state, so this checks the RESULTING pair rather
+// than letting the second call drive both sides off one motor. Only
+// the state after each call has to be legal, so a straight swap goes
+// via an unused port, or assigns each side a port the other never had.
+//
+//%
+void configureMotor(int side, int port, int fwdSign) {
+  Rig& r = ensure();
+  NezhaMotorPort& target = (side == 0) ? r.left : r.right;
+  NezhaMotorPort& other = (side == 0) ? r.right : r.left;
+  if (port == other.wiredPort()) return;  // would strand a wheel
+
+  // Stop first, through the same soft-stop path a block-level stop
+  // uses: rewiring under a held commanded velocity would leave the
+  // kernel re-commanding the OLD port from the very next step().
+  r.softStop();
+
+  // configureWiring() talks I2C (the leaving port's zero write, then
+  // the arriving port's encoder anchor), so it takes the bus guard like
+  // every other non-kernel I2C caller in this file -- otherwise it
+  // races whatever fiber is parked inside kernel.step()'s encoder
+  // settle sleep, which is the exact collision the guard exists for.
+  r.busGuard.acquire(r.sleeper);
+  target.configureWiring(static_cast<uint8_t>(port),
+                         static_cast<int8_t>(fwdSign));
+  r.busGuard.release();
+}
+
 // ---- shaping-field descriptor table ---------------------------------
 // {ordinal, setter, field} rows for the ten config ordinals that map
 // onto a MotionLimits member. setKernelValue()/getConfigValue() (below)

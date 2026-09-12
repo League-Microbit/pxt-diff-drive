@@ -460,6 +460,56 @@ void NezhaMotorPort::rebaseline() {
   lastPosition_ = 0.0f;
 }
 
+void NezhaMotorPort::configureWiring(uint8_t port, int8_t fwdSign) {
+  if (port < 1 || port > 4) return;
+  if (fwdSign != 1 && fwdSign != -1) return;
+  if (port == port_ && fwdSign == fwdSign_) return;
+
+  // Zero the port we are LEAVING, while we can still address it. The
+  // brick latches its last commanded speed across even an MCU reset
+  // (see this file's header), so a rewire that skipped this could
+  // orphan a running wheel that nothing is able to command any more.
+  emergencyStop();
+
+  port_ = port;
+  fwdSign_ = fwdSign;
+
+  // The whole write pipeline describes the OLD motor: the dedupe cache
+  // would suppress the first write to the new one, the sigma-delta
+  // carry belongs to a different wheel's sub-percent history, and the
+  // reversal dwell is mid-flight against a sign that no longer applies.
+  // None of it transfers.
+  stagedDuty_ = 0.0f;
+  dutyCarry_ = 0.0f;
+  lastWritten_ = kNeverWritten;
+  lastWriteTime_ = 0;
+  lastNonzeroSign_ = 0;
+  atZero_ = false;
+  zeroSince_ = 0;
+  dwelling_ = false;
+  dwellStart_ = 0;
+
+  // Encoder state likewise. The new port has its own free-running
+  // counter, so drop the offset measured against the old one and let
+  // begin() re-anchor; keeping it would teleport odometry by whatever
+  // the two counters happen to differ by. Also clears the wedge
+  // detector, whose streak is evidence about a motor we no longer read.
+  lastPosition_ = 0.0f;
+  velocity_ = 0.0f;
+  sampleTime_ = 0;
+  lastTick_ = 0;
+  hasLastTick_ = false;
+  connected_ = false;
+  lastWedgeCheckPosition_ = 0.0f;
+  identicalReads_ = 0;
+  identicalReadsDriven_ = 0;
+  wedgeLatched_ = false;
+  wedgeSuspect_ = false;
+  glitchArmor_ = EncoderGlitchArmor();
+
+  begin();
+}
+
 void NezhaMotorPort::configureShaping(float outputDeadband,
                                       float reversalDwell, float slewRate,
                                       float writeThrottle) {

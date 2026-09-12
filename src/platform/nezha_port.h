@@ -65,6 +65,15 @@ class NezhaMotorPort final : public DiffDrive::Motor {
                         float slewRate, float writeThrottle);
                         // [-1,1] [ms] [pct/tick] [us]
 
+  // Re-point this side at a different port and/or reverse it at RUN
+  // time. Out-of-range is ignored; no-change is free. Zeroes the port
+  // being left, then re-anchors the encoder on the new one over I2C --
+  // caller holds the bus guard and nothing is driving (configureMotor()
+  // in shims.cpp is the only caller).
+  void configureWiring(uint8_t port, int8_t fwdSign);  // [M1..M4] [+1/-1]
+
+  uint8_t wiredPort() const { return port_; }
+
   // PUBLIC so the fault-context emergency stop
   // (diffdrive_emergency_motor_stop(), nezha_port.cpp) can build the
   // same wire frame without an instance -- see its own comment for why

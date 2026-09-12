@@ -86,6 +86,37 @@ enum ConfigField {
     GoToTimeout = 39
 }
 
+// Top-level, not inside the namespace: pxt renders an enum parameter as
+// a dropdown only when the enum is declared at file scope, the same
+// placement ConfigField above uses.
+
+enum MotorSide {
+    //% block="left"
+    Left = 0,
+    //% block="right"
+    Right = 1
+}
+
+// 1-based, matching the numbers printed on the brick.
+enum MotorPort {
+    //% block="M1"
+    M1 = 1,
+    //% block="M2"
+    M2 = 2,
+    //% block="M3"
+    M3 = 3,
+    //% block="M4"
+    M4 = 4
+}
+
+// The values ARE the firmware's fwdSign, passed straight through.
+enum MotorDirection {
+    //% block="forward"
+    Forward = 1,
+    //% block="reversed"
+    Reversed = -1
+}
+
 //% color=#0f9c5a icon="" block="DiffDrive"
 //% groups='["Move", "Drive", "Wheels", "GoTo", "Moving?", "Stop", "Pose", "World", "Setup", "Remote", "Debug"]'
 //% subcategories='["Pose", "Setup", "Extra"]'
@@ -417,6 +448,59 @@ namespace diffDrive {
      * Run code while moving. The body gets the live pose each
      * iteration; when the loop exits — move complete or stopMove() —
      * the move is over.
+     *
+     * THE BODY MUST NOT BLOCK. This loop's own _tickDrive() call is
+     * what steps the control loop, on THIS fiber, so every millisecond
+     * the body spends parked is a millisecond nothing is driving the
+     * robot. Park for more than ~100 ms and the starvation watchdog
+     * (shims.cpp) cannot tell you apart from a loop that was abandoned
+     * mid-move: it soft-stops the robot AND clears the move, so the
+     * next _tickDrive() returns false and the loop exits early. The
+     * symptom is a loop that "exits when my sensor fires" — the sensor
+     * is innocent; the blocking call in that branch is the cause.
+     *
+     * The blocking calls students actually reach for, all of which end
+     * the move on their first iteration. Defaults read from the
+     * vendored pxt core (pxt_modules/core/icons.ts:190,
+     * core/basic.ts:12-17, core/shims.d.ts:46/147/162) -- a source
+     * reading, not a bench measurement:
+     *
+     *   basic.showIcon(icon)     pauses 600 ms   -> showIcon(icon, 0)
+     *   basic.showLeds(leds)     pauses 400 ms   -> pass 0
+     *   basic.pause(ms)          pauses ms
+     *   music.playTone(f, dur)   pauses dur
+     *   basic.showString(s)      SCROLLS at 150 ms/char -- no fix, the
+     *                            whole scroll blocks
+     *   basic.showNumber(n)      showString() underneath, same 150 ms
+     *                            scroll. Passing 0 does NOT help: it
+     *                            sets the shift SPEED, not a one-shot
+     *                            pause, and a multi-digit number still
+     *                            scrolls. Show digits outside the loop.
+     *
+     * basic.clearScreen(), <image>.plotImage() (the no-interval draw
+     * showIcon is built on), led.plot()/unplot(), pin and I2C sensor
+     * reads, and plain arithmetic are all fine.
+     *
+     * For anything that genuinely has to block, set a variable here and
+     * do the slow work on ANOTHER fiber. CODAL fibers are cooperative,
+     * so a pause over there yields rather than stalling this loop:
+     *
+     *   let sawLine = false
+     *   control.inBackground(function () {
+     *       while (true) {
+     *           if (sawLine) { basic.showIcon(IconNames.Heart) }
+     *           else { basic.clearScreen() }
+     *           basic.pause(50)
+     *       }
+     *   })
+     *   diffDrive.whileMoving(100, 0, function (x, y, heading) {
+     *       sawLine = PlanetX_Basic.TrackbitChannelState(...)
+     *   })
+     *
+     * One caveat on that second fiber: never let it call _tickDrive()
+     * (directly, or via startDrive()/a move block), and keep world.ts's
+     * I2C blocks out of it — see startDrive()'s own doc comment for
+     * that bus-ownership rule.
      */
     //% block="while moving %distance cm turning %yaw degrees"
     //% draggableParameters="reporter" handlerStatement=1
@@ -431,7 +515,10 @@ namespace diffDrive {
     }
 
     /**
-     * Run code while going to a point. Same contract as whileMoving.
+     * Run code while going to a point. Same contract as whileMoving —
+     * including the one that bites: the body must not block. See
+     * whileMoving()'s doc comment above for why, and for the
+     * set-a-variable/second-fiber pattern to use when it has to.
      */
     //% block="while going to x %x cm y %y cm"
     //% draggableParameters="reporter" handlerStatement=1
@@ -513,6 +600,28 @@ namespace diffDrive {
     //% subcategory="Setup"
     export function setWheelCalibration(calib: number): void {
         _setGeometry(0, Math.round(calib * 10000))
+    }
+
+    /**
+     * Tell the robot which port a wheel is plugged into and which way
+     * it runs. Call it once per side, in on-start, before anything
+     * drives.
+     *
+     * Use "reversed" when a wheel turns the wrong way: a robot that
+     * drives backwards on a forward command has both sides reversed, one
+     * that spins instead of driving straight has one. The two sides
+     * cannot share a port -- a call that would put both wheels on one
+     * motor is ignored.
+     * @param side which wheel this is
+     * @param port the brick port it is plugged into
+     * @param direction forward, or reversed if the wheel runs backwards
+     */
+    //% block="configure motor %side on port %port running %direction"
+    //% group="Setup" weight=120
+    //% subcategory="Setup"
+    export function configureMotor(side: MotorSide, port: MotorPort,
+        direction: MotorDirection): void {
+        _configureMotor(side, port, direction)
     }
 
     /**
