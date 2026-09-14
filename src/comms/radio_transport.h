@@ -128,6 +128,8 @@ class RadioTransport {
   // Idempotent; there is deliberately no disable().
   void enable() { enabled_ = true; }
   bool enabled() const { return enabled_; }
+  uint8_t channel() const { return channel_; }  // live: kChannel or setChannel()
+  uint8_t group() const { return group_; }  // live: kGroup or setGroup()
 
   // Fragments `data` (len bytes) into RadioRelay-framed radio packets
   // and transmits each one via uBit.radio.datagram.send(), appending a

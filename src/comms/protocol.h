@@ -165,6 +165,10 @@ class Protocol {
   // header, so it never pulls radio_transport.h into its own include
   // graph.
   int serialDropCount() const;
+  bool wifiConnected() const { return wifiEnabled_ && wifiLink_.ready(); }
+  bool radioLinkEnabled() const { return radioTransport_.enabled(); }
+  uint8_t radioChannel() const { return radioTransport_.channel(); }
+  uint8_t radioGroup() const { return radioTransport_.group(); }
 
   // Configure the radio AND bring the v6 radio link up -- the ONE write
   // path student blocks gain into RadioTransport's own configuration.

@@ -112,6 +112,12 @@ bool engineMoveActive();
 // reports as a merits rejection rather than a false accept.
 bool protocolOfferRun(const char* text);
 
+// STATUS's wifi/radio/channel/group -- Protocol owns both transports.
+bool protocolWifiConnected();
+bool protocolRadioEnabled();
+int protocolRadioChannel();
+int protocolRadioGroup();
+
 // The SECOND genuinely new read, alongside engineMoveActive() above --
 // true iff the most recent Segment to go inactive ended via its OWN
 // deadline rather than by reaching its own goal, an abort, or an
@@ -309,6 +315,10 @@ void WireAdapter::status(Wire::StatusFields& out) const {
 
   out.flags = computeFlags();
   out.i2cf = diagValue(kDiagI2cFault);
+  out.wifi = protocolWifiConnected();
+  out.radio = protocolRadioEnabled();
+  out.channel = static_cast<uint8_t>(protocolRadioChannel());
+  out.group = static_cast<uint8_t>(protocolRadioGroup());
   // Same seam as i2cf immediately above: diagValue(kDiagCycleCount) is
   // the SAME call FULL telemetry's `cyc` column reads, so a never-ticked
   // kernel (cyc == 0) and a ticked-but-unreachable-brick kernel

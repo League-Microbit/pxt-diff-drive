@@ -139,6 +139,10 @@ struct StatusFields {
   // wire: a cycle count never goes negative.
   uint32_t cyc = 0;
   const char* tlm = "off";
+  bool wifi = false;    // WiFi link enabled and up (protocol traffic flows)
+  bool radio = false;   // v6 radio link enabled
+  uint8_t channel = 0;  // radio channel, live, reported even while disabled
+  uint8_t group = 0;    // radio group, live, reported even while disabled
 };
 
 // One named, already-scaled telemetry value (protocol.md S5.2: `thdr

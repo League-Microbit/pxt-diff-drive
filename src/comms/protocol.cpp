@@ -87,7 +87,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20260913.1";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20260914.1";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 
@@ -656,6 +656,11 @@ bool protocolOfferRun(const char* text) {
   while (text[len] != '\0') ++len;
   return protocol().handleRun(reinterpret_cast<const uint8_t*>(text), len);
 }
+// STATUS's transport fields (WireAdapter::status()).
+bool protocolWifiConnected() { return protocol().wifiConnected(); }
+bool protocolRadioEnabled() { return protocol().radioLinkEnabled(); }
+int protocolRadioChannel() { return protocol().radioChannel(); }
+int protocolRadioGroup() { return protocol().radioGroup(); }
 
 void Protocol::dispatchJob() {
   if (motionOwner_ != MotionOwner::kNone) return;
