@@ -183,6 +183,15 @@ class MotionEngine {
 
   uint32_t wrongWayCount() const { return wrongWayCount_; }
 
+  // A stall halted a command and no later command has shown the wheels
+  // turning yet. The kernel's own stallHalted is the HALT, and every new
+  // command re-arms it -- a stall stops only the command it happened in.
+  // This is the REPORT: it stays set after the halt so a program can ask
+  // afterwards, and clears on the first tick a later command measures
+  // either wheel above the stall speed, or on clearStallReport().
+  bool stallReported() const { return stallReported_; }
+  void clearStallReport() { stallReported_ = false; }
+
   // Steps the kernel until both wheels MEASURE at rest, bounded. Needed
   // because neutral() only stages a zero command and the delivering step's
   // own encoder read can otherwise freeze a nonzero velocity forever.
@@ -276,6 +285,8 @@ class MotionEngine {
   uint32_t wrongWayCount_ = 0;
 
   bool lastSegmentEndedByDeadline_ = false;
+
+  bool stallReported_ = false;
 };
 
 }  // namespace diffDrive

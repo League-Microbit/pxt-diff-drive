@@ -3,6 +3,7 @@
 
 #include "../core/fiber_identity.h"
 #include "../platform/vfp_guard.h"
+#include "reply_backpressure.h"
 #include "wifi_credential_store.h"  // wifiCredentialStore(): the shared
                                     // flash-backed store used by
                                     // serviceWifi()'s lazy-begin
@@ -86,7 +87,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20260912.8";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20260913.1";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 
@@ -1070,6 +1071,26 @@ Protocol& protocol() {
     gProtocol->start();
   }
   return *gProtocol;
+}
+
+// WireHandler replies over WiFi (wifiSink_). FUNCS alone writes one line
+// per registered function, and WifiLink's 8-slot transmit ring drops the
+// newest line when full, so a long reply lost its tail over WiFi only.
+// A REPLY now waits, bounded, for room while this fiber pumps the link
+// forward. Telemetry keeps dropping (it must never stall), and nothing
+// waits while a wire motion obligation is live: this fiber is also what
+// ticks that motion, and a stalled tick trips the starvation watchdog.
+void Protocol::writeWifi(WifiLink& link, const uint8_t* data, size_t length) {
+  Protocol& p = protocol();
+  if (!link.telemetryMarked() && !p.wireAdapter_.hasLiveMotionObligation()) {
+    (void)waitForTxRoom(
+        link, WifiLink::kTxSlots,
+        [&p]() { p.wifiJoinSequencer_.service(); },
+        []() { vfpSafeSleep(kWifiReplyYield); },
+        [&p]() { return p.clockNow(); },
+        kWifiReplyWait);
+  }
+  (void)link.sendLine(data, length);
 }
 
 // Boot-time auto-start wiring: called once from a top-level statement in

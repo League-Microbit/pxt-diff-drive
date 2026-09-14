@@ -969,11 +969,26 @@ void estopClear() { ensure().kernel.estopClear(); }
 // `blocks/stop.ts` readback block, the STATUS `flags` bit 2, and the
 // pre-existing diagValue(2) -- three independent ways to read the same
 // bit, all sourced from this one Output field.
+//
+// 2026-09-13 (stakeholder direction): a stall stops only the command it
+// happened in. MotionEngine re-arms the kernel's halt at every new
+// command, so a later Drive/Move block tries again instead of being
+// silently ignored until reboot. isStalled() now reads the engine's
+// stall REPORT -- set by the halt, held until a later command measures
+// the wheels turning -- so a program can still ask afterwards. STATUS
+// flags bit 2 and diagValue(2) still read the kernel's raw halt bit.
 //%
-void clearStall() { ensure().kernel.clearStallLatch(); }
+void clearStall() {
+  Rig& r = ensure();
+  r.kernel.clearStallLatch();
+  r.engine.clearStallReport();
+}
 
 //%
-bool isStalled() { return ensure().kernel.output().stallHalted; }
+bool isStalled() {
+  Rig& r = ensure();
+  return r.engine.stallReported() || r.kernel.output().stallHalted;
+}
 
 // SerialTransport's writeLine() drop counter (sprint 004 ticket 006),
 // read back by case 26 below. Reached by same-package forward
@@ -1356,7 +1371,9 @@ float cfgGetStallClear(Rig& r) {
   return r.kernel.output().stallHalted ? 1.0f : 0.0f;
 }
 void cfgSetStallClear(Rig& r, float v) {
-  if (v != 0.0f) r.kernel.clearStallLatch();
+  if (v == 0.0f) return;
+  r.kernel.clearStallLatch();
+  r.engine.clearStallReport();
 }
 
 // rebase zeroes the odometry frame, writing BOTH pose sources

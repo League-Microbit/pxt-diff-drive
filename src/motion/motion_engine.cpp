@@ -114,6 +114,7 @@ void MotionEngine::cancelMove() {
 }
 
 void MotionEngine::wheelsV(float left, float right, uint32_t duration) {
+  kernel_.clearStallLatch();  // a new command gets its own attempt
   const bool wasSegActive = seg_.active;
   const bool wasHoldActive = hold_.active;
   cancelMove();
@@ -193,6 +194,7 @@ void MotionEngine::beginPendingStraightPhase() {
 
 void MotionEngine::wheelsX(float left, float right, float cruise,
                            uint32_t timeout) {
+  kernel_.clearStallLatch();  // a new command gets its own attempt
   const uint32_t deadline = now() + timeout;
   const float cpm = countsPerMm();
   const float distTarget = 0.5f * (left + right) * cpm;
@@ -202,6 +204,7 @@ void MotionEngine::wheelsX(float left, float right, float cruise,
 
 void MotionEngine::moveX(float distance, float rotation, float cruise,
                          uint32_t timeout) {
+  kernel_.clearStallLatch();  // a new command gets its own attempt
   // One blended constant-ratio segment for EVERY (distance, rotation).
   // R = distance / rotation is always a driveable arc: |R| < b/2 only
   // means the inner wheel runs backwards, R = 0 is a spot pivot. There
@@ -225,6 +228,7 @@ void MotionEngine::goToR(float x, float y, float speed, float arrive,
                          uint32_t timeout) {
   // Radial no-op gate, ahead of any split decision.
   if (std::hypot(x, y) <= arrive) return;
+  kernel_.clearStallLatch();  // a new command gets its own attempt
 
   const GoToRPlan plan = decomposeGoToR(x, y);
 
@@ -261,6 +265,19 @@ bool MotionEngine::service() {
 
   const DiffDrive::DifferentialDrive::Output out = kernel_.output();
   const uint32_t nowVal = now();
+
+  // Stall REPORT (stallReported()): set whenever the kernel's halt is
+  // published; cleared once this command measures a wheel genuinely
+  // turning -- the inverse of the kernel's own "both wheels still" test.
+  if (out.stallHalted) {
+    stallReported_ = true;
+  } else if (stallReported_) {
+    const float moving = kernel_.config().stallSpeed;  // [counts/s]
+    if (std::fabs(out.velocityLeft) > moving ||
+        std::fabs(out.velocityRight) > moving) {
+      stallReported_ = false;
+    }
+  }
   const float dt = static_cast<float>(nowVal - lastTick_) / 1000.0f;
   lastTick_ = nowVal;
   const float cpm = countsPerMm();
@@ -360,7 +377,15 @@ bool MotionEngine::service() {
     return true;
   }
 
-  // Continuous hold (wheelsV()/moveV()).
+  // Continuous hold (wheelsV()/moveV()). A stall ends it exactly as it
+  // ends a Segment above: without this, the kernel sits forced-neutral
+  // under a hold that stays "driving" for its whole lease (up to
+  // kLeaseMax), and a `while (driveTick())` loop spins over a halted robot.
+  if (out.stallHalted) {
+    kernel_.neutral();
+    hold_.active = false;
+    return false;
+  }
   const bool holdExpired = static_cast<int32_t>(nowVal - hold_.until) >= 0;
   if (holdExpired) {
     kernel_.neutral();

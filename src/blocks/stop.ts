@@ -29,11 +29,13 @@ namespace diffDrive {
     }
 
     /**
-     * Whether the stall latch has tripped: the robot demanded motion
-     * for too long with the wheels not turning, and every Drive/Move
-     * block has been silently ignored since. Separate from the
-     * emergency-stop latch -- see clearStallLatch(). Always false in
-     * the simulator: there is no stall model in the browser.
+     * Whether a move stalled: the robot demanded motion for too long
+     * with the wheels not turning, so that move was stopped. It stays
+     * true until a later move gets the wheels turning again (or clear
+     * stall latch). A stall only stops the move it happened in -- the
+     * next Drive/Move block tries again on its own. Separate from the
+     * emergency-stop latch. Always false in the simulator: there is no
+     * stall model in the browser.
      */
     //% block="is stalled"
     //% group="Moving?" weight=310
@@ -42,10 +44,11 @@ namespace diffDrive {
     }
 
     /**
-     * Clear the stall latch so Drive/Move blocks take effect again.
-     * Does NOT clear the emergency-stop latch -- the two are
+     * Forget a stall, so is stalled reads false. Not needed to move
+     * again: every new Drive/Move block re-arms stall detection by
+     * itself. Does NOT clear the emergency-stop latch -- the two are
      * independent fault states (see clearEmergencyStop()). A no-op if
-     * nothing is latched.
+     * nothing stalled.
      */
     //% block="clear stall latch"
     //% group="Stop" weight=250

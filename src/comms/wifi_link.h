@@ -207,6 +207,7 @@ class WifiLink {
   // tagged as periodic frames, which a later reply may discard unsent
   // (a stale frame is worthless; a late ack is a stalled host).
   void markTelemetry(bool on) { telemetryMode_ = on; }
+  bool telemetryMarked() const { return telemetryMode_; }  // telemetry vs reply
 
   // --- introspection, for the DBG:wifi line and bench tools ---
   State state() const { return state_; }

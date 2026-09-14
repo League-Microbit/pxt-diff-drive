@@ -312,6 +312,8 @@ class Protocol {
   // reason to name a second constant here, not to spell a bare number
   // at its call site.
   static constexpr int kRxDrainPerPass = 4;
+  static constexpr uint32_t kWifiReplyWait = 2000;  // [ms] writeWifi() room wait
+  static constexpr uint32_t kWifiReplyYield = 2;  // [ms] sleep between pumps
 
   // The ONE path an inbound line takes, whichever transport produced
   // it: `data`/`len` is one complete line, delimiter already stripped
@@ -453,9 +455,7 @@ class Protocol {
                          size_t length) {
     (void)transport.sendLine(data, length);
   }
-  static void writeWifi(WifiLink& link, const uint8_t* data, size_t length) {
-    (void)link.sendLine(data, length);
-  }
+  static void writeWifi(WifiLink& link, const uint8_t* data, size_t length);
 
   RadioTransport radioTransport_;
   SerialTransport transport_;
