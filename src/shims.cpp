@@ -355,18 +355,20 @@ static void odomUpdate(Rig& r) { r.odometry.update(r.kernel.output()); }
 // the free function deliverStopNow(), a name src/DESIGN.md,
 // tests/host/fake_ports.h and several code-review documents still use.)
 //
-// The three parts, in order:
+// The four parts, in order:
 //
-//   engine.endMove()  clears the move engine's own in-flight state, so
-//                     a later service() cannot re-command from it.
-//   kernel.neutral()  disarms the kernel's HELD commanded velocity (a
-//                     continuous drive holds up to kLeaseMax, one
-//                     hour); without it the port zero below is
-//                     momentary, because the very next step()
-//                     re-commands the duty. Unconditional, so a stop
-//                     after setWheels()/driveTwist() gets it too
-//                     (stakeholder decision, 2026-08-26).
-//   the port write    delivers the stop NOW.
+//   engine.endMove()   clears the move engine's own in-flight state, so
+//                      a later service() cannot re-command from it.
+//   kernel.neutral()   disarms the kernel's HELD commanded velocity (a
+//                      continuous drive holds up to kLeaseMax, one
+//                      hour); without it the port zero below is
+//                      momentary, because the very next step()
+//                      re-commands the duty. Unconditional, so a stop
+//                      after setWheels()/driveTwist() gets it too
+//                      (stakeholder decision, 2026-08-26).
+//   the port write     delivers the stop NOW.
+//   engine.settleToRest()  forces a FRESH kernel Output before this
+//                      call returns -- see below.
 //
 // Why PORT-LEVEL (R-08/BLK-01): kernel.neutral() only STAGES a zero
 // (diffdrive.cpp), delivered solely on a LATER kernel.step(), and
@@ -381,13 +383,25 @@ static void odomUpdate(Rig& r) { r.odometry.update(r.kernel.output()); }
 // latches estopLatch_ (diffdrive.cpp), turning this resumable soft stop
 // into a hard e-stop needing clearEmergencyStop().
 //
+// The port write above stops the WHEELS but does not itself touch the
+// kernel's own published Output, which WireAdapter::status()'s `active`
+// bit reads -- so without a further kernel step, `active` can read
+// stale/frozen after a stop (MEASURED vevov 2026-09-15, captures/
+// calibratel-vevov-20260915/: `active=1`/`cyc` frozen after a `STOP`).
+// settleToRest() here keeps stepping the kernel (bounded,
+// `MotionEngine::kSettleMaxSteps`) until both wheels are MEASURED at
+// rest, so `active` reflects the stop by the time this call returns.
+//
 // Staged while busGuard is held: the port write would otherwise race
-// the I2C traffic of whichever OTHER fiber holds the guard (mid
-// kernel.step(), possibly parked in its own settle sleep) -- the exact
+// the I2C traffic of whichever OTHER fiber holds the guard -- the exact
 // collision the guard exists to prevent. Rig::pendingStop_ hands the
-// write to that fiber instead, delivered from inside tickDrive() just
-// before it releases the guard, still within the same tick. When the
-// guard is free (the common case) the write happens here, immediately.
+// write (and the settle below) to that fiber instead, delivered from
+// inside tickDrive() just before it releases the guard. When the guard
+// is free (the common case) this call acquires it itself for the
+// duration of the port write + settle, the same acquire/I2C-body/
+// release bracket every other non-kernel I2C entry point in this file
+// takes -- settleToRest() steps the kernel, which talks I2C, so it
+// needs the same protection tickDrive()'s own acquire() gives step().
 void Rig::softStop() {
   engine.endMove();
   kernel.neutral();
@@ -395,8 +409,11 @@ void Rig::softStop() {
     pendingStop_ = true;
     return;
   }
+  busGuard.acquire(sleeper);
   left.emergencyStop();
   right.emergencyStop();
+  engine.settleToRest();
+  busGuard.release();
 }
 
 // ---- velocity commands ----------------------------------------------
@@ -514,6 +531,31 @@ float engineDominantAxisTravel(float distance, float rotation) {  // [mm] [rad] 
   return ensure().engine.dominantAxisTravel(distance, rotation);
 }
 
+// [counts/mm] -- forwards MotionEngine::countsPerMm() for wire-layer
+// callers reporting a counts delta in mm (wire_adapter.cpp's `pulse`
+// handler). Named after the method it forwards, not the usual
+// `engineXxx` prefix: `engineCountsPerMm` would itself carry the
+// forbidden `Mm` unit suffix.
+float countsPerMm() {
+  return ensure().engine.countsPerMm();
+}
+
+// pulseWheels()'s wire-layer forward: that method drives its own
+// kernel.step() loop synchronously, so this wraps it in the SAME
+// BusGuard tickDrive() and every other non-kernel I2C caller here
+// takes, guarding against a concurrent tickDrive() racing it mid
+// encoder-settle-sleep.
+void enginePulseWheels(float ampLeft, float ampRight, int32_t widthTicks,
+                       float& outLeft, float& outRight) {  // [counts] [counts]
+  Rig& r = ensure();
+  r.busGuard.acquire(r.sleeper);
+  const diffDrive::MotionEngine::PulseResult result =
+      r.engine.pulseWheels(ampLeft, ampRight, widthTicks);
+  r.busGuard.release();
+  outLeft = result.left;
+  outRight = result.right;
+}
+
 // True iff MotionEngine's move-engine state (MOVE_X/GO_TO_R/GO_TO_W's
 // own tracked segment) is currently active -- one of the two reads
 // WireAdapter's motion-completion resolution needs. Mirrors the `//%`
@@ -624,6 +666,88 @@ bool updateMove() {
   return moveActive;
 }
 
+// ---- nudge mode: block-facing entry points ------------------------------
+//
+// nudge()/nudgeTurn() (blocks/motion.ts) each stage a beginNudge() call
+// then loop `_tickDrive()` (which already dispatches to serviceNudge()
+// via MotionEngine::service()) until the nudge reports inactive, and
+// read the measured result off nudgeMeasuredDistance()/
+// nudgeMeasuredRotation() below.
+//
+// The (left, right)/(deg) -> (distance, rotation) reduction happens
+// HERE, not in TypeScript: it needs effectiveTrackWidth(), live
+// runtime-configurable engine state that TS would otherwise have to
+// duplicate or go stale against -- the same reason wheelsX()'s own
+// per-wheel reduction lives in MotionEngine::wheelsX(). Two entry
+// points rather than one generic shim, since each reduction is a
+// one-line formula and the two blocks take genuinely different
+// parameterizations.
+//
+// Same ownership contract as startMove() above: refused (a silent
+// no-op), not superseding, while the drivetrain is already held.
+// Neither threads a caller-supplied timeout through from TS;
+// kNudgeTimeout below is a generous backstop on top of the pulse
+// BUDGET (MotionEngine::nudgeMaxPulses(), the real runaway guard).
+
+// [ms] UNVERIFIED ceiling, not a tuned value: kMaxNudgePulses (40) at
+// kSettleMaxSteps (12) settle steps each, ~24 ms/step, is ~12 s worst
+// case before any operator nudgeSettle() pause; the pulse budget is
+// what actually bounds a runaway nudge.
+static constexpr uint32_t kNudgeTimeout = 20000;
+
+//%
+void beginNudgeWheels(int left, int right) {  // [mm] [mm]
+  if (!protocolTryTakeMotionOwnership()) return;
+  Rig& r = ensure();
+  const float distance = 0.5f * static_cast<float>(left + right);  // [mm]
+  // Inverse of beginNudge()'s own yawTarget formula (motion_engine.h):
+  // yawTarget = rotation * 0.5 * effectiveTrackWidth() * cpm, and the
+  // SAME half-difference wheelsX() reduces onto yawTarget directly
+  // (0.5*(right-left)*cpm) must come out equal, so
+  // rotation = (right-left) / effectiveTrackWidth().
+  const float rotation =                                          // [rad]
+      static_cast<float>(right - left) / r.engine.effectiveTrackWidth();
+  r.engine.beginNudge(distance, rotation, kNudgeTimeout);
+}
+
+//%
+void beginNudgeTurn(int rotation) {  // [cdeg]
+  if (!protocolTryTakeMotionOwnership()) return;
+  Rig& r = ensure();
+  r.engine.beginNudge(0.0f, static_cast<float>(rotation) * kCdegToRad,
+                      kNudgeTimeout);
+}
+
+// A nudge is still in flight. tickDrive()'s own return value does NOT
+// carry for nudge mode -- a fired pulse always settles applied duty
+// back to zero before returning, so it reads "nothing commanded" every
+// nudge tick (blocks/motion.ts's nudge()/nudgeTurn() loop on this
+// alongside `_tickDrive()` for that reason). Mirrors engineMoveActive()'s
+// own `rig == nullptr` guard.
+//%
+bool nudgeActive() {
+  return rig != nullptr && rig->engine.isNudgeActive();
+}
+
+// [mm] the measured mean-axis distance nudge() actually achieved --
+// see MotionEngine::nudgeMeasuredDistance()'s own comment for why this
+// reads the engine's own ledger rather than the fused odometry pose.
+// Rounded to the nearest mm at THIS boundary (block layer), not
+// upstream: the engine's own float stays full precision for any other
+// consumer.
+//%
+int nudgeMeasuredDistance() {  // [mm]
+  return static_cast<int>(std::lround(ensure().engine.nudgeMeasuredDistance()));
+}
+
+// [cdeg] the measured rotation nudgeTurn() actually achieved, in the
+// same centidegree convention poseHeading() already uses.
+//%
+int nudgeMeasuredRotation() {  // [cdeg]
+  return static_cast<int>(
+      std::lround(ensure().engine.nudgeMeasuredRotation() * 100.0f));
+}
+
 // Forward declaration: commandLooksActive() is defined further down, in
 // its own clearly delineated section right before the starvation
 // watchdog (it was written there first, for the watchdog's own use) --
@@ -731,10 +855,20 @@ bool tickDrive() {
   // an already-decided stop, and re-entering softStop() would re-run
   // its endMove()/neutral() and re-take the held() branch it is the
   // consumer of.
+  //
+  // settleToRest() + odomUpdate() close the SAME staleness gap
+  // Rig::softStop()'s own comment describes, for the staged case: the
+  // OTHER fiber's engine.endMove() already cleared seg_/hold_ before
+  // pendingStop_ was staged, so the `wasActive && !moveActive` branch
+  // above never fires, and without this call THIS tick's own step()
+  // (run before the race was known) is left as the last, stale word on
+  // Output.
   if (r.pendingStop_) {
     r.pendingStop_ = false;
     r.left.emergencyStop();
     r.right.emergencyStop();
+    r.engine.settleToRest();
+    odomUpdate(r);  // coast counts -> pose before the final TLM
   }
   r.busGuard.release();
 
@@ -1429,6 +1563,24 @@ void cfgSetGoToDeadline(Rig& r, float v) {
   r.goToDeadline = static_cast<uint32_t>(v);
 }
 
+// The nudge stepper's three config rows are thin forwards to
+// MotionEngine's own validated setters, same shape as
+// cfgGetRotationalSlip()/cfgSetRotationalSlip() above. nudge_width
+// rounds rather than truncates so an exact integer tick count survives
+// the shared unscaled-float wire convention (x1000/0.001f).
+float cfgGetNudgeAmplitude(Rig& r) { return r.engine.nudgeAmplitude(); }
+void cfgSetNudgeAmplitude(Rig& r, float v) { r.engine.setNudgeAmplitude(v); }
+
+float cfgGetNudgeWidth(Rig& r) {
+  return static_cast<float>(r.engine.nudgeWidthTicks());
+}
+void cfgSetNudgeWidth(Rig& r, float v) {
+  r.engine.setNudgeWidthTicks(static_cast<int32_t>(std::lround(v)));
+}
+
+float cfgGetNudgeSettle(Rig& r) { return r.engine.nudgeSettle(); }
+void cfgSetNudgeSettle(Rig& r, float v) { r.engine.setNudgeSettle(v); }
+
 struct ConfigAccessor {
   int ordinal;
   float (*get)(Rig&);          // [unscaled]
@@ -1457,6 +1609,9 @@ constexpr ConfigAccessor kConfigAccessors[] = {
     {33, &cfgGetEstopClear, &cfgSetEstopClear},
     {38, &cfgGetStraightTrim, &cfgSetStraightTrim},
     {39, &cfgGetGoToDeadline, &cfgSetGoToDeadline},
+    {40, &cfgGetNudgeAmplitude, &cfgSetNudgeAmplitude},
+    {41, &cfgGetNudgeWidth, &cfgSetNudgeWidth},
+    {42, &cfgGetNudgeSettle, &cfgSetNudgeSettle},
 };
 
 const ConfigAccessor* findConfigAccessor(int ordinal) {

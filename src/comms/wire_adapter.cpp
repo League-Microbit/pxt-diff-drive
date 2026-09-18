@@ -7,6 +7,9 @@
 #include "wifi_credential_store.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace diffDrive {
 
@@ -58,6 +61,18 @@ bool engineGoToW(float x, float y, float speed, float arrive,
 // hypot(x, y) of the target alone (see this function's own comment,
 // shims.cpp, for why that would be wrong).
 float engineGoToWChord(float worldX, float worldY);  // -> [mm]
+
+// The diagnostic pulse primitive's own forwards -- see shims.cpp's
+// enginePulseWheels() for the BusGuard rationale (this call talks I2C
+// directly, synchronously, unlike every motion verb above which only
+// ARMS a command for the tick engine). execPulse() (below) is this
+// class's own onRun()-reached caller.
+void enginePulseWheels(float ampLeft, float ampRight, int32_t widthTicks,
+                       float& outLeft, float& outRight);  // [%] [%] [ticks] -> [counts] [counts]
+// [counts/mm] -- named identically to MotionEngine::countsPerMm() (the
+// method it forwards), an allow-listed conversion-function name, rather
+// than an `engineXxx`-prefixed name ending in the forbidden `Mm` suffix.
+float countsPerMm();
 
 // ---- shims.cpp entry points: buildSnapshot()'s own five reads,
 // reaching live pose/OTOS/wheel-speed state. Same same-package
@@ -940,13 +955,87 @@ const Wire::Snapshot& WireAdapter::buildSnapshot() {
   return snapshot_;
 }
 
+// Parses "<ampLeft> <ampRight> <widthTicks>" from RUN's raw argument
+// tokens and fires one enginePulseWheels() pulse. std::strtof/
+// std::strtol are used exactly
+// as wire_handler.cpp's own decodeGet()/decodeSet() field parsers use
+// them (that file's own comment on the same two functions) -- checking
+// `endPtr` lands on the token's NUL, so trailing garbage ("25x") is a
+// decode failure (kBadArg) rather than a silently-truncated 25.
+Wire::Result WireAdapter::execPulse(const char* const* argv, size_t argc,
+                                    char* result, size_t resultCapacity,
+                                    bool& hasResult) {
+  if (externalOwner_ != MotionOwner::kNone) return Wire::Result::kBusy;
+  if (argc != 3) return Wire::Result::kBadArg;
+
+  char* endPtr = nullptr;
+  const float ampLeft = std::strtof(argv[0], &endPtr);
+  if (endPtr == argv[0] || *endPtr != '\0') return Wire::Result::kBadArg;
+  const float ampRight = std::strtof(argv[1], &endPtr);
+  if (endPtr == argv[1] || *endPtr != '\0') return Wire::Result::kBadArg;
+  const long widthTicksLong = std::strtol(argv[2], &endPtr, 10);
+  if (endPtr == argv[2] || *endPtr != '\0') return Wire::Result::kBadArg;
+  if (widthTicksLong <= 0) return Wire::Result::kRange;
+
+  float leftDelta = 0.0f, rightDelta = 0.0f;  // [counts]
+  enginePulseWheels(ampLeft, ampRight, static_cast<int32_t>(widthTicksLong),
+                    leftDelta, rightDelta);
+
+  const float cpm = countsPerMm();  // [counts/mm]
+  const float leftTravel = cpm > 0.0f ? leftDelta / cpm : 0.0f;    // [mm]
+  const float rightTravel = cpm > 0.0f ? rightDelta / cpm : 0.0f;  // [mm]
+
+  // Integer-only formatting: the micro:bit target's newlib-nano printf
+  // has no float conversion support -- `%f`/`%g`/`%e` come back EMPTY,
+  // not truncated or wrong. MEASURED vevov 2026-09-16, farm serial link
+  // null.local:41285, firmware vevov-nudgehang0915: the pulse executed
+  // correctly but every `ret` field name came back with an empty value.
+  // Every other wire formatter in this codebase already avoids float
+  // conversions (see wire_handler.cpp's formatConfigValue()); pinned
+  // here by test_no_float_format_specifier_in_wire_layer_source_pin.py,
+  // since the desk's own libc DOES support %f and so cannot catch it.
+  //
+  // Encoder counts are integral; round to the nearest count rather than
+  // truncate. Travel is reported as hundredths of a millimetre
+  // (`_mm_x100`, an explicit scale in the wire field name -- the
+  // C++-identifier no-units convention doesn't apply to wire fields) so
+  // a single pulse's ~0.7 mm displacement resolves to tens of counts,
+  // enough for the characterization gate to tell 0.3 mm from 2.0 mm
+  // apart.
+  const long leftCountsInt =
+      std::lround(static_cast<double>(leftDelta));  // [counts]
+  const long rightCountsInt =
+      std::lround(static_cast<double>(rightDelta));  // [counts]
+  const long leftMmScaled =
+      std::lround(static_cast<double>(leftTravel) * 100.0);  // [mm], x100
+  const long rightMmScaled =
+      std::lround(static_cast<double>(rightTravel) * 100.0);  // [mm], x100
+  std::snprintf(
+      result, resultCapacity,
+      "left_counts=%ld right_counts=%ld left_mm_x100=%ld right_mm_x100=%ld",
+      leftCountsInt, rightCountsInt, leftMmScaled, rightMmScaled);
+  hasResult = true;
+  return Wire::Result::kOk;
+}
+
 Wire::Result WireAdapter::onRun(const char* name, const char* const* argv,
-                                size_t argc, char* /*result*/,
-                                size_t /*resultCapacity*/, bool& hasResult) {
+                                size_t argc, char* result,
+                                size_t resultCapacity, bool& hasResult) {
   // Void by construction: the TypeScript handlers this reaches return
   // nothing, and a queued one has not even started when this returns.
   hasResult = false;
   if (name == nullptr || name[0] == '\0') return Wire::Result::kUnknown;
+
+  // "pulse": the diagnostic pulse primitive, handled entirely in C++,
+  // synchronously -- see execPulse()'s own
+  // comment (this file, above) and this class's own comment
+  // (wire_adapter.h) for why it bypasses the TS run_registry/RunBridge
+  // path below rather than joining it. Checked before the registry
+  // lookup so this name works whether or not any TS handler has ever
+  // bound anything.
+  if (std::strcmp(name, "pulse") == 0) {
+    return execPulse(argv, argc, result, resultCapacity, hasResult);
+  }
 
   // An unregistered name is refused HERE, before the bridge, so a typo
   // answers `err 1` instead of being queued and silently matching no

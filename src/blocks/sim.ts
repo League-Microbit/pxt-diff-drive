@@ -147,6 +147,90 @@ namespace diffDrive {
         return simMoveActive
     }
 
+    // ---- nudge mode: sub-floor micro-moves (039/005) -----------------
+    // The simulator has no discrete-pulse model (no encoder counts, no
+    // per-pulse amplitude/width to fire) -- it resolves a nudge as ONE
+    // small blended segment at a fixed low nudge speed, same shape
+    // _startMove() already uses above, and always reaches the FULL
+    // requested amount (no early-convergence/margin behavior to model,
+    // unlike hardware's settle-gated stepper). The "measured" accessors
+    // below report exactly what was requested, recorded at
+    // _beginNudgeWheels()/_beginNudgeTurn() time -- an honest
+    // approximation, not a promise this reproduces hardware's per-pulse
+    // granularity (see nudge()'s own doc comment, motion.ts, for the
+    // real MEASURED floor).
+    const kSimNudgeSpeed = 10                     // [mm/s]
+    const kSimNudgeYawRate = 10 * Math.PI / 180   // [rad/s]
+    let simNudgeDistance = 0  // [mm] last requested, reported "measured"
+    let simNudgeRotation = 0  // [cdeg] last requested, reported "measured"
+
+    //% shim=diffDrive::beginNudgeWheels
+    export function _beginNudgeWheels(left: number, right: number): void {  // [mm] [mm]
+        simIntegrate()
+        const distance = 0.5 * (left + right)  // [mm]
+        // Mirrors beginNudgeWheels()'s own reduction in shims.cpp:
+        // rotation = (right - left) / effectiveTrackWidth().
+        const rotation =                                // [rad]
+            (right - left) / (simTrackWidth / simRotationalSlip)
+        simNudgeDistance = Math.round(distance)
+        simNudgeRotation = Math.round(rotation * 180 / Math.PI * 100)
+        if (simEstopped) return
+        simMoveRemainDist = Math.abs(distance)
+        simMoveRemainYaw = Math.abs(rotation)
+        let duration = 0
+        if (distance != 0) duration = Math.abs(distance) / kSimNudgeSpeed
+        if (rotation != 0) {
+            const yawDur = Math.abs(rotation) / kSimNudgeYawRate
+            if (yawDur > duration) duration = yawDur
+        }
+        if (duration <= 0) return
+        simVel = distance / duration
+        simYawRate = rotation / duration
+        simMoveActive = true
+    }
+
+    //% shim=diffDrive::beginNudgeTurn
+    export function _beginNudgeTurn(rotation: number): void {  // [cdeg]
+        simIntegrate()
+        simNudgeDistance = 0
+        simNudgeRotation = Math.round(rotation)
+        if (simEstopped) return
+        const rotationRadians = (rotation / 100) * Math.PI / 180
+        simMoveRemainDist = 0
+        simMoveRemainYaw = Math.abs(rotationRadians)
+        if (rotationRadians == 0) return
+        const duration = Math.abs(rotationRadians) / kSimNudgeYawRate
+        simVel = 0
+        simYawRate = rotationRadians / duration
+        simMoveActive = true
+    }
+
+    // Mirrors shims.cpp's nudgeActive(): "still in flight" for the
+    // block loop's own `while (_tickDrive() || _nudgeActive())`
+    // condition -- see nudge()'s doc comment (motion.ts) for why
+    // `_tickDrive()` alone is not enough on hardware. In the simulator
+    // both signals already agree (simMoveActive), so this is
+    // redundant with `_tickDrive()`'s own return here, but the two
+    // must stay separate shims so one program (and one loop
+    // expression) works unmodified on both hardware and the simulator.
+    //% shim=diffDrive::nudgeActive
+    export function _nudgeActive(): boolean {
+        simIntegrate()
+        return simMoveActive
+    }
+
+    //% shim=diffDrive::nudgeMeasuredDistance
+    export function _nudgeMeasuredDistance(): int32 {  // [mm]
+        simIntegrate()
+        return simNudgeDistance
+    }
+
+    //% shim=diffDrive::nudgeMeasuredRotation
+    export function _nudgeMeasuredRotation(): int32 {  // [cdeg]
+        simIntegrate()
+        return simNudgeRotation
+    }
+
     // [ms] -- Two shims, not one: a five-parameter shim annotation fails
     // the PXT packager (TS9200; the full account is on shims.cpp's
     // engineSetGoToDeadline()). Deadline is pre-armed here for the very

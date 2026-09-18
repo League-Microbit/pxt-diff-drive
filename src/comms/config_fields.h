@@ -134,6 +134,14 @@ constexpr ConfigFieldDescriptor kConfigFields[] = {
     // on: a block-issued go-to overwrites it.
     // ConfigField.GoToTimeout: "go-to timeout ms"
     {"goto_timeout", 39, "ms"},
+    // Nudge defaults 15%/2 ticks, cited on nudgeAmplitude() in
+    // motion_engine.h. 0 ms settle is UNVERIFIED.
+    // ConfigField.NudgeAmplitude: "nudge pulse amplitude %"
+    {"nudge_amplitude", 40, "%"},
+    // ConfigField.NudgeWidth: "nudge pulse width ticks"
+    {"nudge_width", 41, "ticks"},
+    // ConfigField.NudgeSettle: "nudge settle time ms"
+    {"nudge_settle", 42, "ms"},
 };
 
 constexpr int kConfigFieldCount =

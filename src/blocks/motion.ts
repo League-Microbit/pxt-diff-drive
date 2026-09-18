@@ -83,7 +83,13 @@ enum ConfigField {
     //% block="straight trim"
     StraightTrim = 38,
     //% block="go-to timeout ms"
-    GoToTimeout = 39
+    GoToTimeout = 39,
+    //% block="nudge pulse amplitude %"
+    NudgeAmplitude = 40,
+    //% block="nudge pulse width ticks"
+    NudgeWidth = 41,
+    //% block="nudge settle time ms"
+    NudgeSettle = 42
 }
 
 // Top-level, not inside the namespace: pxt renders an enum parameter as
@@ -304,6 +310,65 @@ namespace diffDrive {
     export function move(distance: number, yaw: number): void {
         startMove(distance, yaw)
         while (_tickDrive());
+    }
+
+    // ================= nudge mode: sub-floor micro-moves ==============
+    //
+    // Sub-floor micro-moves: repeated small duty pulses (motion_engine.h's
+    // settle-gated pulse stepper) instead of the closed-loop shaper, for
+    // corrections below move()'s own speed floor. Both blocks below
+    // return the ACTUALLY-MEASURED displacement, not the requested
+    // amount, so a caller (e.g. calibrateL, squaring to a floor line) can
+    // loop on what really happened.
+
+    /**
+     * Nudge each wheel by a small distance, forward (positive) or
+     * reverse (negative), using sub-floor duty pulses instead of the
+     * closed-loop shaper. Blocks until the pulse stepper reports done
+     * -- converged, out of pulse budget, or its own timeout -- then
+     * returns the ACTUALLY-MEASURED mean-axis displacement in mm, not
+     * the requested amount, so a caller can loop on the return value
+     * instead of trusting the command. Works forward and reverse.
+     *
+     * PRACTICAL RESOLUTION FLOOR: the accepted operating point is ONE
+     * pulse per step, about 1.79 mm (measured and cited on
+     * MotionEngine::nudgeAmplitude() in motion_engine.h). A
+     * `nudge(2, 2)` request is really a one-pulse request, not a
+     * promise of exactly 2.00 mm -- expect the return value to land
+     * near a multiple of ~1.8 mm. Do not ask for sub-mm precision;
+     * loop on the return value instead.
+     * @param left left wheel distance in mm, eg: 5
+     * @param right right wheel distance in mm, eg: 5
+     */
+    //% block="nudge left %left mm right %right mm"
+    //% group="Move" weight=415
+    export function nudge(left: number, right: number): number {
+        _beginNudgeWheels(Math.round(left), Math.round(right))
+        // tickDrive()'s return reflects isDriving()/applied duty, which a
+        // nudge pulse always settles to zero before returning -- so it
+        // reports "idle" every tick even mid-pulse-budget. Call it anyway
+        // (it paces the tick) but treat _nudgeActive() as the real
+        // termination signal.
+        while (_tickDrive() || _nudgeActive());
+        return _nudgeMeasuredDistance()  // [mm], matching left/right's own unit
+    }
+
+    /**
+     * Turn the robot by a small angle, CCW+, using sub-floor duty
+     * pulses instead of the closed-loop shaper. Same blocking/return
+     * contract as nudge() above -- see its doc comment for the
+     * practical resolution floor and why the loop is not a bare
+     * `while (_tickDrive())`. Returns the ACTUALLY-MEASURED rotation
+     * in degrees, not the requested amount. Works forward and reverse
+     * (either sign of deg).
+     * @param deg angle to turn CCW+, eg: 2
+     */
+    //% block="nudge turn %deg degrees"
+    //% group="Move" weight=405
+    export function nudgeTurn(deg: number): number {
+        _beginNudgeTurn(Math.round(deg * 100))
+        while (_tickDrive() || _nudgeActive());
+        return _nudgeMeasuredRotation() / 100
     }
 
     /**

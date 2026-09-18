@@ -350,6 +350,28 @@ class WireAdapter : public Wire::Adapter {
   // LEASE-STYLE branch has.
   bool motionObligationDeadlineLive() const;
 
+  // The diagnostic pulse primitive's own C++-native handler for `RUN
+  // pulse <ampLeft> <ampRight> <widthTicks> #<id>` -- intercepted
+  // directly inside onRun() (see
+  // that method's own comment) rather than routed through the TS
+  // run_registry/RunBridge every OTHER RUN name below goes through,
+  // because the characterization gate needs a SYNCHRONOUS result in
+  // the same round trip (`ret <text> #<id>`, wire_handler.cpp's
+  // execRun()) and the cleartext/registry path only ever dispatches to
+  // a TypeScript handler on a LATER tick, void by construction. `argv`
+  // are the RAW, unconverted tokens onRun() itself received. Refuses
+  // kBusy under the same externalOwner_ check every motion verb above
+  // uses (this call drives the wheels, same as WHEELS_V/WHEELS_X/
+  // MOVE_X/MOVE_V/GO_TO_R/GO_TO_W); kBadArg for a wrong argument count
+  // or an unparseable numeric token; kRange for a non-positive
+  // widthTicks. On kOk, formats both wheels' encoder-count delta AND
+  // its mm equivalent (the wire-layer countsPerMm() forward,
+  // shims.cpp) into `result` and sets
+  // hasResult.
+  Wire::Result execPulse(const char* const* argv, size_t argc,
+                         char* result, size_t resultCapacity,
+                         bool& hasResult);
+
   // Pure function of currently observable state (diagValue()'s estop/
   // stall flags; motionObligationDeadlineLive() for a LEASE-STYLE
   // pending motion; engineMoveActive()/engineMoveEndedByDeadline() for

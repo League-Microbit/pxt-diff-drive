@@ -111,6 +111,7 @@ MotionEngine::AxisLimits MotionEngine::axisLimits(const Segment& seg) const {
 void MotionEngine::cancelMove() {
   seg_ = Segment();
   hold_.active = false;
+  nudge_.active = false;
 }
 
 void MotionEngine::wheelsV(float left, float right, uint32_t duration) {
@@ -261,6 +262,7 @@ void MotionEngine::goToW(const PoseSource& pose, float x, float y,
 }
 
 bool MotionEngine::service() {
+  if (nudge_.active) return serviceNudge();
   if (!seg_.active && !hold_.active) return false;
 
   const DiffDrive::DifferentialDrive::Output out = kernel_.output();
@@ -420,17 +422,218 @@ void MotionEngine::endMove() {
   shaper_.reset();
 }
 
+bool MotionEngine::atRest(
+    const DiffDrive::DifferentialDrive::Output& out) const {
+  return out.velocityLeft < kSettleRestCountsPerS &&
+         out.velocityLeft > -kSettleRestCountsPerS &&
+         out.velocityRight < kSettleRestCountsPerS &&
+         out.velocityRight > -kSettleRestCountsPerS;
+}
+
 void MotionEngine::settleToRest() {
   for (int i = 0; i < kSettleMaxSteps; ++i) {
     kernel_.step();
-    const DiffDrive::DifferentialDrive::Output o = kernel_.output();
-    if (o.velocityLeft < kSettleRestCountsPerS &&
-        o.velocityLeft > -kSettleRestCountsPerS &&
-        o.velocityRight < kSettleRestCountsPerS &&
-        o.velocityRight > -kSettleRestCountsPerS) {
-      break;
-    }
+    if (atRest(kernel_.output())) break;
   }
+}
+
+MotionEngine::PulseResult MotionEngine::firePulseAndSettle(
+    float ampLeft, float ampRight, int32_t widthTicks) {
+  const DiffDrive::DifferentialDrive::Output before = kernel_.output();
+  const float leftStart = before.positionLeft;
+  const float rightStart = before.positionRight;
+
+  // Re-armed every iteration, immediately before THAT iteration's own
+  // step() -- generous relative to one cycle so the command can never
+  // expire mid-pulse (this method's own header comment, motion_engine.h,
+  // via pulseWheels()'s original one). Not a safety weakening: E-stop/
+  // leaseExpired are evaluated fresh by the kernel's own controlStep()
+  // on every tick regardless of what this lease says, so an E-stop
+  // engaged mid-loop still forces neutral on its very next step() even
+  // though this loop keeps re-arming.
+  const uint32_t lease = 2u * kernel_.config().cyclePeriod;  // [ms]
+  const int32_t ticks = widthTicks > 0 ? widthTicks : 0;
+  for (int32_t i = 0; i < ticks; ++i) {
+    kernel_.driveDuty(ampLeft, ampRight, lease);
+    kernel_.step();
+  }
+
+  // Hard zero: only STAGED here -- kModeNeutral's own controlStep()
+  // branch calls stageStop() (== stageDuty(0, 0)), the same exact-zero
+  // write path a commanded zero from anywhere else takes (no slew, no
+  // throttle), but it only reaches the motors on a LATER step(), same
+  // as every other primitive's neutral(). settleToRest() below is what
+  // delivers it -- its own first internal step is the handoff moment,
+  // exactly as it is for a Segment's arrival (see that method's own
+  // comment). A direction flip versus the PREVIOUS pulse this call (or
+  // serviceNudge()'s previous fire) pays the port's own reversal dwell
+  // here, transparently -- this call issues no extra dwell of its own,
+  // same driveDuty()-then-settle shape regardless of sign (the dwell
+  // itself is nezha_port.cpp:236-250; the settle loop below absorbs
+  // whatever real-hardware delay it adds, it does not need to know it
+  // happened).
+  kernel_.neutral();
+  settleToRest();
+
+  const DiffDrive::DifferentialDrive::Output after = kernel_.output();
+  return PulseResult{after.positionLeft - leftStart,
+                     after.positionRight - rightStart};
+}
+
+MotionEngine::PulseResult MotionEngine::pulseWheels(float ampLeft,
+                                                     float ampRight,
+                                                     int32_t widthTicks) {
+  kernel_.clearStallLatch();  // a new command gets its own attempt, same
+                               // as every other primitive here
+  cancelMove();
+  return firePulseAndSettle(ampLeft, ampRight, widthTicks);
+}
+
+void MotionEngine::beginNudge(float distance, float rotation,
+                              uint32_t timeout) {  // [mm] [rad] [ms]
+  kernel_.clearStallLatch();  // a new command gets its own attempt
+  cancelMove();
+
+  const float cpm = countsPerMm();
+  const float distTarget = distance * cpm;
+  const float yawTarget = rotation * 0.5f * effectiveTrackWidth() * cpm;
+  if (distTarget == 0.0f && yawTarget == 0.0f) {
+    // Nothing new to command, but still stop anything already moving --
+    // same "zero magnitude still stops" contract beginSegment() gives
+    // wheelsX()/moveX().
+    kernel_.neutral();
+    return;
+  }
+
+  // Origin captured NOW, synchronously -- see the Nudge struct's own
+  // comment (motion_engine.h) for why this differs from Segment's lazy
+  // originPending capture.
+  const DiffDrive::DifferentialDrive::Output out = kernel_.output();
+  nudge_.distTarget = distTarget;
+  nudge_.yawTarget = yawTarget;
+  nudge_.posLeft0 = out.positionLeft;
+  nudge_.posRight0 = out.positionRight;
+  nudge_.deadline = now() + timeout;
+  nudge_.pulsesFired = 0;
+  nudge_.lastDistStep = 0.0f;
+  nudge_.lastYawStep = 0.0f;
+  nudge_.readyAt = 0;
+  nudge_.active = true;
+}
+
+bool MotionEngine::serviceNudge() {
+  const DiffDrive::DifferentialDrive::Output out = kernel_.output();
+  const uint32_t nowVal = now();
+  const float cpm = countsPerMm();
+
+  // E-stop/lease expiry already force the KERNEL to neutral through its
+  // own controlStep() (checkCommandable(), diffdrive.cpp) regardless of
+  // anything below -- this just ends the nudge promptly instead of
+  // spending pulse budget on commands the kernel is silently refusing.
+  if (out.estopped) {
+    kernel_.neutral();
+    nudge_.active = false;
+    return false;
+  }
+
+  const float dLeft = out.positionLeft - nudge_.posLeft0;
+  const float dRight = out.positionRight - nudge_.posRight0;
+  // Re-read from encoder counts every tick -- never carried/accumulated
+  // state (this ticket's own "that ledger IS the feature").
+  const float distRemain = nudge_.distTarget - 0.5f * (dLeft + dRight);
+  const float yawRemain = nudge_.yawTarget - 0.5f * (dRight - dLeft);
+
+  // Margin reuses the engine's own arrival tolerances (arriveDist/
+  // arriveYaw, ordinals 35/36) rather than adding a fourth nudge-only
+  // config field -- the ticket's own field list is amplitude/width/
+  // settle, exactly three. arriveYaw is converted into the SAME
+  // half-differential-counts frame yawTarget itself is in, via the
+  // identical rotation->yawTarget formula beginNudge() uses.
+  const float kDegToRad = 3.14159265f / 180.0f;
+  const float distMargin = limits_.arriveDist * cpm;
+  const float yawMargin =
+      limits_.arriveYaw * kDegToRad * 0.5f * effectiveTrackWidth() * cpm;
+
+  // An axis counts as CONVERGED either when it is within its own margin,
+  // or -- stop within one step of target rather than overshoot and
+  // correct -- once a pulse has actually been measured on that axis,
+  // when firing AGAIN is more likely to overshoot PAST the target than
+  // to land closer to it (a single pulse is ~0.9 deg at the accepted
+  // operating point cited on nudgeAmplitude() in motion_engine.h, close
+  // enough to calibrateL's 1 deg tolerance that one extra pulse misses
+  // it). Each axis tracks its own last-measured step (lastDistStep/
+  // lastYawStep) since a combined nudge can converge one axis pulses
+  // before the other.
+  const bool distDone = std::fabs(distRemain) <= distMargin;
+  const bool yawDone = std::fabs(yawRemain) <= yawMargin;
+  const bool distConverged =
+      distDone || (nudge_.lastDistStep > 0.0f &&
+                   std::fabs(distRemain) < 0.5f * nudge_.lastDistStep);
+  const bool yawConverged =
+      yawDone || (nudge_.lastYawStep > 0.0f &&
+                  std::fabs(yawRemain) < 0.5f * nudge_.lastYawStep);
+  if (distConverged && yawConverged) {
+    kernel_.neutral();
+    nudge_.active = false;
+    return false;
+  }
+
+  // A pure straight nudge (yawTarget == 0) or a pure turn (distTarget ==
+  // 0) always has its one live axis converged-false until reached and
+  // the other converged-true from the start, so the choice below
+  // degenerates to exactly that axis for both nudge()/nudgeTurn() calls.
+  // A combined nudge (both axes nonzero, e.g. an
+  // uneven nudge(leftMm, rightMm)) corrects whichever UNCONVERGED axis
+  // is relatively FARTHER from its own margin this pulse, in units of
+  // "how many margins away", so neither axis starves the other across
+  // successive pulses.
+  const float distRatio = distDone ? 0.0f : std::fabs(distRemain) / distMargin;
+  const float yawRatio = yawDone ? 0.0f : std::fabs(yawRemain) / yawMargin;
+  const bool fireYaw = !yawConverged && (distConverged || yawRatio >= distRatio);
+
+  const bool expired = static_cast<int32_t>(nowVal - nudge_.deadline) >= 0;
+  if (expired || nudge_.pulsesFired >= kMaxNudgePulses) {
+    kernel_.neutral();
+    nudge_.active = false;
+    return false;
+  }
+
+  // Fire only when both wheels already read at rest (atRest(), the same
+  // test settleToRest() uses) -- otherwise wait for a later tick without
+  // spending any of the pulse budget. Also honors the operator-tunable
+  // settle-time gate (nudgeSettle()) on top of the encoder-velocity
+  // test.
+  if (!atRest(out)) return true;
+  if (static_cast<int32_t>(nowVal - nudge_.readyAt) < 0) return true;
+
+  float ampLeft, ampRight;
+  const float amp = nudgeAmplitude_;
+  if (fireYaw) {
+    // Matches beginSegment()'s own yawTarget sign convention exactly
+    // (left = distTarget - yawTarget, right = distTarget + yawTarget):
+    // a positive (CCW) yaw remaining needs the right wheel forward, the
+    // left wheel backward.
+    const float sign = yawRemain > 0.0f ? 1.0f : -1.0f;
+    ampLeft = -sign * amp;
+    ampRight = sign * amp;
+  } else {
+    const float sign = distRemain > 0.0f ? 1.0f : -1.0f;
+    ampLeft = sign * amp;
+    ampRight = sign * amp;
+  }
+
+  kernel_.clearStallLatch();  // this pulse gets its own stall attempt,
+                              // same as every other primitive here
+  const PulseResult step =
+      firePulseAndSettle(ampLeft, ampRight, nudgeWidthTicks_);
+  if (fireYaw) {
+    nudge_.lastYawStep = std::fabs(0.5f * (step.right - step.left));
+  } else {
+    nudge_.lastDistStep = std::fabs(0.5f * (step.left + step.right));
+  }
+  nudge_.readyAt = now() + static_cast<uint32_t>(nudgeSettle_);
+  ++nudge_.pulsesFired;
+  return true;
 }
 
 int MotionEngine::progress() const {
