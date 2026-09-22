@@ -49,20 +49,11 @@ namespace diffDrive {
 // DifferentialDrive::begin()'s boot zero-write) is created LAZILY on
 // the first motion command, so a rebooted board that nobody commands
 // would leave the brick driving.
-extern "C" void diffdrive_emergency_motor_stop() {
-  // Same frame shape as NezhaMotorPort::writeFrame(), inlined so this
-  // needs no instance: {0xFF, 0xF9, port, arg, reg, val, 0xF5, 0x00}.
-  for (uint8_t port = 1; port <= 2; ++port) {
-    uint8_t frame[8] = {0xFF, 0xF9, port, NezhaMotorPort::kDirCw,
-                        NezhaMotorPort::kRegMotorRun, 0x00, 0xF5, 0x00};
-#if MICROBIT_CODAL
-    uBit.i2c.write(NezhaMotorPort::kAddress << 1, frame, 8);
-#else
-    uBit.i2c.write(NezhaMotorPort::kAddress << 1,
-                   reinterpret_cast<char*>(frame), 8);
-#endif
-  }
-}
+//
+// DEFINED per-board in board_nezha.cpp now (a different board's frame
+// at this same address would be wrong); the fault handlers below stay
+// board-generic and reach it through this declaration either way.
+extern "C" void diffdrive_emergency_motor_stop();
 
 // ---- fail-safe fault handlers ---------------------------------------
 //
@@ -517,6 +508,29 @@ void NezhaMotorPort::configureShaping(float outputDeadband,
   reversalDwell_ = reversalDwell;
   slewRate_ = slewRate;
   writeThrottle_ = writeThrottle;
+}
+
+// Board-generic diag hook: ordinal -> field, host-portable (no I2C, no
+// pxt.h). See maxDrivenStreak_/glitchCount_/rebaselineCount_ above and
+// wiredPort()/wiredSign()/rawCount() in nezha_port.h for what each
+// ordinal reads.
+int nezhaBoardDiagValue(const NezhaMotorPort& left, const NezhaMotorPort& right,
+                        int ordinal) {
+  switch (ordinal) {
+    case 21: return static_cast<int>(left.maxDrivenStreak_);
+    case 22: return static_cast<int>(right.maxDrivenStreak_);
+    case 23: return static_cast<int>(left.glitchCount_);
+    case 24: return static_cast<int>(right.glitchCount_);
+    case 27:
+      return static_cast<int>(left.rebaselineCount_ + right.rebaselineCount_);
+    case 35: return static_cast<int>(left.wiredPort());
+    case 36: return static_cast<int>(left.wiredSign());
+    case 37: return static_cast<int>(right.wiredPort());
+    case 38: return static_cast<int>(right.wiredSign());
+    case 39: return static_cast<int>(left.rawCount());
+    case 40: return static_cast<int>(right.rawCount());
+    default: return 0;
+  }
 }
 
 }  // namespace diffDrive

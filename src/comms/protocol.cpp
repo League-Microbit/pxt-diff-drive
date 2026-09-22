@@ -2,6 +2,7 @@
 #include "protocol.h"
 
 #include "../core/fiber_identity.h"
+#include "../platform/board.h"
 #include "../platform/vfp_guard.h"
 #include "reply_backpressure.h"
 #include "wifi_credential_store.h"  // wifiCredentialStore(): the shared
@@ -87,7 +88,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20260919.1";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20260921.1";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 
@@ -97,7 +98,28 @@ constexpr const char* kVersion = "1.20260919.1";  // baked by config/hooks/versi
 // make_deploy.py's `_inject_profile()` regex matches only the exact
 // name `kProfile`, so this is safe, but re-check before adding a third
 // `k*Profile`-adjacent name.
+//
+// kRole is selected by DIFFDRIVE_BOARD (platform/board.h) rather than a
+// single literal, since the HELLO banner's role string is one of the
+// sites that leaks which physical board a build targets above its
+// Motor port. The Nezha branch's literal text is UNCHANGED (still
+// exactly `constexpr const char* kRole = "NEZHA2";`), so an existing
+// `--board nezha`/default build's banner is byte-identical; only a
+// build actually selecting a different board would ever compile the
+// #else branch below. Everything downstream of kRole (the constructor
+// seed, setDeviceRole()'s runtime override, sendBanner()'s read of
+// roleBuf_) is unchanged.
+#if DIFFDRIVE_BOARD == DIFFDRIVE_BOARD_NEZHA
 constexpr const char* kRole = "NEZHA2";
+#elif DIFFDRIVE_BOARD == DIFFDRIVE_BOARD_CUTEBOT_PRO
+// The Cutebot Pro's own HELLO banner role. UNVERIFIED against a
+// real board (no Cutebot has answered a HELLO yet) -- this is a
+// naming choice, not a measurement, and is easy to change before
+// real bring-up if the stakeholder wants something else.
+constexpr const char* kRole = "CUTEBOTPRO";
+#else
+#error "protocol.cpp: kRole has no definition for this DIFFDRIVE_BOARD selection"
+#endif
 constexpr const char* kCommonName = "robot";
 
 // WiFi credentials, injected into the SCRATCH COPY ONLY by

@@ -11,9 +11,27 @@ namespace diffDrive {
 
 class VelocityShaper {
  public:
+  // WheelCommandTap's own phase signal (the Cutebot Pro support design
+  // doc's "where the velocity setpoint comes from" section), derived
+  // here rather than handed a second channel of its own -- see
+  // advance()'s own comment for exactly where each value is decided.
+  // Does not feed back into v_/a_/vCmd/arriving: adding it changes no
+  // shaping behaviour, only what a caller can additionally read off a
+  // Step.
+  enum class Phase : uint8_t {
+    kAccel,   // still ramping toward this tick's goal
+    kCruise,  // holding at the goal; not bounded by the stop-distance
+              // brake budget below
+    kBrake,   // this tick's goal is bounded by the brake-to-stop budget
+              // (remain-driven), not by the segment's target/cap -- a
+              // short move whose target is never reachable is kBrake
+              // from its very first tick, never kCruise
+  };
+
   struct Step {
     float vCmd;     // [mm/s] what to command the dominant wheel this tick
     bool arriving;  // true when this is the LAST nonzero tick
+    Phase phase;    // this tick's accel/cruise/brake classification
   };
 
   // v = 0, a = 0. Called at every segment start.

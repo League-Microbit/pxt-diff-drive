@@ -18,6 +18,7 @@
 #include "motion_limits.h"
 #include "segment.h"
 #include "velocity_shaper.h"
+#include "wheel_command_tap.h"
 
 namespace diffDrive {
 
@@ -373,6 +374,17 @@ class MotionEngine {
   MotionLimits& limits() { return limits_; }
   const MotionLimits& limits() const { return limits_; }
 
+  // An optional, nullable observer notified with the shaped per-wheel
+  // (left, right) mm/s alongside every
+  // kernel_.drive() call, and "neutral" alongside every kernel_.neutral()
+  // call -- see wheel_command_tap.h for the exact contract. `tap` is
+  // NOT owned; the caller (shims.cpp's Rig, for a board that wants one)
+  // keeps it alive for at least as long as it stays installed. Passing
+  // nullptr uninstalls it. No board installs one today -- the Nezha
+  // fleet's behaviour is unaffected by this method's mere existence.
+  void setWheelCommandTap(WheelCommandTap* tap) { tap_ = tap; }
+  WheelCommandTap* wheelCommandTap() const { return tap_; }
+
  private:
   // [rad] 50 deg. goToR() only: at or above this arc angle, pivot to the
   // bearing first, then drive the chord. Inherited from a go-to-a-point
@@ -482,8 +494,29 @@ class MotionEngine {
   // primitive's "clear the planner" step, and endMove()'s tail.
   void cancelMove();
 
+  // The two notify wrappers every kernel_.drive()/kernel_.neutral() call
+  // site in this file pairs itself with -- a single null check each, so
+  // the no-tap (Nezha) path costs one branch and nothing else.
+  // notifyDrive()'s (left, right) match kernel_.drive()'s own internal
+  // velocity-twist split (rawLeft = velocity - twist, rawRight =
+  // velocity + twist, diffdrive.cpp) applied to the SAME (velocity,
+  // twist) mm/s this call site is handing the kernel -- never a
+  // separately-derived number.
+  void notifyDrive(float left,   // [mm/s]
+                   float right,  // [mm/s]
+                   VelocityShaper::Phase phase) {
+    if (tap_) tap_->onDrive(left, right, phase);
+  }
+  void notifyNeutral() {
+    if (tap_) tap_->onNeutral();
+  }
+
   DiffDrive::DifferentialDrive& kernel_;
   const DiffDrive::Clock& clock_;
+
+  // Not owned; nullptr (no tap) by default -- see
+  // setWheelCommandTap()'s own comment above.
+  WheelCommandTap* tap_ = nullptr;
 
   // Geometry defaults are the measured tovez/vevov bake. The measurements
   // and their derivations are in DESIGN.md; generic kits recalibrate

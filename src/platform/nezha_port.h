@@ -79,7 +79,7 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   int32_t rawCount() const { return glitchArmor_.lastGoodRaw(); }
 
   // PUBLIC so the fault-context emergency stop
-  // (diffdrive_emergency_motor_stop(), nezha_port.cpp) can build the
+  // (diffdrive_emergency_motor_stop(), board_nezha.cpp) can build the
   // same wire frame without an instance -- see its own comment for why
   // that path cannot use any object state. Values unchanged.
   static constexpr uint8_t kAddress = 0x10;      // 7-bit I2C address
@@ -159,5 +159,10 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   bool wedgeLatched_ = false;
   bool wedgeSuspect_ = false;
 };
+
+// diagValue() ordinals 21/22/23/24/27/35-40's field mapping, callable
+// with no I2C and no singleton -- board_nezha.cpp's boardDiagValue().
+int nezhaBoardDiagValue(const NezhaMotorPort& left, const NezhaMotorPort& right,
+                        int ordinal);
 
 }  // namespace diffDrive

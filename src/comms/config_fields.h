@@ -142,6 +142,11 @@ constexpr ConfigFieldDescriptor kConfigFields[] = {
     {"nudge_width", 41, "ticks"},
     // ConfigField.NudgeSettle: "nudge settle time ms"
     {"nudge_settle", 42, "ms"},
+    // CutebotActuationPolicy's mode -- see platform/cutebot_actuation_policy.h.
+    // ConfigField.OnboardPid: "onboard actuation mode"
+    {"onboard_pid", 43, "1"},
+    // ConfigField.OnboardFloor: "onboard actuation floor mm/s"
+    {"onboard_floor", 44, "mm/s"},
 };
 
 constexpr int kConfigFieldCount =

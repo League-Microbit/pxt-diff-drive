@@ -89,7 +89,11 @@ enum ConfigField {
     //% block="nudge pulse width ticks"
     NudgeWidth = 41,
     //% block="nudge settle time ms"
-    NudgeSettle = 42
+    NudgeSettle = 42,
+    //% block="onboard actuation mode"
+    OnboardPid = 43,
+    //% block="onboard actuation floor mm/s"
+    OnboardFloor = 44
 }
 
 // Top-level, not inside the namespace: pxt renders an enum parameter as

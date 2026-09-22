@@ -47,6 +47,12 @@ VelocityShaper::Step VelocityShaper::advance(float target, float remain,
   // delivered -- and the host sim cannot show that, because its plant IS
   // a first-order lag with tau equal to the configured lag.
   float vGoal;
+  // WheelCommandTap's phase signal is decided right here, the one
+  // place that already knows whether the brake budget (vBrake) or the
+  // plain target/cap ceiling governs this tick's goal -- see the Phase
+  // enum's own comment (velocity_shaper.h) for what each value means.
+  // Read-only: does not change vGoal itself.
+  bool brakeLimited = false;
   if (remain >= 0.0f) {
     const float usable0 =
       remain - lim.stopDistance - vPrev * dt - vAct * lim.lag;
@@ -55,6 +61,7 @@ VelocityShaper::Step VelocityShaper::advance(float target, float remain,
       ? 0.5f * lim.decel * lim.decel / lim.jerk : 0.0f;
     const float vBrake = std::sqrt(rounding * rounding +
                     2.0f * lim.decel * usable) - rounding;
+    brakeLimited = vBrake < target;
     vGoal = target < vBrake ? target : vBrake;
     if (cap < vGoal) vGoal = cap;
   } else {
@@ -145,7 +152,21 @@ VelocityShaper::Step VelocityShaper::advance(float target, float remain,
   v_ = vNext;
   a_ = dt > 0.0f ? (vNext - vPrev) / dt : 0.0f;
 
-  return Step{v_, arriving};
+  // Phase, decided last so it reflects the FINAL vNext (post rate/jerk
+  // limit and the legacy-floor bump above), against the SAME vGoal step
+  // 1 computed. kPhaseEpsilon absorbs float roundoff from the sqrt/
+  // copysign arithmetic above -- not a tuning knob.
+  constexpr float kPhaseEpsilon = 1e-3f;  // [mm/s]
+  Phase phase;
+  if (brakeLimited) {
+    phase = Phase::kBrake;
+  } else if (vNext + kPhaseEpsilon < vGoal) {
+    phase = Phase::kAccel;
+  } else {
+    phase = Phase::kCruise;
+  }
+
+  return Step{v_, arriving, phase};
 }
 
 float VelocityShaper::velocity() const { return v_; }

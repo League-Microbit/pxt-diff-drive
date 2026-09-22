@@ -153,6 +153,7 @@ void MotionEngine::beginSegment(float distTarget, float yawTarget,
   if (dominant <= 0.0f || cruise <= 0.0f) {
     // Nothing new to command, but still stop anything already moving.
     kernel_.neutral();
+    notifyNeutral();
     return;
   }
 
@@ -316,7 +317,7 @@ bool MotionEngine::service() {
             ? std::fabs(0.5f * (out.velocityRight - out.velocityLeft) / cpm)
             : std::fabs(0.5f * (out.velocityLeft + out.velocityRight) / cpm));
     const VelocityShaper::Step step = seg_.settling
-      ? VelocityShaper::Step{0.0f, true}
+      ? VelocityShaper::Step{0.0f, true, VelocityShaper::Phase::kBrake}
       : shaper_.advance(target, remain, al.floor, al.cap, dt, limits_, vAct);
 
     // Trust wrongWay() only once the yaw axis has genuinely moved.
@@ -331,12 +332,14 @@ bool MotionEngine::service() {
       lastSegmentEndedByDeadline_ = expired && !wrongWay && !out.stallHalted &&
                                     !out.estopped;
       kernel_.neutral();
+      notifyNeutral();
       seg_ = Segment();
       return false;
     }
 
     if (step.arriving) {
       kernel_.neutral();
+      notifyNeutral();
       if (limits_.lag > 0.0f) {
         const bool fresh = out.sampleTimeLeft != seg_.restSampleLeft &&
                            out.sampleTimeRight != seg_.restSampleRight;
@@ -366,6 +369,7 @@ bool MotionEngine::service() {
     const float twist = (seg_.yawTarget / seg_.dominant) * step.vCmd;
     const DiffDrive::DifferentialDrive::Status driveStatus =
         kernel_.drive(velocity * cpm, twist * cpm, 500u, limits_.lag);
+    notifyDrive(velocity - twist, velocity + twist, step.phase);
     // Because no entry point drives synchronously, a refused command can
     // only be discovered here. Without this check a permanently-refused
     // drive would re-issue every tick and spin out the whole deadline
@@ -373,6 +377,7 @@ bool MotionEngine::service() {
     if (driveStatus != DiffDrive::DifferentialDrive::Status::kOk) {
       lastSegmentEndedByDeadline_ = false;
       kernel_.neutral();
+      notifyNeutral();
       seg_ = Segment();
       return false;
     }
@@ -385,12 +390,14 @@ bool MotionEngine::service() {
   // kLeaseMax), and a `while (driveTick())` loop spins over a halted robot.
   if (out.stallHalted) {
     kernel_.neutral();
+    notifyNeutral();
     hold_.active = false;
     return false;
   }
   const bool holdExpired = static_cast<int32_t>(nowVal - hold_.until) >= 0;
   if (holdExpired) {
     kernel_.neutral();
+    notifyNeutral();
     hold_.active = false;
     return false;
   }
@@ -404,8 +411,10 @@ bool MotionEngine::service() {
   const float twist = hold_.twist * scale;
   const DiffDrive::DifferentialDrive::Status holdDriveStatus =
       kernel_.drive(velocity * cpm, twist * cpm, 500u, limits_.lag);
+  notifyDrive(velocity - twist, velocity + twist, step.phase);
   if (holdDriveStatus != DiffDrive::DifferentialDrive::Status::kOk) {
     kernel_.neutral();
+    notifyNeutral();
     hold_.active = false;
     return false;
   }
@@ -416,7 +425,10 @@ void MotionEngine::endMove() {
   // An explicit external end is never a timeout, but a no-op call must not
   // overwrite a still-meaningful earlier verdict.
   if (seg_.active) lastSegmentEndedByDeadline_ = false;
-  if (seg_.active || hold_.active) kernel_.neutral();
+  if (seg_.active || hold_.active) {
+    kernel_.neutral();
+    notifyNeutral();
+  }
   seg_ = Segment();
   hold_ = Hold();
   shaper_.reset();
@@ -473,6 +485,7 @@ MotionEngine::PulseResult MotionEngine::firePulseAndSettle(
   // whatever real-hardware delay it adds, it does not need to know it
   // happened).
   kernel_.neutral();
+  notifyNeutral();
   settleToRest();
 
   const DiffDrive::DifferentialDrive::Output after = kernel_.output();
@@ -502,6 +515,7 @@ void MotionEngine::beginNudge(float distance, float rotation,
     // same "zero magnitude still stops" contract beginSegment() gives
     // wheelsX()/moveX().
     kernel_.neutral();
+    notifyNeutral();
     return;
   }
 
@@ -532,6 +546,7 @@ bool MotionEngine::serviceNudge() {
   // spending pulse budget on commands the kernel is silently refusing.
   if (out.estopped) {
     kernel_.neutral();
+    notifyNeutral();
     nudge_.active = false;
     return false;
   }
@@ -574,6 +589,7 @@ bool MotionEngine::serviceNudge() {
                   std::fabs(yawRemain) < 0.5f * nudge_.lastYawStep);
   if (distConverged && yawConverged) {
     kernel_.neutral();
+    notifyNeutral();
     nudge_.active = false;
     return false;
   }
@@ -594,6 +610,7 @@ bool MotionEngine::serviceNudge() {
   const bool expired = static_cast<int32_t>(nowVal - nudge_.deadline) >= 0;
   if (expired || nudge_.pulsesFired >= kMaxNudgePulses) {
     kernel_.neutral();
+    notifyNeutral();
     nudge_.active = false;
     return false;
   }
