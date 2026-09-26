@@ -88,7 +88,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20260921.1";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20260925.1";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 
@@ -295,6 +295,11 @@ void Protocol::enableRadio() { radioTransport_.enable(); }
 
 void Protocol::enableWifi() { wifiEnabled_ = true; }
 
+void Protocol::enableStoredWifi() {
+  wifiStoreOnly_ = true;
+  enableWifi();
+}
+
 void Protocol::setupWifi(const char* ssid, const char* password) {
   if (ssid == nullptr) return;
 
@@ -471,6 +476,8 @@ void Protocol::emitWifiDebug() {
       ssidField = wifiJoinSequencer_.currentSsid();
       haspwField = wifiJoinSequencer_.currentHasPassword();
     }
+  } else if (wifiStoreOnly_) {
+    // An empty store is an intentional no-credential state in this mode.
   } else if (wifiCredsExplicit_) {
     if (wifiSsid_[0] != '\0') {
       ssidField = wifiSsid_;
@@ -546,6 +553,10 @@ void Protocol::serviceWifi() {
       // local `config` are left at Config's own defaults ("") and
       // ignored, since begin() below never reaches wifiLink_ directly.
       wifiJoinSequencer_.begin(config);
+    } else if (wifiStoreOnly_) {
+      config.ssid = "";
+      config.password = "";
+      wifiLink_.begin(config);
     } else if (wifiCredsExplicit_) {
       // A program called setupWifi() before the link began -- use its
       // stored credentials (possibly an explicit "", which
@@ -1156,5 +1167,8 @@ void enableRadioLink() { protocol().enableRadio(); }
 // the WiFi twin of enableRadioLink() just above.
 //%
 void enableWifiLink() { protocol().enableWifi(); }
+
+//%
+void enableStoredWifiLink() { protocol().enableStoredWifi(); }
 
 }  // namespace diffDrive

@@ -203,6 +203,9 @@ class Protocol {
   // name, which is only safe to read there (see buildIdentity()).
   void enableWifi();
 
+  // Enable WiFi only when credentials are present in the flash store.
+  void enableStoredWifi();
+
   // Runtime alternative to the deploy-time bake: copies (clipped,
   // truncation recorded) into wifiSsid_/wifiPassword_ and calls
   // enableWifi() -- one call stores AND enables. `setupWifi("")` is a
@@ -483,6 +486,7 @@ class Protocol {
   // records that serviceWifi() has already handed wifiLink_ its config
   // on this fiber.
   bool wifiEnabled_ = false;
+  bool wifiStoreOnly_ = false;
   bool wifiBegun_ = false;
   uint32_t lastWifiDbg_ = 0;  // [ms]
 

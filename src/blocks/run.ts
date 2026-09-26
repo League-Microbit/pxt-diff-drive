@@ -291,6 +291,15 @@ namespace diffDrive {
     }
 
     /**
+     * Bring up WiFi using only credentials provisioned with WIFICRED.
+     * An empty store leaves the link disabled; reset after provisioning.
+     */
+    //% blockHidden=true
+    export function enableStoredWifiLink(): void {
+        _enableStoredWifiLink()
+    }
+
+    /**
      * Send a line of text back to the computer, tagged as debug output.
      * It shows up in the console as `DBG:` followed by your text.
      *

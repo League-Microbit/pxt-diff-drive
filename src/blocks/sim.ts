@@ -678,4 +678,9 @@ namespace diffDrive {
         // No simulator model of the WiFi module: a no-op here, exactly
         // as the radio link is a flag with no behaviour behind it.
     }
+
+    //% shim=diffDrive::enableStoredWifiLink
+    export function _enableStoredWifiLink(): void {
+        // No simulator model of the WiFi module.
+    }
 }
