@@ -201,10 +201,59 @@ namespace diffDrive {
      * @param group radio group, eg: 10
      */
     //% block="setup radio channel %channel group %group"
-    //% group="Setup" weight=90
+    //% group="Setup" weight=100
     //% subcategory="Setup"
     export function setupRadio(channel: number, group: number = 10): void {
         _setupRadio(Math.round(channel), Math.round(group))
+    }
+
+    /**
+     * Turn on the v6 wire protocol over the radio, on the channel and
+     * group that belong to a robot's five-letter name -- so nobody has
+     * to look the numbers up. Same effect as `setup radio channel
+     * group`, and the same warning: MakeCode's own radio blocks stop
+     * working in this program.
+     *
+     * Leave the name empty to use this micro:bit's own name, which is
+     * what a robot almost always wants. If the name is not a robot name
+     * (five letters, alternating zvgpt and uoiea, like "tigez"), the
+     * radio is left alone and the screen shows an X.
+     * @param name robot name, or empty for this micro:bit's own name
+     */
+    //% block="setup radio channel for robot %name"
+    //% group="Setup" weight=90
+    //% subcategory="Setup"
+    export function setupRadioForName(name: string = ""): void {
+        const address = radioAddressForName(name == "" ? control.deviceName() : name)
+        if (address.length != 2) {
+            basic.showIcon(IconNames.No)
+            return
+        }
+        _setupRadio(address[0], address[1])
+    }
+
+    /**
+     * [channel, group] for a five-letter robot name, or [] if it is not
+     * one. NORMATIVE SPEC: radio-robot-lib's radio-addressing design
+     * doc -- the name is DEVICEID[1] in base 5 (consonants zvgpt at positions
+     * 0/2/4, vowels uoiea at 1/3, first letter most significant), then
+     * channel = 11 + n % 73 and group = 15 + n % 241. The relay's `!N`,
+     * mbregistry and robot-console compute the same pair; change this
+     * only with the spec.
+     */
+    //% blockHidden=true
+    export function radioAddressForName(name: string): number[] {
+        const consonants = "zvgpt"
+        const vowels = "uoiea"
+        if (name.length != 5) return []
+        let n = 0
+        for (let i = 0; i < 5; i++) {
+            const alphabet = i % 2 == 0 ? consonants : vowels
+            const digit = alphabet.indexOf(name.charAt(i).toLowerCase())
+            if (digit < 0) return []
+            n = n * 5 + digit
+        }
+        return [11 + n % 73, 15 + n % 241]
     }
 
     /**

@@ -5,7 +5,7 @@ namespace diffDrive {
      * Stop driving (normal stop).
      */
     //% block="stop"
-    //% group="Stop" weight=270
+    //% group="Stop" weight=290
     export function stop(): void {
         _stopAll()
     }
@@ -14,7 +14,7 @@ namespace diffDrive {
      * Emergency stop: latch off until clearEmergencyStop().
      */
     //% block="emergency stop"
-    //% group="Stop" weight=280
+    //% group="Stop" weight=300
     export function emergencyStop(): void {
         _estopAll()
     }
@@ -23,7 +23,7 @@ namespace diffDrive {
      * Clear the emergency-stop latch.
      */
     //% block="clear emergency stop"
-    //% group="Stop" weight=260
+    //% group="Stop" weight=280
     export function clearEmergencyStop(): void {
         _estopClear()
     }
@@ -38,7 +38,7 @@ namespace diffDrive {
      * stall model in the browser.
      */
     //% block="is stalled"
-    //% group="Moving?" weight=310
+    //% group="Moving?" weight=320
     export function isStalled(): boolean {
         return _isStalled()
     }
@@ -51,7 +51,7 @@ namespace diffDrive {
      * nothing stalled.
      */
     //% block="clear stall latch"
-    //% group="Stop" weight=250
+    //% group="Stop" weight=270
     export function clearStallLatch(): void {
         _clearStallLatch()
     }
