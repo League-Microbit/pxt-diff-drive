@@ -143,11 +143,70 @@ namespace diffDrive {
         control.reset()
     }
 
+    // The stored WiFi address as one number, a*2^24 + b*2^16 + c*2^8 + d.
+    // A `settings` system key, like the calibration keys.
+    const wifiAddressKey = "#net.ip"
+
+    function storedWifiAddress(): number[] {
+        if (!settings.exists(wifiAddressKey)) return []
+        const packed = settings.readNumber(wifiAddressKey)
+        if (!(packed > 0)) return []
+        return [
+            Math.floor(packed / 16777216) % 256,
+            Math.floor(packed / 65536) % 256,
+            Math.floor(packed / 256) % 256,
+            packed % 256,
+        ]
+    }
+
+    function dotted(address: number[]): string {
+        return address.length == 4
+            ? address[0] + "." + address[1] + "." + address[2] + "." + address[3]
+            : "-"
+    }
+
+    /** Report the WiFi address this robot uses and where it comes from. */
+    function reportWifiAddress(): void {
+        const stored = storedWifiAddress()
+        const byName = wifiAddressForName(control.deviceName())
+        report("netstore.values")
+            .str("ip", dotted(stored.length == 4 ? stored : byName))
+            .num("stored", stored.length == 4 ? 1 : 0, 0)
+            .str("default", dotted(byName))
+            .str("gateway", "10.55.255.254")
+            .str("netmask", "255.255.0.0")
+            .send()
+        flushReports()
+    }
+
+    // A stored address takes effect at the next reset, like a stored
+    // WiFi credential.
+    function saveWifiAddress(a: number, b: number, c: number, d: number): void {
+        const parts = [a, b, c, d]
+        for (const part of parts) {
+            if (!(part >= 0 && part <= 255) || part != Math.floor(part)) {
+                report("netstore.fail").str("why", "each part must be a whole number from 0 to 255").send()
+                flushReports()
+                return
+            }
+        }
+        if (a == 0) {
+            report("netstore.fail").str("why", "the first part cannot be 0").send()
+            flushReports()
+            return
+        }
+        settings.writeNumber(wifiAddressKey, a * 16777216 + b * 65536 + c * 256 + d)
+        reportWifiAddress()
+    }
+
     /**
      * Bring a fleet robot up: the radio link on the address this
      * micro:bit's name derives, WiFi from stored credentials, the
-     * calibration stored in flash, and the `calshow`, `calclear` and
-     * `reboot` run commands. Call it once, after any setTrackWidth() or
+     * calibration stored in flash, and the console's own run commands
+     * (`_calshow`, `_calclear`, `_calsave`, `_calscale`, `_calports`,
+     * `_netshow`, `_netset`, `_netclear`, `_reboot`). The leading `_`
+     * marks a command the console drives itself; the console keeps
+     * those out of the student's function list. Call it once, after any setTrackWidth() or
      * setWheelCalibration() the stored calibration should override.
      *
      * Takes the radio over: MakeCode's own radio blocks stop working in
@@ -160,19 +219,49 @@ namespace diffDrive {
         const name = control.deviceName()
         const address = radioAddressForName(name)
         if (address.length == 2) setupRadio(address[0], address[1])
+        const net = storedWifiAddress()
+        if (net.length == 4) setWifiAddress(net[0], net[1], net[2], net[3])
         enableStoredWifiLink()
         applyStoredCalibration()
 
-        onRun("calshow", function (arg: number) { reportStoredCalibration() })
-        runSignature("calshow", "()")
-        onRun("calclear", function (arg: number) { clearStoredCalibration() })
-        runSignature("calclear", "()")
-        onRun("reboot", function (arg: number) { reboot() })
-        runSignature("reboot", "()")
+        onRun("_calshow", function (arg: number) { reportStoredCalibration() })
+        runSignature("_calshow", "()")
+        onRun("_calclear", function (arg: number) { clearStoredCalibration() })
+        runSignature("_calclear", "()")
+        onRun("_calsave", function (arg: number) {
+            saveCalibration(runArg(0), runArg(1), runArg(2))
+            reportStoredCalibration()
+        })
+        runSignature("_calsave", "(wheel:number=0, track:number=0, slip:number=0)")
+        onRun("_calscale", function (arg: number) {
+            saveWheelMultipliers(runArg(0), runArg(1))
+            reportStoredCalibration()
+        })
+        runSignature("_calscale", "(left:number=1, right:number=1)")
+        onRun("_calports", function (arg: number) {
+            saveMotorPorts(runArg(0), runArg(1))
+            reportStoredCalibration()
+        })
+        runSignature("_calports", "(left:number=1, right:number=2)")
+        onRun("_netshow", function (arg: number) { reportWifiAddress() })
+        runSignature("_netshow", "()")
+        onRun("_netset", function (arg: number) {
+            saveWifiAddress(runArg(0), runArg(1), runArg(2), runArg(3))
+        })
+        runSignature("_netset", "(a:number=10, b:number=55, c:number=0, d:number=0)")
+        onRun("_netclear", function (arg: number) {
+            settings.remove(wifiAddressKey)
+            reportWifiAddress()
+        })
+        runSignature("_netclear", "()")
+        onRun("_reboot", function (arg: number) { reboot() })
+        runSignature("_reboot", "()")
 
         emitLine(address.length == 2
             ? "boot radio " + name + " ch " + address[0] + " grp " + address[1]
             : "boot radio off: " + name + " has no derived address")
         emitLine(storedCalibrationLine())
+        emitLine("boot net " + dotted(net.length == 4 ? net : wifiAddressForName(name))
+            + (net.length == 4 ? " stored" : " default"))
     }
 }

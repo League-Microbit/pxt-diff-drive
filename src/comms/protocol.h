@@ -213,6 +213,9 @@ class Protocol {
   // wifiBegun_ is a no-op by design, not convention -- see the .cpp,
   // this path is UNVERIFIED on hardware.
   void setupWifi(const char* ssid, const char* password);
+  // Use a.b.c.d as the station's fixed address instead of the one the
+  // board's name derives. Ignored once the link has begun.
+  void setWifiAddress(uint8_t a, uint8_t b, uint8_t c, uint8_t d);
 
   // Runtime alternative to the constructor-seeded kRole/kCommonName
   // defaults: copies (stripped, clipped, truncation recorded) into
@@ -494,6 +497,7 @@ class Protocol {
   // maxima + NUL; WifiLink::Config borrows pointers into these for the
   // link's life, so setupWifi() copies rather than borrows.
   char wifiSsid_[33] = {0};
+  char wifiStaticIp_[16] = {0};
   char wifiPassword_[64] = {0};
 
   // True once setupWifi() has been called at all -- distinguishes

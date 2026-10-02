@@ -349,6 +349,28 @@ namespace diffDrive {
     }
 
     /**
+     * Give this robot the fixed WiFi address a.b.c.d instead of the one
+     * its name derives. Call it before the WiFi link comes up; the
+     * robot never asks a DHCP server for an address.
+     */
+    //% blockHidden=true
+    export function setWifiAddress(a: number, b: number, c: number, d: number): void {
+        _setWifiAddress(a, b, c, d)
+    }
+
+    /**
+     * The fixed WiFi address a robot named `name` defaults to,
+     * 10.55.<group>.<channel> from its radio address, as four numbers.
+     * Empty when the name has no radio address.
+     */
+    //% blockHidden=true
+    export function wifiAddressForName(name: string): number[] {
+        const radio = radioAddressForName(name)
+        if (radio.length != 2) return []
+        return [10, 55, radio[1], radio[0]]
+    }
+
+    /**
      * Send a line of text back to the computer, tagged as debug output.
      * It shows up in the console as `DBG:` followed by your text.
      *

@@ -537,8 +537,34 @@ bool WifiLink::pollNewClientEdge() {
 // --- bring-up states -----------------------------------------------------------
 
 void WifiLink::serviceConfigure() {
-  if (step_ >= kConfigureStepCount) {
+  const bool fixedAddress = config_.staticIp != nullptr && config_.staticIp[0] != '\0';
+  const uint8_t stepCount = static_cast<uint8_t>(kConfigureStepCount + (fixedAddress ? 2 : 0));
+  if (step_ >= stepCount) {
     enterState(kJoin);
+    return;
+  }
+  if (step_ >= kConfigureStepCount) {
+    // The two address steps: station DHCP off (tolerant), then the
+    // fixed address itself (strict -- a link with no address is no link).
+    const bool dhcpStep = step_ == kConfigureStepCount;
+    if (!awaiting_) {
+      if (dhcpStep) {
+        startCommand("AT+CWDHCP=0,1", "OK", kCommandTimeout);
+      } else {
+        char cmd[kCommandBuffer];
+        snprintf(cmd, sizeof(cmd), "AT+CIPSTA=\"%s\",\"%s\",\"%s\"", config_.staticIp,
+                 config_.gateway, config_.netmask);
+        startCommand(cmd, "OK", kCommandTimeout);
+      }
+      return;
+    }
+    const Await addressOutcome = pollAwait();
+    if (addressOutcome == kPending) return;
+    if (!dhcpStep && addressOutcome != kMatched) {
+      enterBackoff();
+      return;
+    }
+    if (++step_ >= stepCount) enterState(kJoin);
     return;
   }
   const AtStep& s = kConfigureSteps[step_];
@@ -552,7 +578,7 @@ void WifiLink::serviceConfigure() {
     enterBackoff();
     return;
   }
-  if (++step_ >= kConfigureStepCount) enterState(kJoin);
+  if (++step_ >= stepCount) enterState(kJoin);
 }
 
 void WifiLink::serviceJoin() {
@@ -653,18 +679,8 @@ void WifiLink::serviceJoin() {
 }
 
 void WifiLink::serviceAddress() {
-  if (step_ == 0) {
-    if (!awaiting_) {
-      startCommand("AT+CWDHCP=1,1", "OK", kCommandTimeout);
-      return;
-    }
-    if (pollAwait() == kPending) return;
-    step_ = 1;  // tolerant of match/reject/timeout alike
-    awaiting_ = false;
-    return;
-  }
-  // step 1: learn our own address for the mDNS A record. Tolerant: a
-  // link with no known address still carries protocol traffic; it just
+  // Read our own address back for the mDNS A record. Tolerant: a link
+  // with no known address still carries protocol traffic; it just
   // cannot announce itself.
   if (!awaiting_) {
     ownIp_[0] = '\0';

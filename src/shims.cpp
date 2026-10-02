@@ -1313,9 +1313,20 @@ void setGeometry(int trackWidth, int calib) {  // [0.1 mm] [1e-4 mm/deg]
 // the state after each call has to be legal, so a straight swap goes
 // via an unused port, or assigns each side a port the other never had.
 //
+// The direction each side runs before anything rewires it.
+static int stockSign(int side) {
+  static int signs[2] = {0, 0};
+  if (signs[0] == 0) {
+    signs[0] = boardWiring(0).sign;
+    signs[1] = boardWiring(1).sign;
+  }
+  return signs[side];
+}
+
 //%
 void configureMotor(int side, int port, int fwdSign) {
   Rig& r = ensure();
+  stockSign(side);
   const int otherSide = 1 - side;
 
   // The decision -- including whether this is a swap -- is
@@ -1617,6 +1628,56 @@ void cfgSetOnboardMode(Rig&, float v) {
 float cfgGetOnboardFloor(Rig&) { return boardOnboardFloor(); }
 void cfgSetOnboardFloor(Rig&, float v) { boardSetOnboardFloor(v); }
 
+// Commanded speed x this = what the wheel does. 1 is a stock wheel; a
+// negative value runs it the other way round from stock; the magnitude
+// is the kernel's wheel-correction gain.
+float wheelScale(Rig& r, int side) {
+  const float direction =
+      boardWiring(side).sign == stockSign(side) ? 1.0f : -1.0f;
+  return direction * r.kernel.config().wheelGain[side][0];
+}
+void setWheelScale(Rig& r, int side, float v) {
+  if (v == 0.0f || !std::isfinite(v)) return;
+  const int sign = v < 0.0f ? -stockSign(side) : stockSign(side);
+  const MotorWiring wiring = boardWiring(side);
+  if (sign != wiring.sign) configureMotor(side, wiring.port, sign);
+  const auto c = r.kernel.config();
+  float gain[2] = {c.wheelGain[0][0], c.wheelGain[1][0]};
+  gain[side] = std::fabs(v);
+  r.kernel.setWheelCorrection(
+      gain[0], c.wheelIntercept[0][0], gain[0], c.wheelIntercept[0][1],
+      gain[1], c.wheelIntercept[1][0], gain[1], c.wheelIntercept[1][1]);
+}
+float cfgGetWheelScaleLeft(Rig& r) { return wheelScale(r, 0); }
+void cfgSetWheelScaleLeft(Rig& r, float v) { setWheelScale(r, 0, v); }
+float cfgGetWheelScaleRight(Rig& r) { return wheelScale(r, 1); }
+void cfgSetWheelScaleRight(Rig& r, float v) { setWheelScale(r, 1, v); }
+
+// Which brick port a side's motor is on. Naming the other side's port
+// swaps the pair.
+void setMotorPort(int side, float v) {
+  const int port = static_cast<int>(std::lround(v));
+  if (!isValidMotorPort(port)) return;
+  configureMotor(side, port, boardWiring(side).sign);
+}
+float cfgGetMotorPortLeft(Rig&) { return boardWiring(0).port; }
+void cfgSetMotorPortLeft(Rig&, float v) { setMotorPort(0, v); }
+float cfgGetMotorPortRight(Rig&) { return boardWiring(1).port; }
+void cfgSetMotorPortRight(Rig&, float v) { setMotorPort(1, v); }
+
+// The engine keeps wheel travel per shaft degree; the wire speaks diameter.
+constexpr float kDegreesPerDiameter = 0.02f / kCdegToRad;  // 360 / pi
+float cfgGetWheelDiameter(Rig& r) {
+  return r.engine.travelCalib() * kDegreesPerDiameter;
+}
+void cfgSetWheelDiameter(Rig& r, float v) {
+  if (v > 0.0f) r.engine.setTravelCalib(v / kDegreesPerDiameter);
+}
+float cfgGetTrackWidth(Rig& r) { return r.engine.trackWidth(); }
+void cfgSetTrackWidth(Rig& r, float v) {
+  if (v > 0.0f) r.engine.setTrackWidth(v);
+}
+
 struct ConfigAccessor {
   int ordinal;
   float (*get)(Rig&);          // [unscaled]
@@ -1650,6 +1711,12 @@ constexpr ConfigAccessor kConfigAccessors[] = {
     {42, &cfgGetNudgeSettle, &cfgSetNudgeSettle},
     {43, &cfgGetOnboardMode, &cfgSetOnboardMode},
     {44, &cfgGetOnboardFloor, &cfgSetOnboardFloor},
+    {45, &cfgGetWheelScaleLeft, &cfgSetWheelScaleLeft},
+    {46, &cfgGetWheelScaleRight, &cfgSetWheelScaleRight},
+    {47, &cfgGetMotorPortLeft, &cfgSetMotorPortLeft},
+    {48, &cfgGetMotorPortRight, &cfgSetMotorPortRight},
+    {49, &cfgGetWheelDiameter, &cfgSetWheelDiameter},
+    {50, &cfgGetTrackWidth, &cfgSetTrackWidth},
 };
 
 const ConfigAccessor* findConfigAccessor(int ordinal) {
@@ -1695,6 +1762,10 @@ int getConfigValue(int field) {  // -> [x1000 scaled]
   }
   return static_cast<int>(std::lround(v * 1000.0));
 }
+
+// getConfigValue() for the block layer.
+//%
+int configValue(int field) { return getConfigValue(field); }  // -> [x1000 scaled]
 
 // ---- OTOS (zeguz bench bring-up, 2026-08-20) ------------------------
 // Thin shim surface over OtosPort (otos_port.h). Same integer boundary

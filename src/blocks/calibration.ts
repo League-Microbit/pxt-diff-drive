@@ -1,11 +1,17 @@
 namespace diffDrive {
-    // Flash keys. Each calibration also keeps count, sum, low and high
-    // of every run saved, under its stats prefix.
-    const wheelKey = "cal.whl"   // [mm/deg]
-    const trackKey = "cal.trk"   // [cm]
-    const slipKey = "cal.slp"
-    const wheelStats = "cw"
-    const turnStats = "ct"
+    // Flash keys. The leading # makes them `settings` system keys, which
+    // are kept when a program with a different name is flashed. Each
+    // calibration also keeps count, sum, low and high of every run saved,
+    // under its stats prefix.
+    const wheelKey = "#cal.whl"   // [mm/deg]
+    const trackKey = "#cal.trk"   // [cm]
+    const slipKey = "#cal.slp"
+    const leftScaleKey = "#cal.wl"
+    const rightScaleKey = "#cal.wr"
+    const leftPortKey = "#cal.pl"
+    const rightPortKey = "#cal.pr"
+    const wheelStats = "#cw"
+    const turnStats = "#ct"
 
     // 0 means "not stored": no calibration value is ever 0.
     function stored(key: string): number {
@@ -75,6 +81,60 @@ namespace diffDrive {
         addRun(turnStats, slip)
     }
 
+    /**
+     * Use a pair of wheel multipliers and keep them in flash. A 0 leaves
+     * that side as it is.
+     * @param left left wheel multiplier, eg: 1
+     * @param right right wheel multiplier, eg: 1
+     */
+    //% blockHidden=true
+    export function saveWheelMultipliers(left: number, right: number): void {
+        if (left != 0) {
+            setWheelMultiplier(MotorSide.Left, left)
+            settings.writeNumber(leftScaleKey, left)
+        }
+        if (right != 0) {
+            setWheelMultiplier(MotorSide.Right, right)
+            settings.writeNumber(rightScaleKey, right)
+        }
+    }
+
+    /**
+     * Say which brick port each wheel's motor is on (1 to 4) and keep it
+     * in flash. A 0 leaves that side as it is.
+     * @param left left motor port, eg: 1
+     * @param right right motor port, eg: 2
+     */
+    //% blockHidden=true
+    export function saveMotorPorts(left: number, right: number): void {
+        if (left == 0) left = configValue(ConfigField.MotorPortLeft)
+        if (right == 0) right = configValue(ConfigField.MotorPortRight)
+        setMotorPorts(left, right)
+        settings.writeNumber(leftPortKey, left)
+        settings.writeNumber(rightPortKey, right)
+    }
+
+    /**
+     * Use a calibration measured elsewhere and keep it in flash, as the
+     * single run behind each value. A 0 leaves that value as it is.
+     * @param diameter wheel diameter in mm, eg: 90
+     * @param width track width in cm, eg: 11.4
+     * @param slip rotational slip, eg: 0.95
+     */
+    //% blockHidden=true
+    export function saveCalibration(diameter: number, width: number,
+        slip: number): void {
+        if (diameter > 0) {
+            clearRuns(wheelStats)
+            saveWheelCalibration(Math.PI * diameter / 360)
+        }
+        if (width > 0 || slip > 0) {
+            clearRuns(turnStats)
+            saveTurnCalibration(width > 0 ? width : trackWidth(),
+                slip > 0 ? slip : rotationalSlip())
+        }
+    }
+
     /** Apply whatever calibration is stored in flash; none stored changes nothing. */
     //% blockHidden=true
     export function applyStoredCalibration(): void {
@@ -83,6 +143,12 @@ namespace diffDrive {
             setTrackWidth(stored(trackKey))
             setConfigValue(ConfigField.RotationalSlip, stored(slipKey))
         }
+        if (settings.exists(leftPortKey) && settings.exists(rightPortKey))
+            setMotorPorts(settings.readNumber(leftPortKey), settings.readNumber(rightPortKey))
+        if (settings.exists(leftScaleKey))
+            setWheelMultiplier(MotorSide.Left, settings.readNumber(leftScaleKey))
+        if (settings.exists(rightScaleKey))
+            setWheelMultiplier(MotorSide.Right, settings.readNumber(rightScaleKey))
     }
 
     /** The stored calibration as one `boot cal` line. */
@@ -107,6 +173,10 @@ namespace diffDrive {
             .num("has_turn", hasTurn() ? 1 : 0, 0)
             .num("live_tw", trackWidth(), 2)
             .num("live_slip", rotationalSlip(), 4)
+            .num("scale_l", wheelMultiplier(MotorSide.Left), 3)
+            .num("scale_r", wheelMultiplier(MotorSide.Right), 3)
+            .num("port_l", configValue(ConfigField.MotorPortLeft), 0)
+            .num("port_r", configValue(ConfigField.MotorPortRight), 0)
             .send()
         report("calstore.runs")
             .num("wheel_runs", stored(wheelStats + ".n"), 0)
@@ -129,6 +199,10 @@ namespace diffDrive {
         settings.remove(wheelKey)
         settings.remove(trackKey)
         settings.remove(slipKey)
+        settings.remove(leftScaleKey)
+        settings.remove(rightScaleKey)
+        settings.remove(leftPortKey)
+        settings.remove(rightPortKey)
         clearRuns(wheelStats)
         clearRuns(turnStats)
         report("calstore.cleared").str("why", "asked").send()

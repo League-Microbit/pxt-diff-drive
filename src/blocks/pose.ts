@@ -5,7 +5,7 @@ namespace diffDrive {
      * Robot x position (forward from start) in cm.
      */
     //% block="pose x (cm)"
-    //% group="Pose" weight=250
+    //% group="Pose" weight=270
     //% subcategory="Pose"
     export function poseX(): number {
         return _poseX() / 10
@@ -15,7 +15,7 @@ namespace diffDrive {
      * Robot y position (left from start) in cm.
      */
     //% block="pose y (cm)"
-    //% group="Pose" weight=240
+    //% group="Pose" weight=260
     //% subcategory="Pose"
     export function poseY(): number {
         return _poseY() / 10
@@ -25,7 +25,7 @@ namespace diffDrive {
      * Robot heading in degrees, CCW positive.
      */
     //% block="heading (deg)"
-    //% group="Pose" weight=260
+    //% group="Pose" weight=280
     //% subcategory="Pose"
     export function heading(): number {
         return _poseHeading() / 100
@@ -35,7 +35,7 @@ namespace diffDrive {
      * Reset the pose to (0, 0, 0).
      */
     //% block="reset pose"
-    //% group="Pose" weight=230
+    //% group="Pose" weight=250
     //% subcategory="Pose"
     export function resetPose(): void {
         _resetPose()

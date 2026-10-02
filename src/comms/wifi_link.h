@@ -38,8 +38,10 @@
 //   join:      poll `AT+CWJAP?` first (the module auto-rejoins after RST;
 //              an explicit join fired into that answers busy/ERROR and
 //              near-livelocks), then `AT+CWJAP="ssid","pw"`
-//   address:   AT+CWDHCP=1,1 (tolerant), AT+CIPSTA? to learn our own IP
-//              (for the mDNS A record)
+//   configure also sets the station's fixed address: AT+CWDHCP=0,1
+//              (tolerant), then AT+CIPSTA="ip","gateway","netmask". The
+//              link never asks a DHCP server for one.
+//   address:   AT+CIPSTA? to read our own IP back (for the mDNS A record)
 //   socket:    AT+CIPSTART=4,"UDP","255.255.255.255",7655,7654,2
 //              AT+CIPSTART=3,"UDP","224.0.0.251",5353,5353,0 (tolerant)
 //   ready:     demux +IPD frames; one AT+CIPSEND per outbound line;
@@ -89,7 +91,7 @@ class WifiLink {
     kDisabled = 0,   // begin() never called, or empty SSID
     kConfigure = 1,  // the AT+RST ... CIPDINFO=1 sequence
     kJoin = 2,       // CWJAP? poll, then CWJAP
-    kAddress = 3,    // CWDHCP + CIPSTA? (learn our IP)
+    kAddress = 3,    // CIPSTA? (read our IP back)
     kSocket = 4,     // CIPSTART link 4 (protocol) and link 3 (mDNS)
     kReady = 5,      // the link is UP -- protocol traffic flows
     kBackoff = 6,    // a strict step failed; waiting before starting over
@@ -106,6 +108,12 @@ class WifiLink {
     uint16_t port;         // our UDP protocol port (7654) -- and the TCP server's
     uint16_t hostPort;     // the host's fixed port (7655), CIPSTART's remote placeholder
     bool tcpServer;        // also accept TCP clients on `port` (AT+CIPSERVER)
+
+    // The station's fixed IPv4 address, gateway and netmask, as dotted
+    // quads. An empty staticIp skips the address step entirely.
+    const char* staticIp;
+    const char* gateway;
+    const char* netmask;
 
     // When true, serviceJoin()'s step 0 sends AT+CWQAP (disassociate,
     // tolerant of ERROR -- "nothing was associated" is expected) and
@@ -128,7 +136,8 @@ class WifiLink {
     bool forceExplicitJoin;
 
     Config() : ssid(""), password(""), hostname("robot"), port(7654), hostPort(7655),
-               tcpServer(true), forceExplicitJoin(false) {}
+               tcpServer(true), staticIp(""), gateway(""), netmask(""),
+               forceExplicitJoin(false) {}
   };
 
   // Wire-line ceiling, matching Wire::WireHandler::kMaxLineBytes /

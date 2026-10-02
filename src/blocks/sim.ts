@@ -455,6 +455,16 @@ namespace diffDrive {
         if (field == 16 && v > 0) simRotationalSlip = v
     }
 
+    //% shim=diffDrive::configValue
+    export function _configValue(field: number): number {  // -> [x1000 scaled]
+        if (field == 16) return simRotationalSlip * 1000
+        if (field == 45 || field == 46 || field == 47) return 1000
+        if (field == 48) return 2000
+        if (field == 49) return 90280
+        if (field == 50) return 114200
+        return 0
+    }
+
     // Recorded so a bare project's on-start sequence is observable in
     // the simulator; hardware's real startProtocol() bring-up has no
     // other in-sim effect to model.
@@ -681,6 +691,11 @@ namespace diffDrive {
 
     //% shim=diffDrive::enableStoredWifiLink
     export function _enableStoredWifiLink(): void {
+        // No simulator model of the WiFi module.
+    }
+
+    //% shim=diffDrive::setWifiAddress
+    export function _setWifiAddress(a: number, b: number, c: number, d: number): void {
         // No simulator model of the WiFi module.
     }
 }

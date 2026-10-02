@@ -147,6 +147,18 @@ constexpr ConfigFieldDescriptor kConfigFields[] = {
     {"onboard_pid", 43, "1"},
     // ConfigField.OnboardFloor: "onboard actuation floor mm/s"
     {"onboard_floor", 44, "mm/s"},
+    // ConfigField.WheelScaleLeft: "left wheel multiplier"
+    {"wheel_scale_left", 45, "1"},
+    // ConfigField.WheelScaleRight: "right wheel multiplier"
+    {"wheel_scale_right", 46, "1"},
+    // ConfigField.MotorPortLeft: "left motor port"
+    {"motor_port_left", 47, "1"},
+    // ConfigField.MotorPortRight: "right motor port"
+    {"motor_port_right", 48, "1"},
+    // ConfigField.WheelDiameter: "wheel diameter mm"
+    {"wheel_diameter", 49, "mm"},
+    // ConfigField.TrackWidth: "track width mm"
+    {"track_width", 50, "mm"},
 };
 
 constexpr int kConfigFieldCount =

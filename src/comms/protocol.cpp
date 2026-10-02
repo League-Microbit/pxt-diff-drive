@@ -5,6 +5,7 @@
 #include "../platform/board.h"
 #include "../platform/vfp_guard.h"
 #include "reply_backpressure.h"
+#include "wifi_address.h"
 #include "wifi_credential_store.h"  // wifiCredentialStore(): the shared
                                     // flash-backed store used by
                                     // serviceWifi()'s lazy-begin
@@ -88,7 +89,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20260925.1";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20261002.1";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 
@@ -298,6 +299,16 @@ void Protocol::enableWifi() { wifiEnabled_ = true; }
 void Protocol::enableStoredWifi() {
   wifiStoreOnly_ = true;
   enableWifi();
+}
+
+void Protocol::setWifiAddress(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+  if (wifiBegun_) {
+    emitLine("DBG:wifi late setWifiAddress() ignored");
+    return;
+  }
+  snprintf(wifiStaticIp_, sizeof(wifiStaticIp_), "%u.%u.%u.%u",
+           static_cast<unsigned>(a), static_cast<unsigned>(b),
+           static_cast<unsigned>(c), static_cast<unsigned>(d));
 }
 
 void Protocol::setupWifi(const char* ssid, const char* password) {
@@ -531,6 +542,12 @@ void Protocol::serviceWifi() {
     config.hostname = microbit_friendly_name();
     config.port = kWifiPort;
     config.hostPort = kWifiHostPort;
+    if (wifiStaticIp_[0] == '\0') {
+      defaultWifiAddress(microbit_friendly_name(), wifiStaticIp_, sizeof(wifiStaticIp_));
+    }
+    config.staticIp = wifiStaticIp_;
+    config.gateway = kWifiGateway;
+    config.netmask = kWifiNetmask;
 
     // Precedence, most to least preferred: a stored flash credential
     // beats a setupWifi()-supplied credential, which beats the baked
@@ -1170,5 +1187,11 @@ void enableWifiLink() { protocol().enableWifi(); }
 
 //%
 void enableStoredWifiLink() { protocol().enableStoredWifi(); }
+
+//%
+void setWifiAddress(int a, int b, int c, int d) {
+  protocol().setWifiAddress(static_cast<uint8_t>(a), static_cast<uint8_t>(b),
+                            static_cast<uint8_t>(c), static_cast<uint8_t>(d));
+}
 
 }  // namespace diffDrive
