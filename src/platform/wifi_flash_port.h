@@ -17,22 +17,15 @@
 // the whole page outright. WifiCredentialStore never touches an
 // address; it only ever deals in offsets from 0..kPageBytes.
 //
-// == The page address is a candidate, not a confirmed answer ==
+// == Who owns the top of flash (BLE off) ==
 //
-// `MICROBIT_STORAGE_PAGE` (0x0007F000) is `uBit.storage`'s
-// (KeyValueStorage's) page.
-// `MICROBIT_DEFAULT_SCRATCH_PAGE` (0x0007E000) is BOTH the flash
-// driver's own erase-merge scratch page (MicroBitFlash::flash_write()'s
-// default `scratch_addr`) AND `MICROBIT_APP_REGION_END` -- where the
-// compiled program's own region is understood to end. Both addresses
-// read from `built/dockercodal/libraries/codal-microbit-v2/inc/
-// MicroBitConfig.h`, a source reading, not a hardware measurement.
-// `WifiFlashPortCodal::kFlashPageAddress` below picks the next page
-// down and is a NAMED CONSTANT precisely so a future firmware region
-// shuffle cannot silently collide with it -- but whether that address
-// actually survives `mbdeploy deploy` (which erases pages) and a power
-// cycle is UNVERIFIED here -- confirming it is real-hardware work, not
-// this file's.
+//   0x0007F000  uBit.storage (MICROBIT_STORAGE_PAGE)
+//   0x0007E000  the flash driver's erase-merge scratch page
+//   0x0007C000..0x0007E000  PXT's `settings` store, 8 KiB by default
+//   0x00076000..0x0007E000  the same store at its 32 KiB maximum
+//
+// The credential page sits one page below the largest `settings`
+// region, so neither store can erase the other.
 #pragma once
 
 #include <cstdint>
@@ -90,16 +83,8 @@ class WifiFlashPort {
 // WifiUartCodal (wifi_uart.h/.cpp) already uses.
 class WifiFlashPortCodal final : public WifiFlashPort {
  public:
-  // UNVERIFIED on real hardware (see this file's header comment
-  // above): one nRF52833 flash page below MICROBIT_DEFAULT_SCRATCH_PAGE
-  // (0x0007E000 - 0x1000 = 0x0007D000), chosen to sit outside both
-  // MICROBIT_STORAGE_PAGE (0x0007F000, uBit.storage's) and
-  // MICROBIT_DEFAULT_SCRATCH_PAGE (0x0007E000, the flash driver's own
-  // erase-merge scratch page and MICROBIT_APP_REGION_END). 0x1000 is
-  // this chip's documented CODEPAGESIZE (see kPageBytes above), used
-  // here as a literal because MICROBIT_CODEPAGESIZE itself is a
-  // runtime register read and so cannot appear in a constexpr.
-  static constexpr uint32_t kFlashPageAddress = 0x0007D000;
+  // See the flash map in this file's header comment.
+  static constexpr uint32_t kFlashPageAddress = 0x00075000;
 
   void read(uint32_t offset, uint8_t* buffer, uint32_t length) const override;
   bool write(uint32_t offset, const uint8_t* buffer, uint32_t length) override;

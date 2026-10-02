@@ -142,6 +142,11 @@ namespace diffDrive {
     // re-aim the running loop instead of stacking fibers. Cleared by
     // the loop itself when tickDrive() goes false.
     let driveLoopRunning = false
+    // What the setters below last applied; unset means the engine's
+    // compiled default is still in force.
+    let appliedTrackWidth: number        // [cm]
+    let appliedWheelCalibration: number  // [mm/deg]
+    let appliedRotationalSlip: number
 
     // Start the wire-protocol loop (its own CODAL fiber -- see
     // protocol.h) as soon as this extension's code loads, independent
@@ -657,7 +662,14 @@ namespace diffDrive {
     //% group="Setup" weight=120
     //% subcategory="Setup"
     export function setTrackWidth(width: number): void {
+        appliedTrackWidth = width
         _setGeometry(Math.round(width * 100), 0)
+    }
+
+    /** The track width in force, in cm. */
+    //% blockHidden=true
+    export function trackWidth(): number {
+        return appliedTrackWidth ? appliedTrackWidth : 11.42
     }
 
     /**
@@ -668,7 +680,20 @@ namespace diffDrive {
     //% group="Setup" weight=110
     //% subcategory="Setup"
     export function setWheelCalibration(calib: number): void {
+        appliedWheelCalibration = calib
         _setGeometry(0, Math.round(calib * 10000))
+    }
+
+    /** The wheel calibration in force, in mm/degree. */
+    //% blockHidden=true
+    export function wheelCalibration(): number {
+        return appliedWheelCalibration ? appliedWheelCalibration : 0.7878
+    }
+
+    /** The rotational slip in force. */
+    //% blockHidden=true
+    export function rotationalSlip(): number {
+        return appliedRotationalSlip ? appliedRotationalSlip : 0.952
     }
 
     /**
@@ -701,6 +726,7 @@ namespace diffDrive {
     //% subcategory="Setup"
     export function setConfigValue(field: ConfigField,
         value: number): void {
+        if (field == ConfigField.RotationalSlip) appliedRotationalSlip = value
         _setKernelValue(field, Math.round(value * 1000))
     }
 
