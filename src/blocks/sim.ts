@@ -643,6 +643,8 @@ namespace diffDrive {
     let simRadioEnabled = false
     let simWifiSsid = ""
     let simWifiPassword = ""
+    let simWifiEnabled = false
+    let simWifiAddress: number[] = []
     let simDeviceRole = ""
     let simCommonName = ""
     let simProfile = ""
@@ -685,17 +687,16 @@ namespace diffDrive {
 
     //% shim=diffDrive::enableWifiLink
     export function _enableWifiLink(): void {
-        // No simulator model of the WiFi module: a no-op here, exactly
-        // as the radio link is a flag with no behaviour behind it.
+        simWifiEnabled = true
     }
 
     //% shim=diffDrive::enableStoredWifiLink
     export function _enableStoredWifiLink(): void {
-        // No simulator model of the WiFi module.
+        simWifiEnabled = true
     }
 
     //% shim=diffDrive::setWifiAddress
     export function _setWifiAddress(a: number, b: number, c: number, d: number): void {
-        // No simulator model of the WiFi module.
+        simWifiAddress = [a, b, c, d]
     }
 }
