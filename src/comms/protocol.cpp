@@ -89,7 +89,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20261004.1";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20261004.2";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 

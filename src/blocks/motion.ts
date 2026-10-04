@@ -139,7 +139,7 @@ enum MotorDirection {
     Reversed = -1
 }
 
-//% color=#0f9c5a icon="" block="DiffDrive"
+//% color=#0f9c5a icon="" block="Nezbot"
 //% groups='["Move", "Drive", "Wheels", "GoTo", "Moving?", "Stop", "Pose", "World", "Setup", "Remote", "Debug"]'
 //% subcategories='["Pose", "Setup", "Extra"]'
 namespace diffDrive {
