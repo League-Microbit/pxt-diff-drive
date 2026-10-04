@@ -201,7 +201,7 @@ namespace diffDrive {
      * @param group radio group, eg: 10
      */
     //% block="setup radio channel %channel group %group"
-    //% group="Radio and WiFi" weight=60
+    //% group="Radio and WiFi" weight=70
     //% subcategory="Setup"
     export function setupRadio(channel: number, group: number = 10): void {
         _setupRadio(Math.round(channel), Math.round(group))
@@ -221,7 +221,7 @@ namespace diffDrive {
      * @param name robot name, or empty for this micro:bit's own name
      */
     //% block="setup radio channel for robot %name"
-    //% group="Radio and WiFi" weight=70
+    //% group="Radio and WiFi" weight=80
     //% subcategory="Setup"
     export function setupRadioForName(name: string = ""): void {
         const address = radioAddressForName(name == "" ? control.deviceName() : name)
@@ -363,6 +363,27 @@ namespace diffDrive {
     //% subcategory="Setup"
     export function setWifiAddress(a: number, b: number, c: number, d: number): void {
         _setWifiAddress(a, b, c, d)
+    }
+
+    /**
+     * Turn WiFi on at the address that belongs to a robot's five-letter
+     * name, joining the network stored on the robot. Leave the name
+     * empty to use this micro:bit's own name, which is what a robot
+     * almost always wants. If the name is not a robot name, WiFi is
+     * left alone and the screen shows an X.
+     * @param name robot name, or empty for this micro:bit's own name
+     */
+    //% block="setup wifi for robot %name"
+    //% group="Radio and WiFi" weight=60
+    //% subcategory="Setup"
+    export function setupWifiForName(name: string = ""): void {
+        const address = wifiAddressForName(name == "" ? control.deviceName() : name)
+        if (address.length != 4) {
+            basic.showIcon(IconNames.No)
+            return
+        }
+        _setWifiAddress(address[0], address[1], address[2], address[3])
+        _enableStoredWifiLink()
     }
 
     /**

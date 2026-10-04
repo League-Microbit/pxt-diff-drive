@@ -192,7 +192,7 @@ namespace diffDrive {
      */
     //% block="set wheel speeds left %left right %right cm/s"
     //% left.min=-50 left.max=50 right.min=-50 right.max=50
-    //% group="Wheels" weight=440
+    //% group="Wheels" weight=450
     export function setWheelSpeeds(left: number, right: number): void {
         _setWheels(Math.round(left * 10), Math.round(right * 10))
     }
@@ -209,7 +209,7 @@ namespace diffDrive {
      */
     //% block="drive %speed cm/s turning %yawRate deg/s"
     //% speed.min=-50 speed.max=50 yawRate.min=-180 yawRate.max=180
-    //% group="Drive" weight=470
+    //% group="Drive" weight=480
     export function driveTwist(speed: number, yawRate: number): void {
         _driveTwist(Math.round(speed * 10), Math.round(yawRate * 100))
     }
@@ -248,7 +248,7 @@ namespace diffDrive {
      * @param yawRate turn rate CCW+, eg: 0
      */
     //% block="start drive %speed cm/s turning %yawRate deg/s"
-    //% group="Drive" weight=460
+    //% group="Drive" weight=470
     export function startDrive(speed: number, yawRate: number): void {
         driveTwist(speed, yawRate)
         if (driveLoopRunning) return
@@ -284,7 +284,7 @@ namespace diffDrive {
      */
     //% block="while driving %speed cm/s turning %yawRate deg/s"
     //% draggableParameters="reporter" handlerStatement=1
-    //% group="Drive" weight=450
+    //% group="Drive" weight=460
     export function whileDriving(speed: number, yawRate: number,
         body: (x: number, y: number, heading: number) => void): void {
         driveTwist(speed, yawRate)
@@ -305,7 +305,7 @@ namespace diffDrive {
      * (about 24 ms), so don't add your own pause() in the loop.
      */
     //% block="drive tick"
-    //% group="Moving?" weight=360
+    //% group="Moving?" weight=370
     export function driveTick(): boolean {
         return _tickDrive()
     }
@@ -322,7 +322,7 @@ namespace diffDrive {
      * @param yaw angle to turn CCW+, eg: 0
      */
     //% block="move %distance cm turning %yaw degrees"
-    //% group="Move" weight=520
+    //% group="Move" weight=530
     export function move(distance: number, yaw: number): void {
         startMove(distance, yaw)
         while (_tickDrive());
@@ -357,7 +357,7 @@ namespace diffDrive {
      * @param right right wheel distance in mm, eg: 5
      */
     //% block="nudge left %left mm right %right mm"
-    //% group="Move" weight=490
+    //% group="Move" weight=500
     export function nudge(left: number, right: number): number {
         _beginNudgeWheels(Math.round(left), Math.round(right))
         // tickDrive()'s return reflects isDriving()/applied duty, which a
@@ -380,7 +380,7 @@ namespace diffDrive {
      * @param deg angle to turn CCW+, eg: 2
      */
     //% block="nudge turn %deg degrees"
-    //% group="Move" weight=480
+    //% group="Move" weight=490
     export function nudgeTurn(deg: number): number {
         _beginNudgeTurn(Math.round(deg * 100))
         while (_tickDrive() || _nudgeActive());
@@ -394,7 +394,7 @@ namespace diffDrive {
      * @param y leftward distance, eg: 10
      */
     //% block="go to x %x cm y %y cm"
-    //% group="GoTo" weight=430
+    //% group="GoTo" weight=440
     export function goTo(x: number, y: number): void {
         startGoTo(x, y)
         while (_tickDrive());
@@ -413,7 +413,7 @@ namespace diffDrive {
      * own driveTick() loop.
      */
     //% block="start move %distance cm turning %yaw degrees"
-    //% group="Move" weight=510
+    //% group="Move" weight=520
     export function startMove(distance: number, yaw: number): void {
         _startMove(Math.round(distance * 10), Math.round(yaw * 100),
             Math.round(defaultSpeed * 10),
@@ -426,7 +426,7 @@ namespace diffDrive {
      * driveTick() loop, this does not progress on its own.
      */
     //% block="start go to x %x cm y %y cm"
-    //% group="GoTo" weight=410
+    //% group="GoTo" weight=420
     export function startGoTo(x: number, y: number): void {
         // goToR() owns the pivot-vs-arc split; never reduce to
         // (distance, yaw) and go through startMove(), which is always
@@ -486,7 +486,7 @@ namespace diffDrive {
      * -- see startMove()'s doc comment for that gap.
      */
     //% block="moving?"
-    //% group="Moving?" weight=390
+    //% group="Moving?" weight=400
     export function isMoving(): boolean {
         return _updateMove()
     }
@@ -497,7 +497,7 @@ namespace diffDrive {
      * advance the move (see startMove()'s doc comment).
      */
     //% block="move progress"
-    //% group="Moving?" weight=380
+    //% group="Moving?" weight=390
     export function moveProgress(): number {
         return _progress() / 1000
     }
@@ -585,7 +585,7 @@ namespace diffDrive {
      */
     //% block="while moving %distance cm turning %yaw degrees"
     //% draggableParameters="reporter" handlerStatement=1
-    //% group="Move" weight=500
+    //% group="Move" weight=510
     export function whileMoving(distance: number, yaw: number,
         body: (x: number, y: number, heading: number) => void): void {
         startMove(distance, yaw)
@@ -603,7 +603,7 @@ namespace diffDrive {
      */
     //% block="while going to x %x cm y %y cm"
     //% draggableParameters="reporter" handlerStatement=1
-    //% group="GoTo" weight=400
+    //% group="GoTo" weight=410
     export function whileGoingTo(x: number, y: number,
         body: (x: number, y: number, heading: number) => void): void {
         startGoTo(x, y)
@@ -620,7 +620,7 @@ namespace diffDrive {
      * @param speed eg: 15
      */
     //% block="set default speed %speed cm/s"
-    //% group="Speeds and tolerances" weight=110
+    //% group="Speeds and tolerances" weight=120
     //% subcategory="Setup"
     export function setDefaultSpeed(speed: number): void {
         defaultSpeed = Math.max(1, speed)
@@ -632,7 +632,7 @@ namespace diffDrive {
      * @param tol eg: 1
      */
     //% block="set arrival tolerance %tol cm"
-    //% group="Speeds and tolerances" weight=90
+    //% group="Speeds and tolerances" weight=100
     //% subcategory="Setup"
     export function setArrivalTolerance(tol: number): void {
         arriveTol = Math.max(0.1, tol)
@@ -655,7 +655,7 @@ namespace diffDrive {
      * @param yawRate eg: 90
      */
     //% block="set default turn rate %yawRate deg/s"
-    //% group="Speeds and tolerances" weight=100
+    //% group="Speeds and tolerances" weight=110
     //% subcategory="Setup"
     export function setDefaultYawRate(yawRate: number): void {
         defaultYawRate = Math.max(1, yawRate)
@@ -666,7 +666,7 @@ namespace diffDrive {
      * @param width eg: 11.5
      */
     //% block="set track width %width cm"
-    //% group="Track and wheels" weight=170
+    //% group="Track and wheels" weight=180
     //% subcategory="Setup"
     export function setTrackWidth(width: number): void {
         _setGeometry(Math.round(width * 100), 0)
@@ -683,7 +683,7 @@ namespace diffDrive {
      * @param calib eg: 0.7837
      */
     //% block="set wheel calibration %calib mm/deg"
-    //% group="Track and wheels" weight=150
+    //% group="Track and wheels" weight=160
     //% subcategory="Setup"
     export function setWheelCalibration(calib: number): void {
         _setGeometry(0, Math.round(calib * 10000))
@@ -696,7 +696,7 @@ namespace diffDrive {
      * @param slip eg: 0.95
      */
     //% block="set turn slip %slip"
-    //% group="Track and wheels" weight=160
+    //% group="Track and wheels" weight=170
     //% subcategory="Setup"
     export function setRotationalSlip(slip: number): void {
         setConfigValue(ConfigField.RotationalSlip, slip)
@@ -716,7 +716,7 @@ namespace diffDrive {
      * @param value the multiplier, eg: 1
      */
     //% block="set %side wheel multiplier to %value"
-    //% group="Motors" weight=120
+    //% group="Motors" weight=130
     //% subcategory="Setup"
     export function setWheelMultiplier(side: MotorSide, value: number): void {
         setConfigValue(side == MotorSide.Left
@@ -729,7 +729,7 @@ namespace diffDrive {
      * @param right the right wheel's motor port
      */
     //% block="set motor ports left %left right %right"
-    //% group="Motors" weight=130
+    //% group="Motors" weight=140
     //% subcategory="Setup"
     export function setMotorPorts(left: MotorPort, right: MotorPort): void {
         if (left == right) return
@@ -773,7 +773,7 @@ namespace diffDrive {
      * @param direction forward, or reversed if the wheel runs backwards
      */
     //% block="configure motor %side on port %port running %direction"
-    //% group="Motors" weight=140
+    //% group="Motors" weight=150
     //% subcategory="Setup"
     export function configureMotor(side: MotorSide, port: MotorPort,
         direction: MotorDirection): void {
@@ -784,7 +784,7 @@ namespace diffDrive {
      * Advanced: set a kernel configuration value directly.
      */
     //% block="set config %field to %value"
-    //% group="Speeds and tolerances" weight=80
+    //% group="Speeds and tolerances" weight=90
     //% subcategory="Setup"
     export function setConfigValue(field: ConfigField,
         value: number): void {
