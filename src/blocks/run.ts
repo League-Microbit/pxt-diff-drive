@@ -201,7 +201,7 @@ namespace diffDrive {
      * @param group radio group, eg: 10
      */
     //% block="setup radio channel %channel group %group"
-    //% group="Setup" weight=100
+    //% group="Radio and WiFi" weight=60
     //% subcategory="Setup"
     export function setupRadio(channel: number, group: number = 10): void {
         _setupRadio(Math.round(channel), Math.round(group))
@@ -221,7 +221,7 @@ namespace diffDrive {
      * @param name robot name, or empty for this micro:bit's own name
      */
     //% block="setup radio channel for robot %name"
-    //% group="Setup" weight=90
+    //% group="Radio and WiFi" weight=70
     //% subcategory="Setup"
     export function setupRadioForName(name: string = ""): void {
         const address = radioAddressForName(name == "" ? control.deviceName() : name)
@@ -352,8 +352,15 @@ namespace diffDrive {
      * Give this robot the fixed WiFi address a.b.c.d instead of the one
      * its name derives. Call it before the WiFi link comes up; the
      * robot never asks a DHCP server for an address.
+     * @param a eg: 10
+     * @param b eg: 55
+     * @param c eg: 0
+     * @param d eg: 1
      */
-    //% blockHidden=true
+    //% block="set wifi address %a . %b . %c . %d"
+    //% inlineInputMode=inline
+    //% group="Radio and WiFi" weight=50
+    //% subcategory="Setup"
     export function setWifiAddress(a: number, b: number, c: number, d: number): void {
         _setWifiAddress(a, b, c, d)
     }

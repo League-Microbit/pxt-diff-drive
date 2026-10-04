@@ -212,7 +212,9 @@ namespace diffDrive {
      * Takes the radio over: MakeCode's own radio blocks stop working in
      * this program.
      */
-    //% blockHidden=true
+    //% block="setup robot"
+    //% group="Robot" weight=180
+    //% subcategory="Setup"
     export function setupRobot(): void {
         if (robotSetUp) return
         robotSetUp = true

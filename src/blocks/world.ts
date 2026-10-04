@@ -17,7 +17,7 @@ namespace diffDrive {
      * Call once at program start, robot held still.
      */
     //% block="start world tracking"
-    //% group="World" weight=210
+    //% group="World" weight=240
     //% subcategory="Pose"
     export function startWorldTracking(): boolean {
         otosBegin()
@@ -28,7 +28,7 @@ namespace diffDrive {
      * Is the world sensor present and answering?
      */
     //% block="world tracking ready?"
-    //% group="World" weight=200
+    //% group="World" weight=230
     //% subcategory="Pose"
     export function worldTrackingReady(): boolean {
         return otosGet(7) != 0
@@ -49,7 +49,7 @@ namespace diffDrive {
      * @param heading world heading in degrees CCW, eg: 0
      */
     //% block="set world pose to x %x cm y %y cm heading %heading deg"
-    //% group="World" weight=220
+    //% group="World" weight=250
     //% subcategory="Pose"
     export function seedPose(x: number, y: number,
         heading: number): void {
@@ -70,7 +70,7 @@ namespace diffDrive {
      * is running. See this file's own header comment.
      */
     //% block="read world position"
-    //% group="World" weight=190
+    //% group="World" weight=220
     //% subcategory="Pose"
     export function readWorld(): boolean {
         return otosRead()
@@ -80,7 +80,7 @@ namespace diffDrive {
      * World x from the most recent fix, in cm.
      */
     //% block="world x (cm)"
-    //% group="World" weight=170
+    //% group="World" weight=200
     //% subcategory="Pose"
     export function worldX(): number {
         return otosGet(0) / 100
@@ -90,7 +90,7 @@ namespace diffDrive {
      * World y from the most recent fix, in cm.
      */
     //% block="world y (cm)"
-    //% group="World" weight=160
+    //% group="World" weight=190
     //% subcategory="Pose"
     export function worldY(): number {
         return otosGet(1) / 100
@@ -100,7 +100,7 @@ namespace diffDrive {
      * World heading from the most recent fix, in degrees CCW.
      */
     //% block="world heading (deg)"
-    //% group="World" weight=180
+    //% group="World" weight=210
     //% subcategory="Pose"
     export function worldHeading(): number {
         return otosGet(2) / 100
@@ -118,7 +118,7 @@ namespace diffDrive {
      * IS ticking.
      */
     //% block="calibrate world sensor"
-    //% group="World" weight=240
+    //% group="World" weight=270
     //% subcategory="Pose"
     export function calibrateWorldSensor(): void {
         otosCalibrate(0)
@@ -131,7 +131,7 @@ namespace diffDrive {
      * Measured by the lever-arm calibration, then set once at startup.
      */
     //% block="set world sensor offset x %x cm y %y cm yaw %yaw deg"
-    //% group="World" weight=230
+    //% group="World" weight=260
     //% subcategory="Pose"
     export function setWorldSensorOffset(x: number, y: number,
         yaw: number): void {
@@ -174,7 +174,7 @@ namespace diffDrive {
      * @param y world y, eg: 0
      */
     //% block="go to world x %x cm y %y cm"
-    //% group="GoTo" weight=390
+    //% group="GoTo" weight=420
     export function goToWorld(x: number, y: number): void {
         // ONE PASS. Drive at the point, get as close as the leg gets,
         // stop. No arrival nudging, no creeping up on it, no squaring
