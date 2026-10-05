@@ -62,16 +62,15 @@ namespace diffDrive {
     }
 
     /**
-     * Add a program to the button menu and bind it to the run command
-     * of the same name. A steps through the programs, B runs the one
-     * shown, and any button stops a running program. Takes over the
-     * A, B and A+B button handlers.
-     * @param name the run command name, eg: "square"
+     * Add a program to the button menu. A steps through the programs, B
+     * runs the one shown, and any button stops a running program. Takes
+     * over the A, B and A+B button handlers.
+     * @param name what the menu calls the program, eg: "square"
      * @param picture what the menu shows for this program
      * @param run the program; test cancelled() between moves
      */
     //% blockHidden=true
-    export function addProgram(name: string, picture: Image,
+    export function addMenuProgram(name: string, picture: Image,
         run: () => void): void {
         if (!programNames) {
             programNames = []
@@ -82,11 +81,35 @@ namespace diffDrive {
         programNames.push(name)
         programPictures.push(picture)
         programRuns.push(run)
+    }
+
+    /**
+     * Bind a program to the run command of the same name, without
+     * touching the buttons.
+     * @param name the run command name, eg: "square"
+     * @param run the program; test cancelled() between moves
+     */
+    //% blockHidden=true
+    export function addRunProgram(name: string, run: () => void): void {
         onRun(name, function (arg: number) {
             beginProgram()
             run()
             endProgram()
         })
+    }
+
+    /**
+     * Add a program to the button menu and bind it to the run command
+     * of the same name.
+     * @param name the run command name, eg: "square"
+     * @param picture what the menu shows for this program
+     * @param run the program; test cancelled() between moves
+     */
+    //% blockHidden=true
+    export function addProgram(name: string, picture: Image,
+        run: () => void): void {
+        addMenuProgram(name, picture, run)
+        addRunProgram(name, run)
     }
 
     /** True while a program added with addProgram() is running. */
@@ -147,7 +170,9 @@ namespace diffDrive {
     // A `settings` system key, like the calibration keys.
     const wifiAddressKey = "#net.ip"
 
-    function storedWifiAddress(): number[] {
+    /** The WiFi address kept in flash, as four numbers, or [] if none is. */
+    //% blockHidden=true
+    export function storedWifiAddress(): number[] {
         if (!settings.exists(wifiAddressKey)) return []
         const packed = settings.readNumber(wifiAddressKey)
         if (!(packed > 0)) return []
@@ -200,8 +225,9 @@ namespace diffDrive {
     }
 
     /**
-     * Bring a fleet robot up: the radio link on the address this
-     * micro:bit's name derives, WiFi from stored credentials, the
+     * Bring a fleet robot up: the radio link and WiFi on the addresses
+     * this micro:bit's name derives, unless the program has already set
+     * them up itself, WiFi credentials from the robot's own store, the
      * calibration stored in flash, and the console's own run commands
      * (`_calshow`, `_calclear`, `_calsave`, `_calscale`, `_calports`,
      * `_netshow`, `_netset`, `_netclear`, `_reboot`). The leading `_`
@@ -219,11 +245,17 @@ namespace diffDrive {
         if (robotSetUp) return
         robotSetUp = true
         const name = control.deviceName()
-        const address = radioAddressForName(name)
-        if (address.length == 2) setupRadio(address[0], address[1])
-        const net = storedWifiAddress()
-        if (net.length == 4) setWifiAddress(net[0], net[1], net[2], net[3])
-        enableStoredWifiLink()
+        if (radioAddressInUse().length != 2) {
+            const byName = radioAddressForName(name)
+            if (byName.length == 2) setupRadio(byName[0], byName[1])
+        }
+        const address = radioAddressInUse()
+        if (!wifiLinkEnabled()) {
+            const net = storedWifiAddress()
+            if (wifiAddressInUse().length != 4 && net.length == 4)
+                setWifiAddress(net[0], net[1], net[2], net[3])
+            enableStoredWifiLink()
+        }
         applyStoredCalibration()
 
         onRun("_calshow", function (arg: number) { reportStoredCalibration() })
@@ -263,7 +295,8 @@ namespace diffDrive {
             ? "boot radio " + name + " ch " + address[0] + " grp " + address[1]
             : "boot radio off: " + name + " has no derived address")
         emitLine(storedCalibrationLine())
+        const net = wifiAddressInUse()
         emitLine("boot net " + dotted(net.length == 4 ? net : wifiAddressForName(name))
-            + (net.length == 4 ? " stored" : " default"))
+            + (storedWifiAddress().length == 4 ? " stored" : " default"))
     }
 }

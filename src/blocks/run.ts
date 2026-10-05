@@ -181,6 +181,10 @@ namespace diffDrive {
         _registerRunCatchAll()  // every name becomes dispatchable
     }
 
+    let radioAddress: number[]
+    let wifiAddress: number[]
+    let wifiEnabled: boolean
+
     /**
      * Turn on the v6 wire protocol over the radio, on this channel and
      * group, so a bench host or relay can drive the robot remotely.
@@ -204,7 +208,26 @@ namespace diffDrive {
     //% group="Radio and WiFi" weight=70
     //% subcategory="Setup"
     export function setupRadio(channel: number, group: number = 10): void {
-        _setupRadio(Math.round(channel), Math.round(group))
+        radioAddress = [Math.round(channel), Math.round(group)]
+        _setupRadio(radioAddress[0], radioAddress[1])
+    }
+
+    /** [channel, group] the program set the radio up on, or [] if it has not. */
+    //% blockHidden=true
+    export function radioAddressInUse(): number[] {
+        return radioAddress || []
+    }
+
+    /** The WiFi address the program set, as four numbers, or [] if it has not. */
+    //% blockHidden=true
+    export function wifiAddressInUse(): number[] {
+        return wifiAddress || []
+    }
+
+    /** True once the program has turned WiFi on. */
+    //% blockHidden=true
+    export function wifiLinkEnabled(): boolean {
+        return !!wifiEnabled
     }
 
     /**
@@ -229,7 +252,7 @@ namespace diffDrive {
             basic.showIcon(IconNames.No)
             return
         }
-        _setupRadio(address[0], address[1])
+        setupRadio(address[0], address[1])
     }
 
     /**
@@ -345,6 +368,7 @@ namespace diffDrive {
      */
     //% blockHidden=true
     export function enableStoredWifiLink(): void {
+        wifiEnabled = true
         _enableStoredWifiLink()
     }
 
@@ -362,6 +386,7 @@ namespace diffDrive {
     //% group="Radio and WiFi" weight=50
     //% subcategory="Setup"
     export function setWifiAddress(a: number, b: number, c: number, d: number): void {
+        wifiAddress = [a, b, c, d]
         _setWifiAddress(a, b, c, d)
     }
 
@@ -369,7 +394,8 @@ namespace diffDrive {
      * Turn WiFi on at the address that belongs to a robot's five-letter
      * name, joining the network stored on the robot. Leave the name
      * empty to use this micro:bit's own name, which is what a robot
-     * almost always wants. If the name is not a robot name, WiFi is
+     * almost always wants. An address stored on the robot from the
+     * console is used instead. If the name is not a robot name, WiFi is
      * left alone and the screen shows an X.
      * @param name robot name, or empty for this micro:bit's own name
      */
@@ -377,13 +403,15 @@ namespace diffDrive {
     //% group="Radio and WiFi" weight=60
     //% subcategory="Setup"
     export function setupWifiForName(name: string = ""): void {
-        const address = wifiAddressForName(name == "" ? control.deviceName() : name)
+        const kept = storedWifiAddress()
+        const address = kept.length == 4 ? kept
+            : wifiAddressForName(name == "" ? control.deviceName() : name)
         if (address.length != 4) {
             basic.showIcon(IconNames.No)
             return
         }
-        _setWifiAddress(address[0], address[1], address[2], address[3])
-        _enableStoredWifiLink()
+        setWifiAddress(address[0], address[1], address[2], address[3])
+        enableStoredWifiLink()
     }
 
     /**
