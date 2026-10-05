@@ -89,7 +89,7 @@ namespace {
 // "fix" it by forcing the two to match.
 constexpr const char* kDrivetrain = "diffdrive";
 constexpr const char* kProfile = "unbaked";
-constexpr const char* kVersion = "1.20261004.5";  // baked by config/hooks/version_bump
+constexpr const char* kVersion = "1.20261005.1";  // baked by config/hooks/version_bump
                                               // at `dotconfig version bump`; see the
                                               // note above
 
@@ -487,13 +487,13 @@ void Protocol::emitWifiDebug() {
       ssidField = wifiJoinSequencer_.currentSsid();
       haspwField = wifiJoinSequencer_.currentHasPassword();
     }
-  } else if (wifiStoreOnly_) {
-    // An empty store is an intentional no-credential state in this mode.
   } else if (wifiCredsExplicit_) {
     if (wifiSsid_[0] != '\0') {
       ssidField = wifiSsid_;
       haspwField = (wifiPassword_[0] != '\0');
     }
+  } else if (wifiStoreOnly_) {
+    // An empty store is an intentional no-credential state in this mode.
   } else if (kWifiSsid[0] != '\0') {
     ssidField = kWifiSsid;
     haspwField = (kWifiPassword[0] != '\0');
@@ -570,10 +570,6 @@ void Protocol::serviceWifi() {
       // local `config` are left at Config's own defaults ("") and
       // ignored, since begin() below never reaches wifiLink_ directly.
       wifiJoinSequencer_.begin(config);
-    } else if (wifiStoreOnly_) {
-      config.ssid = "";
-      config.password = "";
-      wifiLink_.begin(config);
     } else if (wifiCredsExplicit_) {
       // A program called setupWifi() before the link began -- use its
       // stored credentials (possibly an explicit "", which
@@ -582,6 +578,12 @@ void Protocol::serviceWifi() {
       // comment).
       config.ssid = wifiSsid_;
       config.password = wifiPassword_;
+      wifiLink_.begin(config);
+    } else if (wifiStoreOnly_) {
+      // Store-only shuts out the baked credential, never one the
+      // program supplied.
+      config.ssid = "";
+      config.password = "";
       wifiLink_.begin(config);
     } else {
       config.ssid = kWifiSsid;

@@ -205,7 +205,7 @@ namespace diffDrive {
      * @param group radio group, eg: 10
      */
     //% block="setup radio channel %channel group %group"
-    //% group="Radio and WiFi" weight=70
+    //% group="Radio and WiFi" weight=80
     //% subcategory="Setup"
     export function setupRadio(channel: number, group: number = 10): void {
         radioAddress = [Math.round(channel), Math.round(group)]
@@ -244,7 +244,7 @@ namespace diffDrive {
      * @param name robot name, or empty for this micro:bit's own name
      */
     //% block="setup radio channel for robot %name"
-    //% group="Radio and WiFi" weight=80
+    //% group="Radio and WiFi" weight=90
     //% subcategory="Setup"
     export function setupRadioForName(name: string = ""): void {
         const address = radioAddressForName(name == "" ? control.deviceName() : name)
@@ -295,18 +295,25 @@ namespace diffDrive {
     }
 
     /**
-     * Set the WiFi network to join from the program, instead of relying
-     * on credentials baked in at deploy time. Stores the credentials AND
-     * brings the link up in one call -- call it once, from `on start`,
-     * before anything else needs the network. An empty ssid disables the
-     * link (equivalent to no module fitted). A call made after the link
-     * has already started is ignored (see DBG:wifi for a late-call
-     * notice).
-     * @param ssid network name, eg: "Busboom Mesh"
+     * Join this WiFi network, with the name and password written in
+     * the program. Call it once, from `on start`. A network stored on
+     * the robot from the console is tried first; an empty network name
+     * leaves WiFi off. The robot's address is the one stored on it, or
+     * the one its name derives, unless `set wifi address` ran first.
+     *
+     * Anyone who can read the program can read the password.
+     * @param ssid network name, eg: "Robot_Garage"
      * @param password network password
      */
-    //% blockHidden=true
+    //% block="setup wifi network %ssid password %password"
+    //% group="Radio and WiFi" weight=60
+    //% subcategory="Setup"
     export function setupWifi(ssid: string, password: string = ""): void {
+        if (wifiAddressInUse().length != 4) {
+            const kept = storedWifiAddress()
+            if (kept.length == 4) setWifiAddress(kept[0], kept[1], kept[2], kept[3])
+        }
+        wifiEnabled = true
         _setupWifi(ssid, password)
     }
 
@@ -400,7 +407,7 @@ namespace diffDrive {
      * @param name robot name, or empty for this micro:bit's own name
      */
     //% block="setup wifi for robot %name"
-    //% group="Radio and WiFi" weight=60
+    //% group="Radio and WiFi" weight=70
     //% subcategory="Setup"
     export function setupWifiForName(name: string = ""): void {
         const kept = storedWifiAddress()

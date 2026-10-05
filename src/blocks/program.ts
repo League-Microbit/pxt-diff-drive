@@ -239,7 +239,7 @@ namespace diffDrive {
      * this program.
      */
     //% block="setup robot"
-    //% group="Robot" weight=190
+    //% group="Robot" weight=200
     //% subcategory="Setup"
     export function setupRobot(): void {
         if (robotSetUp) return
