@@ -30,9 +30,12 @@ enum class MotionOwner : uint8_t { kNone, kWire, kJob, kBlock };
 
 // The one arbitration rule a block-motion entry point applies before it
 // ever touches the engine: take kBlock and return true iff `*owner` is
-// currently kNone, otherwise leave `*owner` untouched and return false
-// -- refuse, never silently supersede a live kWire/kJob move.
+// currently kNone or already kBlock (a program updating its own
+// continuous drive, e.g. driveTwist() every tick), otherwise leave
+// `*owner` untouched and return false -- refuse, never silently
+// supersede a live kWire/kJob move.
 inline bool tryTakeBlockOwnership(MotionOwner* owner) {
+  if (*owner == MotionOwner::kBlock) return true;
   if (*owner != MotionOwner::kNone) return false;
   *owner = MotionOwner::kBlock;
   return true;
