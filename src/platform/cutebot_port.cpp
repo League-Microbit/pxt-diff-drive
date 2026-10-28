@@ -7,6 +7,7 @@
 #include "vfp_guard.h"
 
 #include <cmath>
+#include <cstring>
 
 namespace diffDrive {
 
@@ -39,6 +40,7 @@ bool CutebotDevice::writeV2Frame(uint8_t cmd, const uint8_t* params,
 bool CutebotDevice::writeWheelFrame(uint8_t wheelSel, uint8_t absL,
                                     uint8_t absR, uint8_t dirbits) {
   const uint8_t params[4] = {wheelSel, absL, absR, dirbits};
+  lastOnboardValid_ = false;
   return writeV2Frame(kCmdWheel, params, 4);
 }
 
@@ -80,7 +82,7 @@ void CutebotDevice::updateTapNeutral() {
 }
 
 bool CutebotDevice::setOnboardMode(int mode) {
-  if (mode < 0 || mode > 2) return false;
+  if (mode < 0 || mode > 3) return false;
   onboardMode_ = mode;
   return true;
 }
@@ -99,8 +101,14 @@ bool CutebotDevice::writeOnboardFrame(float left, float right) {
     const float bounded = mag > 60000.0f ? 60000.0f : mag;
     return static_cast<uint16_t>(std::lround(bounded));
   };
-  const uint16_t magL = magnitude(left);
-  const uint16_t magR = magnitude(right);
+  uint16_t magL = magnitude(left);
+  uint16_t magR = magnitude(right);
+  // MEASURED zetuv 2026-10-19: an 0x80 frame with exactly 0 on one
+  // wheel and non-zero on the other runs the moving wheel up to its
+  // maximum (~500 mm/s) whatever was asked for; 1 mm/s does not. A
+  // stopped wheel beside a moving one is sent as 1 mm/s instead.
+  if (magL == 0 && magR != 0) magL = 1;
+  if (magR == 0 && magL != 0) magR = 1;
   const uint8_t dirbits = static_cast<uint8_t>(
       (left < 0.0f ? 0x01 : 0x00) | (right < 0.0f ? 0x02 : 0x00));
   const uint8_t params[5] = {
@@ -109,7 +117,12 @@ bool CutebotDevice::writeOnboardFrame(float left, float right) {
       static_cast<uint8_t>((magR >> 8) & 0xFF),
       static_cast<uint8_t>(magR & 0xFF),
       dirbits};
-  return writeV2Frame(kCmdOnboard, params, 5);
+  if (lastOnboardValid_ && std::memcmp(params, lastOnboard_, 5) == 0)
+    return true;
+  const bool ok = writeV2Frame(kCmdOnboard, params, 5);
+  lastOnboardValid_ = ok;
+  if (ok) std::memcpy(lastOnboard_, params, 5);
+  return ok;
 }
 
 void CutebotDevice::serviceCycle() {
@@ -161,6 +174,24 @@ bool CutebotDevice::readSelectedDegrees(int32_t* degreesOut) {
       (static_cast<uint32_t>(data[1]) << 8) |
       (static_cast<uint32_t>(data[2]) << 16) |
       (static_cast<uint32_t>(data[3]) << 24));
+  return true;
+}
+
+bool CutebotDevice::readLineState(uint8_t* bitsOut) {
+  const uint8_t params[1] = {0x00};
+  if (!writeV2Frame(kCmdLine, params, 1)) return false;
+  uint8_t v = 0;
+  if (bus_.read(kAddress << 1, &v, 1) != 0) return false;
+  *bitsOut = v;
+  return true;
+}
+
+bool CutebotDevice::readLineGrey(int channel, uint8_t* greyOut) {
+  const uint8_t params[2] = {0x02, static_cast<uint8_t>(channel)};
+  if (!writeV2Frame(kCmdLine, params, 2)) return false;
+  uint8_t v = 0;
+  if (bus_.read(kAddress << 1, &v, 1) != 0) return false;
+  *greyOut = v;
   return true;
 }
 

@@ -31,10 +31,12 @@
 #include "i2c_bus.h"
 #include "../core/diffdrive.h"
 #include "../core/encoder_glitch_armor.h"
+#include "../core/position_motor.h"
 
 namespace diffDrive {
 
-class NezhaMotorPort final : public DiffDrive::Motor {
+class NezhaMotorPort final : public DiffDrive::Motor,
+                             public DiffDrive::PositionMotor {
  public:
   // port: 1-based Nezha motor port (M1..M4). fwdSign: +1/-1 so that
   // positive duty is robot-forward for a mirror-mounted wheel pair.
@@ -59,6 +61,31 @@ class NezhaMotorPort final : public DiffDrive::Motor {
   void rebaseline() override;             // software re-anchor, no bus
   bool wedged() const override { return wedgeLatched_; }
   bool wedgeSuspect() const override { return wedgeSuspect_; }
+
+  // ---- DiffDrive::PositionMotor ----
+  // The brick's own position move. Frame bytes: the "three frames"
+  // table in docs/knowledge/2026-10-27-nezha-brick-opcodes (section 4).
+  // While a move is live (the latch) setDuty() is a no-op, no 0x60 is
+  // written, and driven() is true. The latch clears when the wheel is at
+  // rest near its target, on hardStop(), or on emergencyStop().
+  bool supportsPositionMove() const override { return true; }
+  float positionQuantum() const override { return kPositionQuantum; }
+  bool beginMove(float delta, float degPerSec) override;
+  bool hardStop() override;
+  bool moveLive() const override { return moveLive_; }
+  bool driven() const override;
+  float lastMoveCounts() const override { return lastMove_; }
+
+  // speed_path selector (config ordinal 53). 0 (the
+  // default) is today's 0x60 duty path, byte-identical. 1 drives the
+  // wheel through the motor's own speed loop: each changed shaped duty
+  // ships `0x77 round(|pct| x 11.5)` (deg/s) then `0x70` mode 3 with
+  // n = 1 (a timed run of (10n - 3) x 100 ms = 0.7 s, so a starved
+  // firmware self-stops), and a stop from speed is the hard-stop
+  // opcode. Frame bytes: the brick opcode reference under docs/knowledge/.
+  // The speed_path config ordinal calls this setter.
+  void setSpeedPath(int path) { speedPath_ = path == 1 ? 1 : 0; }
+  int speedPath() const { return speedPath_; }
 
   // Shaping parameters (defaults are the firmware's shipped values).
   void configureShaping(float outputDeadband, float reversalDwell,
@@ -89,12 +116,41 @@ class NezhaMotorPort final : public DiffDrive::Motor {
  private:
   static constexpr uint8_t kRegEncoder = 0x46;
   static constexpr uint8_t kDirCcw = 2;
+  static constexpr uint8_t kRegSpeedStore = 0x77;  // per-port deg/s
+  static constexpr uint8_t kRegMove = 0x70;        // move, mode in byte 6
+  static constexpr uint8_t kRegHardStop = 0x5F;
+  static constexpr uint8_t kMoveModeDegrees = 2;   // integer degrees
+  static constexpr uint8_t kMoveModeTimed = 3;     // timed run, speed_path 1
+  static constexpr uint8_t kTimedRunUnits = 1;     // n: (10n-3) x 100 ms
+  // 11.5 deg/s per percent: ESP32 rig speed-step runs, 2026-10-27
+  // (ESP32 rig motor characterization, brick opcode reference section 1).
+  // UNVERIFIED through the brick: that rig drove the motor over UART.
+  static constexpr float kDegPerSecPerPercent = 11.5f;  // [deg/s per %]
+  // Re-send 0x70 before the 0.7 s timed run lapses when the speed has
+  // not changed (a steady command would otherwise coast to a stop).
+  static constexpr uint64_t kTimedRefresh = 400000;  // [us]
+  // A stop that starts at or below the kernel floor keeps 0x60 0: the hard stop
+  // and 0x60 0 travel the same 0.6 mm from the 8% floor
+  // (docs/code-review/2026-10-27/data/mb_probe_stops1.csv).
+  static constexpr int kStopFromSpeedFloor = 8;    // [pct]
+  static constexpr float kPositionQuantum = 10.0f; // [counts] = 1 deg
+  static constexpr int kMaxMoveDegrees = 65535;
+  static constexpr int kMaxSpeedStore = 65535;     // [deg/s]
+  // Move-done test: within this many counts of the target (capped at
+  // half the commanded move so a 1-degree move cannot start "done"), and
+  // the position unchanged for kMoveRestTicks ticks. The 5-degree figure
+  // is the hard-stop hold accuracy (brick opcode reference, section 3).
+  static constexpr float kMoveDoneBand = 50.0f;    // [counts]
+  static constexpr int kMoveRestTicks = 3;
   static constexpr int8_t kNeverWritten = -128;  // first-write sentinel
   static constexpr float kStopConfirmVelocity = 102.0f;  // [counts/s]
   static constexpr int kWedgeThreshold = 10;     // identical reads
   static constexpr float kMotionThreshold = 0.03f;  // [-1,1] duty
 
   bool writeFrame(uint8_t arg, uint8_t reg, uint8_t val);
+  bool writeBrickFrame(uint8_t arg, uint8_t reg, uint8_t hi, uint8_t mode,
+                       uint8_t lo);
+  void trackMove();  // tick(): completion test for a live move
   bool readEncoderRaw(int32_t* raw);
   void writeShapedDuty(float duty, uint32_t now);  // [-1,1] [ms]
   void writeRawDuty(float duty, uint64_t now, bool stopping);  // [-1,1] [us]
@@ -123,6 +179,19 @@ class NezhaMotorPort final : public DiffDrive::Motor {
                                    // credited toward the reversal dwell
   bool dwelling_ = false;
   uint32_t dwellStart_ = 0;        // [ms]
+
+  // position-move state
+  bool moveLive_ = false;          // the move-live latch
+  int speedPath_ = 0;              // 0 = 0x60 duty, 1 = 0x77/0x70 mode 3
+  bool speedRunning_ = false;      // a mode 3 run was issued, no stop since
+  uint64_t lastTimedWrite_ = 0;    // [us] last mode 3 0x70
+  bool stopHold_ = false;          // brick is stopping itself: do not
+                                   // re-write 0x60 0 for stopNotTaken
+  int32_t lastSpeedStore_ = -1;    // [deg/s] last 0x77 value ACKed; -1 none
+  float lastMove_ = 0.0f;         // [counts] rounded delta last commanded
+  float moveTarget_ = 0.0f;        // [counts] position() value to reach
+  int moveRestTicks_ = 0;
+  float moveLastPosition_ = 0.0f;  // [counts]
  public:
   // Peak consecutive-identical-encoder-read streak observed while the
   // wheel was driven (cumulative since boot) -- direct latch evidence:

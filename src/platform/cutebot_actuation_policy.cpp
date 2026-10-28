@@ -105,6 +105,14 @@ CutebotActuationPolicy::Decision CutebotActuationPolicy::decide(
     } else {
       result.state.engaged = prevState.engaged;
     }
+  } else if (mode == 3) {
+    // Mode 3, board loop always: every non-neutral cycle ships the
+    // shaped setpoint as an 0x80 frame, whatever its magnitude. MEASURED
+    // zetuv 2026-10-19 on the stand: the board's own loop holds 30 mm/s
+    // and up, while the 0x10 path jumps from a ~10 % deadband straight
+    // to ~200 mm/s and couples the two wheels, so the kernel's duty loop
+    // cannot hold low speeds or a differential through it.
+    result.state.engaged = true;
   } else {
     // An out-of-range mode falls back to PWM, the same "unrecognized
     // field is silently inert" precedent shims.cpp's own

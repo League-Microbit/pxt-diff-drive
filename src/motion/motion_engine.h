@@ -15,7 +15,9 @@
 #include <cstdint>
 
 #include "../core/diffdrive.h"
+#include "../core/position_motor.h"
 #include "motion_limits.h"
+#include "position_move.h"
 #include "segment.h"
 #include "velocity_shaper.h"
 #include "wheel_command_tap.h"
@@ -64,6 +66,10 @@ class MotionEngine {
   void setRotationalSlip(float slip) {
     if (slip > 0.0f) rotationalSlip_ = slip;
   }
+
+  // Finish a MOVE_X arc's missing rotation with a pivot. Off by default:
+  // a drivetrain that holds the arc's wheel ratio never needs it.
+  void setArcYawClosure(bool on) { arcYawClosure_ = on; }
 
   // [counts/mm] 1 count == 0.1 shaft degree.
   float countsPerMm() const { return 10.0f / travelCalib_; }
@@ -165,7 +171,9 @@ class MotionEngine {
   // Either a Segment or a Hold is driving. Callers inferring "something is
   // driving" must read this, not the kernel's applied duty, which is one
   // tick stale after a command is armed.
-  bool isDriving() const { return seg_.active || hold_.active; }
+  bool isDriving() const {
+    return seg_.active || hold_.active || posMove_.active;
+  }
 
   // The most recent Segment ended on its own deadline rather than by
   // arriving, aborting or being cancelled. Latched on the exact tick the
@@ -175,8 +183,14 @@ class MotionEngine {
     return lastSegmentEndedByDeadline_;
   }
 
-  // Force-end the current command now; no-op if nothing is active.
-  void endMove();
+  // Force-end the current command now; no-op if nothing is active. A
+  // live position move is hard-stopped on both ports here. Pass false
+  // endMoveStaged() is the same with no port write, for a caller that
+  // does not own the bus (another fiber holds it): the move's record is
+  // dropped but the ports stay latched live, so their own emergencyStop()
+  // sends the hard stop from the bus holder.
+  void endMove() { endMoveImpl(true); }
+  void endMoveStaged() { endMoveImpl(false); }
 
   // [0..1000] dominant-axis fraction completed; 1000 when no Segment is
   // active. A continuous hold has no notion of done and is unaffected.
@@ -370,6 +384,70 @@ class MotionEngine {
     if (ms >= 0.0f) nudgeSettle_ = ms;
   }
 
+  // ---- position moves: the motors' own position loops ------------------
+  //
+  // The ports the engine hands position moves to (not owned; set once at
+  // composition, shims.cpp ensure() via board.h's boardPositionMotor()).
+  // nullptr, or a port whose supportsPositionMove() is false (Cutebot),
+  // means unsupported.
+  void setPositionMotors(DiffDrive::PositionMotor* left,
+                         DiffDrive::PositionMotor* right) {
+    posLeft_ = left;
+    posRight_ = right;
+  }
+  bool positionMoveSupported() const {
+    return posLeft_ != nullptr && posRight_ != nullptr &&
+           posLeft_->supportsPositionMove() &&
+           posRight_->supportsPositionMove();
+  }
+
+  // moveX()'s (distance, rotation, cruise, timeout) run through the
+  // motors' own position loops: per-wheel count targets from the same
+  // segment maths, rounded to the port quantum; per-wheel deg/s
+  // proportional to each wheel's share of the dominant distance so both
+  // finish together; two beginMove() calls back to back. The kernel
+  // keeps stepping (encoders, odometry) but stages no wheel command.
+  // Supersedes any in-flight command. Where position moves are not
+  // supported it falls back to moveX() and returns true. Returns false
+  // (nothing live) when the port refuses, the kernel is e-stopped, or
+  // the move rounds to nothing. wheelsX()/moveX() select this path
+  // themselves under setPositionMode().
+  bool beginPositionMove(float distance, float rotation, float cruise,
+                         uint32_t timeout);  // [mm] [rad] [mm/s] [ms]
+
+  // position_mode: which position verbs go down the position path.
+  // 0 never (the kernel segment, as before), 1 pure straights and pure
+  // pivots (distance or rotation exactly zero), 2 arcs too. Honoured by
+  // wheelsX(), moveX() and, through its blended arc, goToR()/goToW();
+  // never by wheelsV()/moveV(), which are velocity commands, nor by a
+  // go-to that splits into a pivot and a chord (two phases). Where the
+  // ports do not support position moves the mode has no effect.
+  //
+  // The boot default is 1: straights and pivots run through the motor's
+  // own position loop (docs/code-review/2026-10-27/data/mb_probe_stops1.csv
+  // for the stop travel; captures/zuvat-position-2026-10-27/fiftycm/position.csv
+  // and pivots/analysis_output.txt for the accuracy it buys). Arcs stay on
+  // the kernel (captures/zuvat-position-2026-10-27/circle/closure_radial.csv).
+  // Rig::positionMode seeds from this constant so GET reads what routes.
+  static constexpr int kDefaultPositionMode = 1;
+  void setPositionMode(int mode) { positionMode_ = mode; }
+  int positionMode() const { return positionMode_; }
+
+  // True when a (distance, rotation) move would take the position path
+  // under the current position_mode and the composed ports.
+  bool takesPositionPath(float distance, float rotation) const {  // [mm] [rad]
+    if (positionMode_ < 1 || !positionMoveSupported()) return false;
+    return positionMode_ >= 2 || distance == 0.0f || rotation == 0.0f;
+  }
+
+  // A position move is in flight (service() is dispatching to
+  // servicePositionMove()).
+  bool isPositionMoveActive() const { return posMove_.active; }
+
+  // The last position move ended inside the arrival window (as opposed
+  // to deadline, stall, e-stop or cancel).
+  bool lastPositionMoveArrived() const { return posMove_.arrived; }
+
   // The one settable shaping surface. This engine holds no shaping knob.
   MotionLimits& limits() { return limits_; }
   const MotionLimits& limits() const { return limits_; }
@@ -390,6 +468,13 @@ class MotionEngine {
   // bearing first, then drive the chord. Inherited from a go-to-a-point
   // navigator (motion-api.md S3.3); it was never a drivetrain limit.
   static constexpr float kTurnFirstAngle = 0.8726646f;
+
+  // Position-move stall test: a wheel counts as moving once it has
+  // travelled this far since the last progress stamp; with the kernel's
+  // stallWindow unset the window falls back to kDefaultStallWindow
+  // (the shipped Rig value, shims.cpp).
+  static constexpr float kPositionProgress = 2.0f;        // [counts]
+  static constexpr uint32_t kDefaultStallWindow = 500u;   // [ms]
 
   static constexpr int kSettleMaxSteps = 12;          // [steps]
   static constexpr float kSettleRestCountsPerS = 25.0f;  // [counts/s] ~2 mm/s
@@ -413,6 +498,7 @@ class MotionEngine {
     float twist = 0.0f;     // [mm/s] target half-differential
     float dominant = 0.0f;  // [mm/s] max(|v-twist|, |v+twist|)
     uint32_t until = 0;     // [ms] the caller's duration deadline
+    bool stallArmed = false;  // see Segment::stallArmed
   };
 
   // beginNudge()'s target, ticked by serviceNudge(). Exactly one of
@@ -466,6 +552,13 @@ class MotionEngine {
   // way the Segment/Hold branches already are -- see this file's own
   // Nudge struct and beginNudge()'s header comment for the algorithm.
   bool serviceNudge();
+
+  // posMove_'s per-tick advance: completion, e-stop, stall, deadline.
+  bool servicePositionMove();
+
+  // hardStop() on both ports and end posMove_ (never a 0x60).
+  void stopPositionMove();
+  void endMoveImpl(bool stopPositionPorts);
 
   // Converts this segment's axis into the dominant-wheel floor/cap the
   // shaper wants. A pure turn uses the omega floor/ceiling; a straight leg
@@ -524,10 +617,15 @@ class MotionEngine {
   float travelCalib_ = 0.7878f;   // [mm/deg] wheel travel per shaft degree
   float trackWidth_ = 114.2f;     // [mm] tape-measured
   float rotationalSlip_ = 0.952f; // [1] physical/odometric rotation ratio
+  bool arcYawClosure_ = false;
 
   Segment seg_;
   Hold hold_;
   Nudge nudge_;
+  PositionMove posMove_;
+  int positionMode_ = kDefaultPositionMode;  // [0..2] see setPositionMode()
+  DiffDrive::PositionMotor* posLeft_ = nullptr;   // not owned
+  DiffDrive::PositionMotor* posRight_ = nullptr;  // not owned
   VelocityShaper shaper_;
   MotionLimits limits_;
 

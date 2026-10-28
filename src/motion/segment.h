@@ -29,6 +29,15 @@ struct Segment {
   float pendingDistance = 0.0f;  // [mm]
   float pendingCruise = 0.0f;    // [mm/s]
 
+  // A MOVE_X arc that arrives with its rotation short by more than the
+  // arrival window finishes the rest as a pivot.
+  bool closeYaw = false;
+
+  // The stall latch a new command asks the kernel to clear is only
+  // cleared on the kernel's next step; until this segment has seen it
+  // clear once, a set latch is the previous move's and must not end it.
+  bool stallArmed = false;
+
   uint32_t deadline = 0;  // [ms] the caller's timeout backstop
   bool active = false;
   bool settling = false;

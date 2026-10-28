@@ -143,6 +143,9 @@ struct StatusFields {
   bool radio = false;   // v6 radio link enabled
   uint8_t channel = 0;  // radio channel, live, reported even while disabled
   uint8_t group = 0;    // radio group, live, reported even while disabled
+  // The live move runs on the motors' own position loops (not the
+  // kernel). Appended last on the wire so older parsers ignore it.
+  bool posmove = false;
 };
 
 // One named, already-scaled telemetry value (protocol.md S5.2: `thdr

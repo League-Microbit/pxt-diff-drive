@@ -68,6 +68,12 @@ BoardMotors boardMotors() {
   return BoardMotors{b.left, b.right};
 }
 
+DiffDrive::PositionMotor* boardPositionMotor(int side) {
+  NezhaBoard& b = board();
+  return side == 0 ? static_cast<DiffDrive::PositionMotor*>(&b.left)
+                   : static_cast<DiffDrive::PositionMotor*>(&b.right);
+}
+
 MotorWiring boardWiring(int side) {
   const NezhaBoard& b = board();
   const NezhaMotorPort& p = (side == 0) ? b.left : b.right;
@@ -85,6 +91,14 @@ int boardDiagValue(int ordinal) {
   return nezhaBoardDiagValue(b.left, b.right, ordinal);
 }
 
+int boardSpeedPath() { return board().left.speedPath(); }
+bool boardSetSpeedPath(int path) {
+  NezhaBoard& b = board();
+  b.left.setSpeedPath(path);
+  b.right.setSpeedPath(path);
+  return true;
+}
+
 // ---- hybrid actuation --------------------------------------------------
 //
 // The Nezha brick has no onboard speed loop, so none of this means
@@ -99,6 +113,17 @@ bool boardSetOnboardFloor(float) { return false; }
 
 #ifndef DIFFDRIVE_HOST_BUILD
 
+int boardLineBits() {
+  I2CBus& bus = defaultI2CBus();
+  const uint8_t sel = 4;
+  if (bus.write(0x1A << 1, &sel, 1) != 0) return -1;
+  uint8_t v = 0;
+  if (bus.read(0x1A << 1, &v, 1) != 0) return -1;
+  return v & 0x0F;
+}
+
+int boardLineGrey(int) { return -1; }
+
 // ---- fault-context emergency stop -----------------------------------
 //
 // Moved verbatim from nezha_port.cpp: the same bytes at the same
@@ -111,7 +136,8 @@ bool boardSetOnboardFloor(float) { return false; }
 // that call moves with the board
 // selection.
 //
-// Writes "run at 0" to BOTH motor ports over I2C with no dependency on
+// Writes "run at 0" to ALL FOUR motor ports (M1 to M4: the wiring
+// hooks allow a robot on M3/M4) over I2C with no dependency on
 // any object, fiber, scheduler or kernel state -- so it is callable
 // from a fault handler, where none of those can be trusted. See
 // nezha_port.cpp's own (unmoved) comment on why a plain reboot is not
@@ -120,7 +146,7 @@ bool boardSetOnboardFloor(float) { return false; }
 extern "C" void diffdrive_emergency_motor_stop() {
   // Same frame shape as NezhaMotorPort::writeFrame(), inlined so this
   // needs no instance: {0xFF, 0xF9, port, arg, reg, val, 0xF5, 0x00}.
-  for (uint8_t port = 1; port <= 2; ++port) {
+  for (uint8_t port = 1; port <= 4; ++port) {
     uint8_t frame[8] = {0xFF, 0xF9, port, NezhaMotorPort::kDirCw,
                         NezhaMotorPort::kRegMotorRun, 0x00, 0xF5, 0x00};
 #if MICROBIT_CODAL

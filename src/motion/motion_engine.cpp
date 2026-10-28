@@ -109,6 +109,9 @@ MotionEngine::AxisLimits MotionEngine::axisLimits(const Segment& seg) const {
 }
 
 void MotionEngine::cancelMove() {
+  // A live position move runs on the motors' own loop: dropping our
+  // record is not enough, the brick would carry on to its target.
+  if (posMove_.active) stopPositionMove();
   seg_ = Segment();
   hold_.active = false;
   nudge_.active = false;
@@ -118,6 +121,7 @@ void MotionEngine::wheelsV(float left, float right, uint32_t duration) {
   kernel_.clearStallLatch();  // a new command gets its own attempt
   const bool wasSegActive = seg_.active;
   const bool wasHoldActive = hold_.active;
+  const bool wasStallArmed = hold_.stallArmed;
   cancelMove();
 
   const float v = 0.5f * (left + right);      // [mm/s] target mean
@@ -131,6 +135,7 @@ void MotionEngine::wheelsV(float left, float right, uint32_t duration) {
   hold_.dominant = absLeft > absRight ? absLeft : absRight;
   hold_.until = now() + duration;
   hold_.active = true;
+  hold_.stallArmed = !wasSegActive && wasHoldActive && wasStallArmed;
 
   // A genuinely new hold restarts the shaper from the floor. A call that
   // only RETARGETS a live hold (closed-loop steering re-issuing every
@@ -196,6 +201,16 @@ void MotionEngine::beginPendingStraightPhase() {
 
 void MotionEngine::wheelsX(float left, float right, float cruise,
                            uint32_t timeout) {
+  {
+    // The same reduction the position path takes: a pure straight has
+    // left == right, a pure pivot has left == -right.
+    const float distance = 0.5f * (left + right);               // [mm]
+    const float rotation = (right - left) / effectiveTrackWidth();  // [rad]
+    if (takesPositionPath(distance, rotation) &&
+        beginPositionMove(distance, rotation, cruise, timeout)) {
+      return;
+    }
+  }
   kernel_.clearStallLatch();  // a new command gets its own attempt
   const uint32_t deadline = now() + timeout;
   const float cpm = countsPerMm();
@@ -206,6 +221,10 @@ void MotionEngine::wheelsX(float left, float right, float cruise,
 
 void MotionEngine::moveX(float distance, float rotation, float cruise,
                          uint32_t timeout) {
+  if (takesPositionPath(distance, rotation) &&
+      beginPositionMove(distance, rotation, cruise, timeout)) {
+    return;
+  }
   kernel_.clearStallLatch();  // a new command gets its own attempt
   // One blended constant-ratio segment for EVERY (distance, rotation).
   // R = distance / rotation is always a driveable arc: |R| < b/2 only
@@ -219,6 +238,9 @@ void MotionEngine::moveX(float distance, float rotation, float cruise,
   const float distTarget = distance * cpm;
   const float yawTarget = rotation * 0.5f * effectiveTrackWidth() * cpm;
   beginSegment(distTarget, yawTarget, cruise, deadline);
+  if (arcYawClosure_ && seg_.active && distTarget != 0.0f && yawTarget != 0.0f) {
+    seg_.closeYaw = true;
+  }
 }
 
 void MotionEngine::moveV(float vx, float omega, uint32_t duration) {
@@ -263,6 +285,7 @@ void MotionEngine::goToW(const PoseSource& pose, float x, float y,
 }
 
 bool MotionEngine::service() {
+  if (posMove_.active) return servicePositionMove();
   if (nudge_.active) return serviceNudge();
   if (!seg_.active && !hold_.active) return false;
 
@@ -325,11 +348,13 @@ bool MotionEngine::service() {
         seg_.wrongWay(out) &&
         std::fabs(seg_.yawProgress(out)) >= kMinYawProgressBeforeWrongWay;
     const bool expired = static_cast<int32_t>(nowVal - seg_.deadline) >= 0;
-    if (wrongWay || out.stallHalted || out.estopped || expired) {
+    if (!out.stallHalted) seg_.stallArmed = true;
+    const bool stalled = out.stallHalted && seg_.stallArmed;
+    if (wrongWay || stalled || out.estopped || expired) {
       if (wrongWay) ++wrongWayCount_;
       // The deadline had first refusal above only for WHETHER to end the
       // segment; an abort reason still wins on WHY.
-      lastSegmentEndedByDeadline_ = expired && !wrongWay && !out.stallHalted &&
+      lastSegmentEndedByDeadline_ = expired && !wrongWay && !stalled &&
                                     !out.estopped;
       kernel_.neutral();
       notifyNeutral();
@@ -357,6 +382,21 @@ bool MotionEngine::service() {
         kernel_.rearmReferences();
         beginPendingStraightPhase();
         return seg_.active;
+      }
+      if (seg_.closeYaw) {
+        // MEASURED zetuv 2026-10-21: a chassis that cannot brake an arc's
+        // inner wheel hard enough ends 45 deg arcs ~10 deg short.
+        const float shortBy = std::fabs(seg_.yawTarget) - seg_.yawProgress(out);  // [counts]
+        const float window = limits_.arriveYaw * (3.14159265f / 180.0f) *
+                             0.5f * effectiveTrackWidth() * cpm;
+        if (shortBy > window) {
+          const float remainder = seg_.yawTarget > 0.0f ? shortBy : -shortBy;
+          const float cruise = seg_.cruise;
+          const uint32_t deadline = seg_.deadline;
+          kernel_.rearmReferences();
+          beginSegment(0.0f, remainder, cruise, deadline);
+          return seg_.active;
+        }
       }
       lastSegmentEndedByDeadline_ = false;
       seg_ = Segment();
@@ -388,7 +428,8 @@ bool MotionEngine::service() {
   // ends a Segment above: without this, the kernel sits forced-neutral
   // under a hold that stays "driving" for its whole lease (up to
   // kLeaseMax), and a `while (driveTick())` loop spins over a halted robot.
-  if (out.stallHalted) {
+  if (!out.stallHalted) hold_.stallArmed = true;
+  if (out.stallHalted && hold_.stallArmed) {
     kernel_.neutral();
     notifyNeutral();
     hold_.active = false;
@@ -421,10 +462,14 @@ bool MotionEngine::service() {
   return true;
 }
 
-void MotionEngine::endMove() {
+void MotionEngine::endMoveImpl(bool stopPositionPorts) {
   // An explicit external end is never a timeout, but a no-op call must not
   // overwrite a still-meaningful earlier verdict.
   if (seg_.active) lastSegmentEndedByDeadline_ = false;
+  if (posMove_.active) {
+    if (stopPositionPorts) stopPositionMove();
+    else posMove_.active = false;
+  }
   if (seg_.active || hold_.active) {
     kernel_.neutral();
     notifyNeutral();
@@ -653,7 +698,167 @@ bool MotionEngine::serviceNudge() {
   return true;
 }
 
+namespace {
+
+// Round to the port quantum the way NezhaMotorPort::beginMove() does
+// (nearest, half away from zero), so the engine's plan and the port's
+// commanded delta agree.
+float roundToQuantum(float counts, float quantum) {  // [counts] [counts]
+  return std::round(counts / quantum) * quantum;
+}
+
+}  // namespace
+
+bool MotionEngine::beginPositionMove(float distance, float rotation,
+                                     float cruise, uint32_t timeout) {
+  if (!positionMoveSupported()) {
+    // No built-in position move on this board (Cutebot): the kernel's
+    // own segment does the job.
+    moveX(distance, rotation, cruise, timeout);
+    return true;
+  }
+  kernel_.clearStallLatch();  // a new command gets its own attempt
+  cancelMove();               // hardStops any earlier position move
+  // The kernel owns no wheel command while a position move runs: park it
+  // at neutral so a stale lease cannot stage duty behind the latch.
+  kernel_.neutral();
+  notifyNeutral();
+
+  const DiffDrive::DifferentialDrive::Output out = kernel_.output();
+  if (out.estopped) return false;
+
+  const float cpm = countsPerMm();
+  const float distTarget = distance * cpm;
+  const float yawTarget = rotation * 0.5f * effectiveTrackWidth() * cpm;
+  const float quantum = posLeft_->positionQuantum();
+  if (cruise <= 0.0f || quantum <= 0.0f) return false;
+
+  // Rounding each wheel to the quantum leaves at most half a quantum of
+  // error on each, so the mean (distance) and half-difference (heading)
+  // axes are each off by at most half a quantum.
+  const float moveLeft = roundToQuantum(distTarget - yawTarget, quantum);
+  const float moveRight = roundToQuantum(distTarget + yawTarget, quantum);
+  const float absLeft = std::fabs(moveLeft);
+  const float absRight = std::fabs(moveRight);
+  const float dominant = absLeft > absRight ? absLeft : absRight;
+  if (dominant <= 0.0f) return false;  // rounds to nothing
+
+  // The dominant wheel runs at the capped cruise; the other at its
+  // share of that, so both finish together.
+  float target = cruise;  // [mm/s]
+  if (limits_.vMax < target) target = limits_.vMax;
+  if (distTarget == 0.0f && limits_.omegaMax > 0.0f) {
+    const float cap = limits_.omegaMaxAsWheelSpeed(effectiveTrackWidth());
+    if (cap < target) target = cap;
+  }
+  const float dominantRate = target / travelCalib_;  // [deg/s]
+
+  posMove_ = PositionMove();
+  posMove_.posLeft0 = out.positionLeft;
+  posMove_.posRight0 = out.positionRight;
+  posMove_.deadline = now() + timeout;
+  posMove_.progressAt = now();
+  posMove_.lastLeft = out.positionLeft;
+  posMove_.lastRight = out.positionRight;
+
+  bool startedLeft = false;
+  if (absLeft > 0.0f) {
+    startedLeft = posLeft_->beginMove(moveLeft, dominantRate * absLeft / dominant);
+    if (!startedLeft) return false;
+    posMove_.moveLeft = posLeft_->lastMoveCounts();
+  }
+  if (absRight > 0.0f) {
+    if (!posRight_->beginMove(moveRight, dominantRate * absRight / dominant)) {
+      if (startedLeft) posLeft_->hardStop();
+      posMove_ = PositionMove();
+      return false;
+    }
+    posMove_.moveRight = posRight_->lastMoveCounts();
+  }
+  posMove_.active = true;
+  lastSegmentEndedByDeadline_ = false;
+  return true;
+}
+
+void MotionEngine::stopPositionMove() {
+  // Both ports, always: a wheel that was not moved still gets the hold,
+  // and a repeat hard stop on a finished wheel is harmless.
+  posLeft_->hardStop();
+  posRight_->hardStop();
+  posMove_.active = false;
+}
+
+bool MotionEngine::servicePositionMove() {
+  const DiffDrive::DifferentialDrive::Output out = kernel_.output();
+  const uint32_t nowVal = now();
+  const float cpm = countsPerMm();
+
+  if (out.estopped) {
+    posMove_.arrived = false;
+    stopPositionMove();
+    return false;
+  }
+
+  const bool live = posLeft_->moveLive() || posRight_->moveLive();
+
+  // Progress stamp: either wheel travelling resets the stall clock.
+  if (std::fabs(out.positionLeft - posMove_.lastLeft) >= kPositionProgress ||
+      std::fabs(out.positionRight - posMove_.lastRight) >= kPositionProgress) {
+    posMove_.lastLeft = out.positionLeft;
+    posMove_.lastRight = out.positionRight;
+    posMove_.progressAt = nowVal;
+  }
+
+  if (!live && atRest(out)) {
+    // Both ports report their move done and the wheels read at rest.
+    const float quantum = posLeft_->positionQuantum();
+    const float errLeft =
+        (out.positionLeft - posMove_.posLeft0) - posMove_.moveLeft;
+    const float errRight =
+        (out.positionRight - posMove_.posRight0) - posMove_.moveRight;
+    float distWindow = limits_.arriveDist * cpm;
+    float yawWindow = limits_.arriveYaw * (3.14159265f / 180.0f) * 0.5f *
+                      effectiveTrackWidth() * cpm;
+    // The port cannot resolve finer than one quantum.
+    if (distWindow < quantum) distWindow = quantum;
+    if (yawWindow < quantum) yawWindow = quantum;
+    posMove_.arrived =
+        std::fabs(0.5f * (errLeft + errRight)) <= distWindow &&
+        std::fabs(0.5f * (errRight - errLeft)) <= yawWindow;
+    posMove_.active = false;  // the brick holds the count itself
+    lastSegmentEndedByDeadline_ = false;
+    return false;
+  }
+
+  float window = kernel_.config().stallWindow;  // [ms]
+  if (window <= 0.0f) window = static_cast<float>(kDefaultStallWindow);
+  const bool stalled =
+      live && static_cast<float>(nowVal - posMove_.progressAt) >= window;
+  const bool expired = static_cast<int32_t>(nowVal - posMove_.deadline) >= 0;
+  if (stalled || expired) {
+    if (stalled) stallReported_ = true;
+    lastSegmentEndedByDeadline_ = expired && !stalled;
+    posMove_.arrived = false;
+    stopPositionMove();
+    return false;
+  }
+  return true;
+}
+
 int MotionEngine::progress() const {
+  if (posMove_.active) {
+    // Dominant wheel's fraction of its commanded delta.
+    const DiffDrive::DifferentialDrive::Output out = kernel_.output();
+    const float dl = out.positionLeft - posMove_.posLeft0;
+    const float dr = out.positionRight - posMove_.posRight0;
+    const float ml = std::fabs(posMove_.moveLeft);
+    const float mr = std::fabs(posMove_.moveRight);
+    float f = ml >= mr ? (ml > 0.0f ? dl / posMove_.moveLeft : 1.0f)
+                       : dr / posMove_.moveRight;
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    return static_cast<int>(f * 1000.0f);
+  }
   if (!seg_.active) return 1000;
   // Before the first service() tick the origin is uncaptured, so a fraction
   // against it would be nonsense rather than merely stale.

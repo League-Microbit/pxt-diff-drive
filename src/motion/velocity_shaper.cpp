@@ -76,6 +76,10 @@ VelocityShaper::Step VelocityShaper::advance(float target, float remain,
   if (vNext < vDown) vNext = vDown;
 
   if (lim.jerk > 0.0f && dt > 0.0f) {
+    // The jerk planner must aim at the floor, not below it, so the
+    // ramp-down lands on the floor smoothly instead of decaying through
+    // the stiction band.
+    if (remain >= 0.0f && vGoal < floor) vGoal = floor;
     const float difference = vGoal - vPrev;
     const float jerkStep = lim.jerk * dt;
     float lower = 0.0f;
@@ -101,9 +105,14 @@ VelocityShaper::Step VelocityShaper::advance(float target, float remain,
     if (vNext < 0.0f) vNext = 0.0f;
   }
 
-  // 4. Retain the legacy floor only without jerk limiting. A jerk-
-  // limited reference must ramp through it instead of stepping to it.
-  if (lim.jerk <= 0.0f && remain >= 0.0f && vNext < floor) vNext = floor;
+  // 4. Floor. Without jerk limiting the command steps to the floor. With
+  // it, the ramp-up from rest is smooth and the ramp-down lands on the
+  // floor (vGoal above); once at or above the floor a command is never
+  // allowed below it, so it never decays through the stiction band.
+  if (remain >= 0.0f && vNext < floor &&
+      (lim.jerk <= 0.0f || vPrev >= floor)) {
+    vNext = floor;
+  }
 
   // 5. Predict coast-to-target. The engine separately confirms rest
   // before completing a lagged segment.

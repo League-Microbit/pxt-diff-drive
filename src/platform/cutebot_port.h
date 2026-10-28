@@ -198,6 +198,13 @@ class CutebotDevice {
   // must be strictly positive (a zero or negative floor would make
   // every nonzero setpoint "at or above the floor", defeating the
   // eligibility gate's whole point).
+  // cmd 0x60 [0]: the built-in line sensor's 4-bit state (bit 0 =
+  // channel 1, the robot's left; set = on the line). MEASURED on zetuv
+  // 2026-10-19 after the sensor's own learn routine: white reads 0.
+  bool readLineState(uint8_t* bitsOut);
+  // cmd 0x60 [2, ch]: one channel's grey level, 0..255.
+  bool readLineGrey(int channel, uint8_t* greyOut);
+
   int onboardMode() const { return onboardMode_; }
   bool setOnboardMode(int mode);
   float onboardFloor() const { return onboardFloor_; }
@@ -218,6 +225,7 @@ class CutebotDevice {
  private:
   static constexpr uint8_t kCmdEncoder = 0xA0;
   static constexpr uint8_t kCmdClear = 0x50;
+  static constexpr uint8_t kCmdLine = 0x60;
   static constexpr uint8_t kCmdOnboard = 0x80;
   static constexpr uint8_t kSelDegreesLeft = 3;
   static constexpr uint8_t kSelDegreesRight = 4;
@@ -272,7 +280,7 @@ class CutebotDevice {
   bool staged_[2] = {false, false};
 
   // Hybrid actuation state.
-  int onboardMode_ = 0;            // GET/SET onboard_pid, {0,1,2}
+  int onboardMode_ = 0;            // GET/SET onboard_pid, {0,1,2,3}
   float onboardFloor_ = 200.0f;    // GET/SET onboard_floor [mm/s]
   CutebotActuationPolicy::PolicyState policyState_{};
 
@@ -286,6 +294,9 @@ class CutebotDevice {
   float tapRight_ = 0.0f;
   VelocityShaper::Phase tapPhase_ = VelocityShaper::Phase::kAccel;
   bool tapNeutral_ = true;
+  // Last 0x80 params the board accepted; valid only until a 0x10 frame.
+  uint8_t lastOnboard_[5] = {0, 0, 0, 0, 0};
+  bool lastOnboardValid_ = false;
 };
 
 // Forwards WheelCommandTap notifications into a CutebotDevice,

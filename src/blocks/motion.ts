@@ -105,7 +105,13 @@ enum ConfigField {
     //% block="wheel diameter mm"
     WheelDiameter = 49,
     //% block="track width mm"
-    TrackWidth = 50
+    TrackWidth = 50,
+    //% block="turning feedforward scale"
+    TwistFeedForward = 51,
+    //% block="position move mode"
+    PositionMode = 52,
+    //% block="wheel speed path"
+    SpeedPath = 53
 }
 
 // Top-level, not inside the namespace: pxt renders an enum parameter as
@@ -318,6 +324,15 @@ namespace diffDrive {
      * a small distance with a big yaw runs one wheel backwards, a
      * negative distance drives the same arc in reverse, and a yaw
      * past 360 keeps going round. Waits until the move is done.
+     *
+     * A pure straight (yaw 0) or a pure turn on the spot (distance 0) runs through
+     * the motor's own position loop, so it lands on its encoder count
+     * (zuvat, encoder truth: 50 cm within 0.5 mm per wheel, 90 degree
+     * turns on the spot within 0.2 degree; captures/zuvat-position-2026-10-27/
+     * fiftycm/position.csv and the turns analysis). A curve
+     * (both set) is driven by the robot's own control loop instead.
+     * `position move mode` 0 puts straights and turns back on that
+     * control loop.
      * @param distance distance to travel, eg: 20
      * @param yaw angle to turn CCW+, eg: 0
      */
@@ -351,15 +366,18 @@ namespace diffDrive {
      * MotionEngine::nudgeAmplitude() in motion_engine.h). A
      * `nudge(2, 2)` request is really a one-pulse request, not a
      * promise of exactly 2.00 mm -- expect the return value to land
-     * near a multiple of ~1.8 mm. Do not ask for sub-mm precision;
-     * loop on the return value instead.
-     * @param left left wheel distance in mm, eg: 5
+     * near a multiple of ~1.8 mm. A sub-mm request is
+     * passed through to the engine unrounded, but the pulse floor above
+     * still applies; loop on the return value.
+     * @param left left wheel distance in mm (fractions allowed), eg: 5
      * @param right right wheel distance in mm, eg: 5
      */
     //% block="nudge left %left mm right %right mm"
     //% group="Move" weight=510
     export function nudge(left: number, right: number): number {
-        _beginNudgeWheels(Math.round(left), Math.round(right))
+        // The shim takes hundredths of a mm (int32 on the wire), so a
+        // fractional mm request keeps its sub-mm part.
+        _beginNudgeWheels(Math.round(left * 100), Math.round(right * 100))
         // tickDrive()'s return reflects isDriving()/applied duty, which a
         // nudge pulse always settles to zero before returning -- so it
         // reports "idle" every tick even mid-pulse-budget. Call it anyway
@@ -390,6 +408,9 @@ namespace diffDrive {
     /**
      * Drive a curved path to a point in robot coordinates, then stop.
      * x is forward, y is left. Waits until the move is done.
+     * The curved path is driven by the robot's own control loop; the
+     * motor's own position loop is used only for pure straights and
+     * pivots (see move()).
      * @param x forward distance, eg: 20
      * @param y leftward distance, eg: 10
      */
@@ -404,6 +425,8 @@ namespace diffDrive {
 
     /**
      * Start a move without waiting. Poll isMoving() / call stopMove().
+     * Routes like move(): a pure straight or pivot runs through the
+     * motor's own position loop, a curve through the control loop.
      * KNOWN GAP under the tick model: this poll pattern does not, by
      * itself, advance the move -- something must still call
      * driveTick() (or otherwise tick the control loop) concurrently,

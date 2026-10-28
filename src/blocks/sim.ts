@@ -165,13 +165,13 @@ namespace diffDrive {
     let simNudgeRotation = 0  // [cdeg] last requested, reported "measured"
 
     //% shim=diffDrive::beginNudgeWheels
-    export function _beginNudgeWheels(left: number, right: number): void {  // [mm] [mm]
+    export function _beginNudgeWheels(left: number, right: number): void {  // [0.01 mm] [0.01 mm]
         simIntegrate()
-        const distance = 0.5 * (left + right)  // [mm]
+        const distance = 0.5 * (left + right) / 100  // [mm]
         // Mirrors beginNudgeWheels()'s own reduction in shims.cpp:
         // rotation = (right - left) / effectiveTrackWidth().
         const rotation =                                // [rad]
-            (right - left) / (simTrackWidth / simRotationalSlip)
+            ((right - left) / 100) / (simTrackWidth / simRotationalSlip)
         simNudgeDistance = Math.round(distance)
         simNudgeRotation = Math.round(rotation * 180 / Math.PI * 100)
         if (simEstopped) return
@@ -490,6 +490,27 @@ namespace diffDrive {
      */
     //% shim=diffDrive::probe
     export function probe(what: number): number { return 0 }
+
+    /**
+     * The four-channel line sensor: bit i set when channel i (0 = left)
+     * sees the line, or -1 when the read fails. Read under the drive
+     * fiber's bus guard, so it is safe while the robot is moving.
+     */
+    //% shim=diffDrive::lineSensorBits
+    export function lineSensorBits(): number { return 0 }
+
+    /**
+     * One line-sensor channel's grey level, 0..255, or -1 when the
+     * board has no grey read (Nezha) or the read fails.
+     */
+    //% shim=diffDrive::lineSensorGrey
+    export function lineSensorGrey(channel: number): number { return -1 }
+
+    /**
+     * Which board this firmware was built for: 1 Nezha, 2 Cutebot Pro.
+     */
+    //% shim=diffDrive::boardKind
+    export function boardKind(): number { return 1 }
 
     /**
      * RETIRED (design S4.7/S8): no-ops kept for one

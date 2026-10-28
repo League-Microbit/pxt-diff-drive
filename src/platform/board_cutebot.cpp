@@ -75,6 +75,10 @@ BoardMotors boardMotors() {
   return BoardMotors{b.left, b.right};
 }
 
+// The Cutebot Pro has no built-in position move: MotionEngine falls back
+// to the kernel segment when this answers nullptr.
+DiffDrive::PositionMotor* boardPositionMotor(int) { return nullptr; }
+
 MotorWiring boardWiring(int side) {
   const CutebotBoard& b = board();
   const CutebotMotorPort& p = (side == 0) ? b.left : b.right;
@@ -108,12 +112,26 @@ WheelCommandTap* boardWheelCommandTap() { return &board().tap; }
 
 int boardOnboardMode() { return board().device.onboardMode(); }
 bool boardSetOnboardMode(int mode) { return board().device.setOnboardMode(mode); }
+int boardSpeedPath() { return 0; }
+bool boardSetSpeedPath(int) { return false; }
 float boardOnboardFloor() { return board().device.onboardFloor(); }
 bool boardSetOnboardFloor(float floor) {
   return board().device.setOnboardFloor(floor);
 }
 
 #ifndef DIFFDRIVE_HOST_BUILD
+
+int boardLineBits() {
+  uint8_t bits = 0;
+  if (!board().device.readLineState(&bits)) return -1;
+  return bits & 0x0F;
+}
+
+int boardLineGrey(int channel) {
+  uint8_t grey = 0;
+  if (!board().device.readLineGrey(channel, &grey)) return -1;
+  return grey;
+}
 
 // ---- fault-context emergency stop -----------------------------------
 //

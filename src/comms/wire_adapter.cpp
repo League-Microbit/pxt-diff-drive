@@ -208,6 +208,7 @@ constexpr int kDiagAppliedDutyRight = 13;  // -> `dutr`
 constexpr int kDiagCycleCount = 16;        // -> `cyc`
 constexpr int kDiagCycleOverrunCount = 19; // -> `cycovr`
 constexpr int kDiagWrongWayCount = 25;     // -> `wrng`
+constexpr int kDiagPositionMoveLive = 41;  // -> STATUS `posmove=`
 
 // LOCAL flags layout's own free function, extracted (unchanged bit
 // layout) so STATUS's `flags=` and the telemetry `flags` column read
@@ -330,6 +331,7 @@ void WireAdapter::status(Wire::StatusFields& out) const {
 
   out.flags = computeFlags();
   out.i2cf = diagValue(kDiagI2cFault);
+  out.posmove = diagValue(kDiagPositionMoveLive) != 0;
   out.wifi = protocolWifiConnected();
   out.radio = protocolRadioEnabled();
   out.channel = static_cast<uint8_t>(protocolRadioChannel());

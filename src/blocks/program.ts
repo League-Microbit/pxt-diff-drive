@@ -18,6 +18,31 @@ namespace diffDrive {
         programCancel = false
     }
 
+    function chime(notes: number[]): void {
+        control.inBackground(function () {
+            for (let i = 0; i < notes.length; i++)
+                music.playTone(notes[i], i == notes.length - 1 ? 220 : 110)
+        })
+    }
+
+    /** Rising notes: a program is starting, watch the robot. */
+    //% blockHidden=true
+    export function playStartTune(): void {
+        chime([392, 523, 659, 784])
+    }
+
+    /** Falling notes: the program has finished. */
+    //% blockHidden=true
+    export function playStopTune(): void {
+        chime([784, 659, 523, 392])
+    }
+
+    /** One short note, e.g. between the steps of a program. */
+    //% blockHidden=true
+    export function beep(): void {
+        chime([880])
+    }
+
     // Stops the wheels now and flags the program so it does not start
     // another move. False when nothing was running.
     function cancelProgram(): boolean {
@@ -53,8 +78,10 @@ namespace diffDrive {
                     const i = menuRequest
                     menuRequest = -1
                     emitLine("run " + programNames[i])
+                    playStartTune()
                     programRuns[i]()
                     endProgram()
+                    playStopTune()
                 }
                 basic.pause(20)
             }

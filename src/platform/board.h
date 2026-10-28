@@ -22,6 +22,7 @@
 
 #include "../core/diffdrive.h"
 #include "../core/motor_wiring.h"
+#include "../core/position_motor.h"
 #include "../motion/wheel_command_tap.h"
 
 #define DIFFDRIVE_BOARD_NEZHA 1
@@ -47,6 +48,11 @@ struct BoardMotors {
 
 // Constructs (on first call) and returns this build's motor pair.
 BoardMotors boardMotors();
+
+// The side's built-in position move or nullptr when the
+// composed board's port has none (Cutebot Pro). side: 0 = left, 1 = right.
+// shims.cpp's ensure() hands both to MotionEngine::setPositionMotors().
+DiffDrive::PositionMotor* boardPositionMotor(int side);
 
 // Which physical port/sign one side of the composed board is
 // currently wired to, and applying a change to it -- the two halves
@@ -98,6 +104,24 @@ WheelCommandTap* boardWheelCommandTap();
 // out-of-range wire SET in this codebase gets. `SET onboard_pid 0`
 // still always ACKS on every board -- refusing the WIRE command is not
 // the same as refusing to store a value nothing on this board reads.
+// The four-channel line sensor, read under the caller's BusGuard
+// (shims.cpp's lineSensorBits()). Bit i set = channel i sees the line,
+// channel 0 on the robot's left. Nezha: the PlanetX Trackbit at 0x1A.
+// Cutebot Pro: the built-in sensor behind the 0x10 MCU (cmd 0x60 [0]),
+// which shares that MCU's select->read state with the encoders, so it
+// must never be read outside the guard. -1 when the read fails.
+int boardLineBits();
+
+// One line-sensor channel's grey level, 0..255; -1 when the board has
+// no such read (Nezha) or the read fails.
+int boardLineGrey(int channel);
+
+// speed_path (config ordinal 53): 0 = 0x60 duty, 1 = 0x77 +
+// 0x70 mode 3. Applies to both Nezha ports; a board with no such path
+// (Cutebot Pro) reads back 0 and refuses (returns false) every SET.
+int boardSpeedPath();
+bool boardSetSpeedPath(int path);
+
 int boardOnboardMode();
 bool boardSetOnboardMode(int mode);
 float boardOnboardFloor();

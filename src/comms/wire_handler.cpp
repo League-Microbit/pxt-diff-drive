@@ -891,7 +891,7 @@ void WireHandler::execStatus(char** fields, size_t fieldCount, uint32_t id,
   // Worst case ~160 B: "status " + 8 single-digit bools +
   // flags=ffffffff + i2cf=-2147483648 + cyc/next/done at 10 digits each
   // + tlm's longest wire name ("buffer") + reason's longest ("aborted")
-  // + wifi/radio + channel/group at 3 digits (~197 B) + '\n'. 240, the
+  // + wifi/radio + channel/group at 3 digits + posmove (~207 B) + '\n'. 240, the
   // wire's line cap, leaves margin. `i2cf` and `cyc` are decimal, not hex
   // like `flags` -- a copy-pasted hex bit would silently turn i2cf=26
   // into i2cf=1a.
@@ -910,7 +910,8 @@ void WireHandler::execStatus(char** fields, size_t fieldCount, uint32_t id,
   snprintf(buf, sizeof(buf),
                 "status ready=%d active=%d connL=%d connR=%d otos=%d "
                 "wedge=%d flags=%x i2cf=%ld cyc=%lu tlm=%s next=%lu "
-                "done=%lu reason=%s wifi=%d radio=%d channel=%u group=%u\n",
+                "done=%lu reason=%s wifi=%d radio=%d channel=%u group=%u "
+                "posmove=%d\n",
                 status.ready ? 1 : 0, status.active ? 1 : 0,
                 status.connLeft ? 1 : 0, status.connRight ? 1 : 0,
                 status.otos ? 1 : 0, status.wedge ? 1 : 0,
@@ -922,7 +923,8 @@ void WireHandler::execStatus(char** fields, size_t fieldCount, uint32_t id,
                 doneReasonWireName(adapter_.lastDoneReason()),
                 status.wifi ? 1 : 0, status.radio ? 1 : 0,
                 static_cast<unsigned int>(status.channel),
-                static_cast<unsigned int>(status.group));
+                static_cast<unsigned int>(status.group),
+                status.posmove ? 1 : 0);
   writeLine(buf);
 }
 

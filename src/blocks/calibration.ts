@@ -48,6 +48,11 @@ namespace diffDrive {
         settings.remove(prefix + ".h")
     }
 
+    /** The wheel calibration kept in flash [mm/deg], or 0 when none is. */
+    export function storedWheelCalibration(): number {
+        return stored(wheelKey)
+    }
+
     function hasWheel(): boolean {
         return stored(wheelKey) > 0
     }

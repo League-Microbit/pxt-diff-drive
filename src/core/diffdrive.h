@@ -94,6 +94,7 @@ class DifferentialDrive {
     float kaff = 0.0f;               // [s] accel feedforward
     float pidMax = 0.0f;             // [counts/s] whole-PID output clamp
     float twistHoldGain = 0.0f;      // [1/s] twist-integral ratio hold; 0 = off
+    float twistFeedForward = 1.0f;   // [1] feedforward scale on each wheel's turning half
     float straightTrim = 0.0f;       // [1] per-robot dimensionless bias on
                                      //   the twist-hold REFERENCE, sized
                                      //   empirically per robot from a
@@ -173,6 +174,7 @@ class DifferentialDrive {
   DifferentialDrive& setPidMax(float pidMax);              // [counts/s]
   DifferentialDrive& setTwistHoldGain(float gain);         // [1/s]
   DifferentialDrive& setStraightTrim(float trim);          // [1]
+  DifferentialDrive& setTwistFeedForward(float gain);      // [1]
   DifferentialDrive& setWheelCorrection(
       float gainLeftAccel, float interceptLeftAccel,
       float gainLeftDecel, float interceptLeftDecel,

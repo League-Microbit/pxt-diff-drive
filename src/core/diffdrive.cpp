@@ -25,7 +25,7 @@ bool isFinite(float v) { return std::isfinite(v); }
 bool allFinite(const DiffDrive::DifferentialDrive::Config& c) {
   const float scalars[] = {
       c.maxDuty, c.fullDutyVelocity, c.kp, c.ki, c.iMax, c.kaff, c.pidMax,
-      c.twistHoldGain, c.straightTrim, c.vMin, c.posErrMax, c.biasMax, c.tauAdapt, c.aSteady,
+      c.twistHoldGain, c.straightTrim, c.twistFeedForward, c.vMin, c.posErrMax, c.biasMax, c.tauAdapt, c.aSteady,
       c.deficitThreshold, c.deficitWindow, c.stallSpeed, c.stallDemand,
       c.stallWindow, c.crawlPulse,
   };
@@ -134,6 +134,16 @@ DifferentialDrive& DifferentialDrive::setTwistHoldGain(float gain) {
 // §2.2): a per-robot dimensionless bias, sign and magnitude both
 // determined empirically per robot -- no ">0"/range validation beyond
 // finiteness, mirroring setTwistHoldGain() immediately above.
+DifferentialDrive& DifferentialDrive::setTwistFeedForward(float gain) {
+  if (!isFinite(gain) || gain < 0.0f) {
+    noteRefusal(Status::kRefusedNonFinite);
+    return *this;
+  }
+  staged_.twistFeedForward = gain;
+  ++cfgSeq_;
+  return *this;
+}
+
 DifferentialDrive& DifferentialDrive::setStraightTrim(float trim) {
   if (!isFinite(trim)) {
     noteRefusal(Status::kRefusedNonFinite);
@@ -755,8 +765,13 @@ void DifferentialDrive::controlStep(const Command& cmd, uint8_t effectiveMode,
   lastPidLeft_ = pidLeft;
   lastPidRight_ = pidRight;
 
-  const float demandLeft = (correctedLeft + pidLeft) * dutyPerSpeed;
-  const float demandRight = (correctedRight + pidRight) * dutyPerSpeed;
+  // A drivetrain whose tyres scrub when the wheels differ needs more duty
+  // for the turning half of a command than for the same wheel speed
+  // driven straight; twistFeedForward scales that half's feedforward.
+  const float turnExtra =
+      (active_.twistFeedForward - 1.0f) * 0.5f * (speedRight - speedLeft);
+  const float demandLeft = (correctedLeft - turnExtra + pidLeft) * dutyPerSpeed;
+  const float demandRight = (correctedRight + turnExtra + pidRight) * dutyPerSpeed;
   dutyDemandLeft_ = demandLeft;
   dutyDemandRight_ = demandRight;
 
