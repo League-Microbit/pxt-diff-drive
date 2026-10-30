@@ -146,6 +146,8 @@ struct StatusFields {
   // The live move runs on the motors' own position loops (not the
   // kernel). Appended last on the wire so older parsers ignore it.
   bool posmove = false;
+  uint32_t wrng = 0;       // wrong-way segment aborts; the `wrng` column
+  const char* sens = "enc";  // pose sensors: optical / gyro / enc
 };
 
 // One named, already-scaled telemetry value (protocol.md S5.2: `thdr
@@ -246,6 +248,7 @@ enum class DoneReason : uint8_t {
   kEstop,    // -> "estop"   -- a panic stop ended it
   kAborted,  // -> "aborted" -- the caller abandoned it
   kStall,    // -> "stall"   -- the kernel's stall latch halted the drivetrain
+  kWrongWay, // -> "wrongway" -- the engine aborted a segment moving the wrong way
 };
 
 // Adapter -- the seam behind every verb this file currently dispatches:

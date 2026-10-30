@@ -87,9 +87,17 @@ bool OtosPort::begin() {
   // Zero the chip's scalar AND offset registers on every boot: the
   // chip is never power-cycled by an nRF reset, so it inherits
   // whatever an earlier session wrote (reference driver's measured
-  // 42.7 mm phantom-circle failure). Scalar 0 == scale 1.000.
-  writeReg8(kRegLinearScalar, 0);
-  writeReg8(kRegAngularScalar, 0);
+  // 42.7 mm phantom-circle failure). Scalar 0 == scale 1.000; the
+  // linear and angular scalars are this robot's baked gains, 0.001 per
+  // LSB, signed (SparkFun OTOS datasheet / setLinearScalar).
+  long linear = std::lround((linearScale_ - 1.0f) / 0.001f);
+  if (linear > 127) linear = 127;
+  if (linear < -127) linear = -127;
+  writeReg8(kRegLinearScalar, static_cast<uint8_t>(static_cast<int8_t>(linear)));
+  long angular = std::lround((angularScale_ - 1.0f) / 0.001f);
+  if (angular > 127) angular = 127;
+  if (angular < -127) angular = -127;
+  writeReg8(kRegAngularScalar, static_cast<uint8_t>(static_cast<int8_t>(angular)));
   writePoseMm(kRegOffsetXl, 0.0f, 0.0f, 0.0f);
   writePoseMm(kRegPositionXl, 0.0f, 0.0f, 0.0f);
 
@@ -148,12 +156,35 @@ bool OtosPort::read() {
   const float rotVx = c * vxF - s * vyF;
   const float rotVy = s * vxF + c * vyF;
 
+  rawX_ = rotX;
+  rawY_ = rotY;
   sensorToCentre(rotX, rotY, hF, offsetX_, offsetY_, x_, y_);
   heading_ = hF;   // heading takes no mounting offset
   vx_ = rotVx;
   vy_ = rotVy;
   omega_ = static_cast<float>(rvh) * kOmegaPerLsb;
+  opticalFresh_ = true;
   return true;
+}
+
+bool OtosPort::takeOpticalIncrement(float& dx, float& dy, float& rawDx,
+                                    float& rawDy) {
+  dx = dy = rawDx = rawDy = 0.0f;
+  if (!opticalFresh_) return false;
+  opticalFresh_ = false;
+  const bool baselined = opticalBaselined_;
+  if (baselined) {
+    dx = x_ - opticalTakenX_;
+    dy = y_ - opticalTakenY_;
+    rawDx = rawX_ - opticalTakenRawX_;
+    rawDy = rawY_ - opticalTakenRawY_;
+  }
+  opticalTakenX_ = x_;
+  opticalTakenY_ = y_;
+  opticalTakenRawX_ = rawX_;
+  opticalTakenRawY_ = rawY_;
+  opticalBaselined_ = true;
+  return baselined;
 }
 
 // The lever arm rotates with the robot: at heading h the sensor sits
@@ -177,6 +208,9 @@ void OtosPort::centreToSensor(float centreX, float centreY, float heading,
   sensorYOut = centreY + (s * offsetX + c * offsetY);
 }
 
+// The arm starts at the per-robot bake (otos_port.h). A program call is a
+// deliberate override, e.g. the lever calibration zeroing it; reboot
+// restores the bake.
 void OtosPort::setOffset(float x, float y, float yaw) {
   offsetX_ = x;
   offsetY_ = y;
@@ -215,6 +249,7 @@ void OtosPort::setPose(float x, float y, float heading) {
   const float xF = c * sensorX + s * sensorY;
   const float yF = -s * sensorX + c * sensorY;
   writePoseMm(kRegPositionXl, xF, yF, wrapRadians(heading));
+  opticalBaselined_ = false;
 }
 
 void OtosPort::resetTracking() {

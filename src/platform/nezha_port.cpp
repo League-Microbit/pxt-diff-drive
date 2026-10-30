@@ -485,7 +485,7 @@ void NezhaMotorPort::writeRawDuty(float duty, uint64_t now,  // [-1,1] [us]
 void NezhaMotorPort::requestSample() {
   // Select 0x46. The kernel spends the settle in sleepMillis(4); this
   // port is the brick's only client, so ordering holds structurally.
-  writeFrame(0x00, kRegEncoder, 0x00);
+  if (!writeFrame(0x00, kRegEncoder, 0x00)) ++busFailCount_;
 }
 
 void NezhaMotorPort::collect(uint64_t now) {  // [us]
@@ -574,6 +574,7 @@ void NezhaMotorPort::collect(uint64_t now) {  // [us]
     if (decision == EncoderGlitchArmor::Decision::kAccept && hasLastTick_ &&
         raw == previousGoodRaw && driven()) {
       lastPosition_ = pos;  // already equal to lastPosition_ by construction
+      ++staleCount_;
       return;  // sampleTime_ HOLDS -- velocity_ holds its prior value
     }
 
@@ -587,6 +588,7 @@ void NezhaMotorPort::collect(uint64_t now) {  // [us]
     hasLastTick_ = true;
   } else {
     connected_ = false;  // sampleTime_ HOLDS -- age grows honestly
+    ++busFailCount_;
   }
 }
 
@@ -723,6 +725,11 @@ int nezhaBoardDiagValue(const NezhaMotorPort& left, const NezhaMotorPort& right,
     case 38: return static_cast<int>(right.wiredSign());
     case 39: return static_cast<int>(left.rawCount());
     case 40: return static_cast<int>(right.rawCount());
+    case 52: return static_cast<int>(left.busFailCount_ + right.busFailCount_);
+    case 53: return static_cast<int>(left.staleCount_ + right.staleCount_);
+    case 54:
+      return static_cast<int>(left.glitchCount_ + right.glitchCount_ +
+                              left.rebaselineCount_ + right.rebaselineCount_);
     default: return 0;
   }
 }

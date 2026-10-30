@@ -162,7 +162,7 @@ constexpr ConfigFieldDescriptor kConfigFields[] = {
     // ConfigField.TwistFeedForward: "turning feedforward scale"
     {"twist_ff", 51, "1"},
     // 0 kernel, 1 built-in straights+pivots, 2 arcs too (out of range ignored).
-    // Boots at 1 (MotionEngine::kDefaultPositionMode); 0 gives the kernel back.
+    // Boots at 0 (MotionEngine::kDefaultPositionMode); 0 gives the kernel back.
     // ConfigField.PositionMode: "position move mode"
     {"position_mode", 52, "1"},
     // 0 = 0x60 duty, 1 = 0x77+0x70 mode 3; Nezha only (opcodes knowledge doc).

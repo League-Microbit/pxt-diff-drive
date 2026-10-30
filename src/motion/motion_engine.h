@@ -38,6 +38,56 @@ class PoseSource {
   // goToW() consume this only through cos()/sin(). A caller that
   // DIFFERENCES two reads must not assume a shared convention.
   virtual float heading() const = 0;
+
+  // The heading comes from a sensor independent of the wheels, so a pivot
+  // measured against it can differ from the pivot the encoders counted.
+  // Only then does goToW() close its pivot on heading.
+  virtual bool hasHeadingReference() const { return false; }
+
+  // The pose is updated every service tick while a move runs, so it can be
+  // steered on. A source a test or caller sets by hand is not.
+  virtual bool tracksMotion() const { return false; }
+};
+
+// goToW()'s pivot closure: after the encoder-counted pivot settles, read the
+// pose heading and pivot the remaining error, up to maxCorrections within
+// timeout, then carry on to the straight with whatever heading was reached.
+struct PivotClosure {
+  bool enabled = true;
+  uint32_t dwell = 250u;         // [ms] rest before the heading is read
+  float deadband = 0.25f;        // [deg] error at or below this is closed, or one tick
+                                 // of travel at the omega floor if that is larger
+  float maxCorrection = 45.0f;   // [deg] largest single correction pivot
+  float speed = 1.0f;            // [mm/s] correction cruise; the shaper raises it to the omega floor
+  int maxCorrections = 3;        // [pivots]
+  uint32_t timeout = 2500u;      // [ms] from the first rest to giving up
+};
+
+// goToW()'s straight phase: steer on the world cross-track error to the line
+// from where the straight starts to the target. The wanted heading is the
+// line's heading less atan(crossTrack / lookahead) (a pure-pursuit aim at a
+// point `lookahead` down the line); the yaw trim is gain * heading error,
+// clamped. The trim is the dominant wheel's speed redistributed, so it never
+// raises the wheel ceiling or lowers the floor the shaper holds.
+struct StraightSteering {
+  bool enabled = true;
+  float lookahead = 150.0f;  // [mm] aim point down the line
+  float gain = 4.0f;         // [1/s] yaw rate per rad of heading error
+  float maxRate = 20.0f;     // [deg/s] largest trim yaw rate
+  float maxShare = 0.15f;    // [1] largest trim wheel speed, as a share of the dominant wheel
+};
+
+// After a goToW() straight (or a close target), the estimator's remaining
+// along-heading distance is driven as a short straight, forward or reverse,
+// instead of a pivot. Reverse is allowed ONLY here: a residual within `band`.
+// Bounded by maxTrims and by timeout from the first rest.
+struct ResidualTrim {
+  bool enabled = true;
+  float band = 30.0f;        // [mm] residual at or below this is trimmed
+  float deadband = 2.0f;     // [mm] along-heading error at or below this is closed, or one tick at the floor speed if larger
+  uint32_t dwell = 250u;     // [ms] rest before the pose is read
+  int maxTrims = 2;          // [straights]
+  uint32_t timeout = 3000u;  // [ms] from the first rest to giving up
 };
 
 class MotionEngine {
@@ -133,7 +183,7 @@ class MotionEngine {
     float theta;       // [rad] wrapped 2*bearingRaw -- the blended rotation
     float chord;       // [mm] hypot(x, y) -- the straight phase when willSplit
     float arcLength;   // [mm] the blended segment's signed distance
-    bool willSplit;    // |theta| >= kTurnFirstAngle
+    bool willSplit;    // |theta| >= kTurnFirstAngle, or the target is behind (x < 0)
   };
   static GoToRPlan decomposeGoToR(float x, float y);  // [mm] [mm]
 
@@ -168,6 +218,12 @@ class MotionEngine {
   // A position-mode Segment is in flight. A continuous hold does not count.
   bool isMoveActive() const { return seg_.active; }
 
+  // A goToW() command is live: its closure dwell, correction pivots,
+  // pending straight and trims all sit inside it with the wheels at rest.
+  bool isLegLive() const {
+    return seg_.active && (closure_.pose != nullptr || goal_.pose != nullptr);
+  }
+
   // Either a Segment or a Hold is driving. Callers inferring "something is
   // driving" must read this, not the kernel's applied duty, which is one
   // tick stale after a command is armed.
@@ -181,6 +237,13 @@ class MotionEngine {
   // until the next segment starts.
   bool lastSegmentEndedByDeadline() const {
     return lastSegmentEndedByDeadline_;
+  }
+
+  // The most recent Segment was aborted by wrongWay() rather than ending
+  // by arriving, deadline, stall, e-stop or cancel. Latched on the tick
+  // it ended; valid until the next segment starts.
+  bool lastSegmentEndedByWrongWay() const {
+    return lastSegmentEndedByWrongWay_;
   }
 
   // Force-end the current command now; no-op if nothing is active. A
@@ -423,13 +486,10 @@ class MotionEngine {
   // go-to that splits into a pivot and a chord (two phases). Where the
   // ports do not support position moves the mode has no effect.
   //
-  // The boot default is 1: straights and pivots run through the motor's
-  // own position loop (docs/code-review/2026-10-27/data/mb_probe_stops1.csv
-  // for the stop travel; captures/zuvat-position-2026-10-27/fiftycm/position.csv
-  // and pivots/analysis_output.txt for the accuracy it buys). Arcs stay on
-  // the kernel (captures/zuvat-position-2026-10-27/circle/closure_radial.csv).
-  // Rig::positionMode seeds from this constant so GET reads what routes.
-  static constexpr int kDefaultPositionMode = 1;
+  // The boot default is 0, the kernel: mode 1's position loop holds the
+  // encoder target but slips on the floor (vevov 2026-10-27, camera saw
+  // 83-96% of each pivot). Rig::positionMode seeds from this constant.
+  static constexpr int kDefaultPositionMode = 0;
   void setPositionMode(int mode) { positionMode_ = mode; }
   int positionMode() const { return positionMode_; }
 
@@ -447,6 +507,26 @@ class MotionEngine {
   // The last position move ended inside the arrival window (as opposed
   // to deadline, stall, e-stop or cancel).
   bool lastPositionMoveArrived() const { return posMove_.arrived; }
+
+  PivotClosure& pivotClosure() { return pivotClosure_; }
+  const PivotClosure& pivotClosure() const { return pivotClosure_; }
+
+  // The last goToW() pivot closure: correction pivots fired, the heading
+  // error left when it ended, and whether it ended on its timeout.
+  int lastPivotCorrections() const { return lastPivotCorrections_; }
+  float lastPivotResidual() const { return lastPivotResidual_; }  // [rad]
+  bool lastPivotClosureTimedOut() const { return lastPivotTimedOut_; }
+
+  StraightSteering& straightSteering() { return straightSteering_; }
+  const StraightSteering& straightSteering() const { return straightSteering_; }
+  ResidualTrim& residualTrim() { return residualTrim_; }
+  const ResidualTrim& residualTrim() const { return residualTrim_; }
+
+  // The last goToW() leg: trim straights fired, and the distance left to
+  // the target when the leg ended (valid once a trim check has run).
+  int lastTrimCount() const { return lastTrimCount_; }
+  float lastTrimResidual() const { return lastTrimResidual_; }  // [mm]
+  bool lastTrimTimedOut() const { return lastTrimTimedOut_; }
 
   // The one settable shaping surface. This engine holds no shaping knob.
   MotionLimits& limits() { return limits_; }
@@ -534,6 +614,23 @@ class MotionEngine {
 
   uint32_t now() const;  // [ms]
 
+  // service()'s pivot-to-straight handoff while a closure is live. True
+  // when the straight phase should start now; false while resting or after
+  // starting a correction pivot.
+  bool pivotClosed(uint32_t nowVal, float dt);  // [ms] [s]
+
+  // service()'s end-of-straight check on the goToW() target. True when the
+  // leg is finished; false while resting or after starting a trim straight.
+  bool legClosed(uint32_t nowVal, float dt);  // [ms] [s]
+
+  // Begins a straight of `distance` (signed) toward the goal, keeping the
+  // goal across the segment reset.
+  void beginGoalStraight(float distance, float cruise, uint32_t deadline,
+                         bool steered);  // [mm] [mm/s] [ms]
+
+  // Yaw trim [mm/s] for the live steered straight, at dominant speed `vCmd`.
+  float steeringTwist(float vCmd) const;  // [mm/s]
+
   // The shared rest test settleToRest() and serviceNudge() both use --
   // mirrors the existing rest test rather than inventing a second
   // definition of "stopped".
@@ -619,6 +716,42 @@ class MotionEngine {
   float rotationalSlip_ = 0.952f; // [1] physical/odometric rotation ratio
   bool arcYawClosure_ = false;
 
+  struct ClosureState {
+    const PoseSource* pose = nullptr;  // not owned; null = no closure
+    float target = 0.0f;               // [rad] pose heading to end the pivot on
+    bool resting = false;
+    uint32_t restUntil = 0;            // [ms]
+    uint32_t giveUp = 0;               // [ms]
+    int corrections = 0;
+  };
+
+  // The world target of the live goToW() leg, and the line to it.
+  struct Goal {
+    const PoseSource* pose = nullptr;  // not owned; null = no goal
+    float x = 0.0f, y = 0.0f;          // [mm] target
+    bool steered = false;
+    float startX = 0.0f, startY = 0.0f;  // [mm] line origin
+    float unitX = 1.0f, unitY = 0.0f;    // [1] line direction
+    float speed = 0.0f;                  // [mm/s]
+    bool resting = false;
+    uint32_t restUntil = 0;              // [ms]
+    uint32_t giveUp = 0;                 // [ms]
+    int trims = 0;
+  };
+
+  StraightSteering straightSteering_;
+  ResidualTrim residualTrim_;
+  Goal goal_;
+  int lastTrimCount_ = 0;
+  float lastTrimResidual_ = 0.0f;  // [mm]
+  bool lastTrimTimedOut_ = false;
+
+  PivotClosure pivotClosure_;
+  ClosureState closure_;
+  int lastPivotCorrections_ = 0;
+  float lastPivotResidual_ = 0.0f;  // [rad]
+  bool lastPivotTimedOut_ = false;
+
   Segment seg_;
   Hold hold_;
   Nudge nudge_;
@@ -648,6 +781,7 @@ class MotionEngine {
   uint32_t wrongWayCount_ = 0;
 
   bool lastSegmentEndedByDeadline_ = false;
+  bool lastSegmentEndedByWrongWay_ = false;
 
   bool stallReported_ = false;
 };

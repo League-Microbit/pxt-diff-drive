@@ -25,10 +25,13 @@
 #include "pxt.h"
 
 #include "../motion/motion_engine.h"
+#include "gyro_source.h"
 
 namespace diffDrive {
 
-class OtosPort : public PoseSource {
+class OtosPort : public PoseSource,
+                 public GyroSource,
+                 public OpticalPositionSource {
  public:
   // Probe the product id and, on a match, run the full init sequence
   // (signal-process config, tracking reset, IMU bias calibration
@@ -38,7 +41,7 @@ class OtosPort : public PoseSource {
   bool begin();
 
   uint8_t productId() const { return lastProbeId_; }  // last probed id
-  bool present() const { return initialized_; }
+  bool present() const override { return initialized_; }
   bool connected() const { return initialized_ && connected_; }
 
   // One 12-byte position+velocity burst read into the cache. Returns
@@ -46,6 +49,21 @@ class OtosPort : public PoseSource {
   // begin() never matched. The cached pose is the ROBOT CENTRE's, with
   // the lever arm applied (setOffset()).
   bool read();
+
+  // GyroSource: the chip's heading channel, from the same burst read().
+  GyroReadStatus readGyro() override {
+    return read() ? GyroReadStatus::kOk : GyroReadStatus::kFailed;
+  }
+  bool providesHeading() const override { return true; }
+  bool providesRate() const override { return true; }
+  float gyroHeading() const override { return heading_; }  // [rad]
+  float gyroRate() const override { return omega_; }       // [rad/s]
+
+  // OpticalPositionSource: increments of the cached centre position.
+  bool opticalPresent() const override { return initialized_; }
+  bool opticalValid() const override { return initialized_ && connected_; }
+  bool takeOpticalIncrement(float& dx, float& dy, float& rawDx,
+                            float& rawDy) override;  // [mm] x4
 
   // PoseSource overrides (motion_engine.h) -- world/centre pose, with
   // the lever arm already applied (setOffset()). "no mount offset" below
@@ -73,6 +91,11 @@ class OtosPort : public PoseSource {
   // own offset register is deliberately held at ZERO -- applying it in
   // both places double-corrects (reference measured a pure pivot
   // tracing a 42.7 mm circle instead of holding the centre still).
+  //
+  // The arm is the robot's, not the program's: a robot whose config bakes
+  // a non-zero arm (firmware_bake otos_arm_x / otos_arm_y) keeps it and
+  // setOffset() changes only the yaw. A robot with no baked arm takes the
+  // program's, as before.
   void setOffset(float x, float y, float yaw);  // [mm] [mm] [rad]
   float offsetX() const { return offsetX_; }
   float offsetY() const { return offsetY_; }
@@ -123,8 +146,14 @@ class OtosPort : public PoseSource {
                              float offsetX, float offsetY,
                              float& sensorXOut, float& sensorYOut);
 
-  float offsetX_ = 0.0f;    // [mm] body frame
-  float offsetY_ = 0.0f;    // [mm] body frame
+  float linearScale_ = 1.0f;   // [1] chip distance gain, baked per robot
+  float angularScale_ = 1.0f;  // [1] chip heading gain, baked per robot
+
+  float bakedArmX_ = 0.0f;  // [mm] body frame, baked per robot
+  float bakedArmY_ = 0.0f;  // [mm] body frame, baked per robot
+
+  float offsetX_ = bakedArmX_;  // [mm] body frame
+  float offsetY_ = bakedArmY_;  // [mm] body frame
   float offsetYaw_ = 0.0f;  // [rad] sensor mounting rotation
 
   bool initialized_ = false;
@@ -137,6 +166,16 @@ class OtosPort : public PoseSource {
   float vx_ = 0.0f;       // [mm/s]
   float vy_ = 0.0f;       // [mm/s]
   float omega_ = 0.0f;    // [rad/s]
+
+  float rawX_ = 0.0f;     // [mm] sensor track, arm not applied
+  float rawY_ = 0.0f;     // [mm]
+
+  bool opticalFresh_ = false;     // read() succeeded since the last take
+  bool opticalBaselined_ = false;
+  float opticalTakenX_ = 0.0f;    // [mm]
+  float opticalTakenY_ = 0.0f;    // [mm]
+  float opticalTakenRawX_ = 0.0f; // [mm]
+  float opticalTakenRawY_ = 0.0f; // [mm]
 };
 
 }  // namespace diffDrive

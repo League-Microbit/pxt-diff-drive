@@ -38,9 +38,10 @@
 #include "core/diffdrive.h"
 #include "core/motor_wiring.h"
 #include "motion/motion_engine.h"
-#include "motion/odometry.h"
+#include "motion/pose_estimator.h"
 #include "platform/board.h"
 #include "platform/otos_port.h"
+#include "platform/sensor_config.h"
 #include "platform/platform_ports.h"
 #include "comms/run_registry.h"
 
@@ -58,6 +59,10 @@ namespace diffDrive {
 // formula independently.
 constexpr float kCdegToRad = 0.01f * 3.14159265f / 180.0f;
 constexpr float kRadToCdeg = 1.0f / kCdegToRad;
+
+constexpr uint64_t kIdleSensePeriod = 100000;  // [us]
+constexpr uint64_t kIdleTickQuiet = 150000;    // [us] a tick this recent means another fiber is ticking
+constexpr uint64_t kAccelSensePeriod = 20000;  // [us]
 
 // Forward declaration: the starvation watchdog fiber entry point is
 // defined in its own clearly delineated section further down (see
@@ -136,21 +141,17 @@ struct Rig {
   // member-initializer order.
   MotionEngine engine{kernel, clock};
 
-  // The dead-reckoned pose (motion/odometry.h): the kernel-Output
-  // integration, its wheel baseline, the rebase-epoch guard, and the
-  // PoseSource GO_TO_W falls back to when no OTOS is fitted -- one
-  // object, where this struct used to carry five loose fields, a free
-  // odomUpdate() over them, and a separate read-only adapter bound to
-  // them by const reference. Reads the geometry it integrates with
-  // (countsPerMm/effectiveTrackWidth) from `engine` above by reference,
-  // so it MUST be declared after it: members initialize in DECLARATION
-  // order regardless of this struct's own (implicit) member-initializer
-  // order, the same rule this file's header comment already states for
-  // `engine` itself. Lives exactly as long as this Rig (a process-
-  // lifetime lazy singleton, see `rig`/`ensure()` below).
-  // engineGoToW() (below) is this project's one selection point between
-  // this and `otosRef()`'s OtosPort.
-  Odometry odometry{engine};
+  // The robot's pose (motion/pose_estimator.h): encoders always, the
+  // OTOS gyro and position when the boot probe found one. Reads the
+  // geometry it integrates with from `engine`, so it MUST be declared
+  // after it. engineGoToW() plans from this.
+  PoseEstimator estimator{engine};
+  uint64_t estimatorStamp = 0;  // [us] of the last estimator update; 0 = none
+  uint64_t idleSenseStamp = 0;  // [us] of the last idle sensor read
+  uint64_t accelStamp = 0;      // [us] of the last accelerometer read; 0 = none
+  int accel[3] = {0, 0, 0};     // [mg] micro:bit accelerometer x y z
+  int accelPeak = 0;            // [mg] largest per-axis jump between reads since 51 was last read
+
 
   // tick engine (sprint 002): caller-driven stepping replaces the
   // kernel's own now-unwired fiber pacer -- see ensure(), tickDrive(),
@@ -185,6 +186,7 @@ struct Rig {
   // heading reset stay SYNCHRONOUS, as before -- only the OTOS write
   // becomes deferred.
   bool pendingOtosZero = false;
+  uint8_t otosSampleTick = 0;  // tickDrive() refreshes the OTOS cache every 4th tick
   // Staged cross-fiber stop: a stop requested while busGuard is held
   // (i.e. some fiber is mid kernel.step(), possibly parked in its own
   // encoder settle sleep) cannot write the motor ports immediately
@@ -277,6 +279,15 @@ struct Rig {
 };
 
 static Rig* rig = nullptr;
+
+static OtosPort& otosRef();
+
+// Boot probe: which sensors this robot has, handed to the estimator. The
+// bus guard must be held; the probe makes one real I2C read.
+static void attachSensors(Rig& r) {
+  OtosPort& o = otosRef();
+  r.estimator.attachSensors(&o, &o, probeSensorConfig(&o, &o));
+}
 
 static Rig& ensure() {
   if (rig == nullptr) {
@@ -371,6 +382,15 @@ static Rig& ensure() {
 #endif
     rig->kernel.begin();   // primes encoders, arms boot zero-write
 
+    // The estimator's sensors come up here, not in the user program: most
+    // programs never call startWorldTracking(), and the gyro is what
+    // keeps their heading. begin() ends with no OTOS fitted on the first
+    // failed product-id read.
+    rig->busGuard.acquire(rig->sleeper);
+    otosRef().begin();
+    attachSensors(*rig);
+    rig->busGuard.release();
+
     // TICK MODEL (sprint 002): the kernel's own background fiber pacer
     // is intentionally left unwired here -- every control cycle now
     // runs on whichever fiber calls tickDrive() (below), not a fiber
@@ -388,14 +408,27 @@ static Rig& ensure() {
   return *rig;
 }
 
-// ---- odometry -------------------------------------------------------
-// The integration itself, its wheel baseline and the rebase-epoch guard
-// all live on Rig::odometry (motion/odometry.h) now. This helper is the
-// one thing that did NOT move: fetching the kernel's current Output.
-// Odometry deliberately does not hold the kernel -- it integrates
-// whatever Output it is handed, which is what makes it host-testable
-// against a scripted wheel path with no kernel in the link at all.
-static void odomUpdate(Rig& r) { r.odometry.update(r.kernel.output()); }
+// ---- pose estimate --------------------------------------------------
+// Folds the kernel's current Output into the estimator with the real time
+// since the last fold; rest detection and the gyro bias windows run on that
+// dt. `sampleSensors` does I2C, so only callers holding busGuard pass true.
+static void odomUpdate(Rig& r, bool sampleSensors = false) {
+  const uint64_t now = r.clock.nowMicros();  // [us]
+  const float dt =  // [s]
+      r.estimatorStamp == 0 ? 0.0f
+                            : static_cast<float>(now - r.estimatorStamp) * 1e-6f;
+  r.estimatorStamp = now;
+  r.estimator.update(r.kernel.output(), dt, sampleSensors);
+}
+
+// busGuard held. The deferred zero of the OTOS; the estimator re-anchors
+// on the gyro reading it will see next.
+static void applyPendingOtosZero(Rig& r) {
+  if (!r.pendingOtosZero) return;
+  r.pendingOtosZero = false;
+  otosRef().setPose(0.0f, 0.0f, 0.0f);
+  r.estimator.reprime();
+}
 
 // ---- the soft stop --------------------------------------------------
 // THE one soft stop this file has. Every stop path calls it and none
@@ -642,6 +675,12 @@ bool engineMoveEndedByDeadline() {
   return rig != nullptr && rig->engine.lastSegmentEndedByDeadline();
 }
 
+// True iff the most recent Segment was aborted by the engine's wrong-way
+// check. `rig == nullptr` answers false.
+bool engineMoveEndedByWrongWay() {
+  return rig != nullptr && rig->engine.lastSegmentEndedByWrongWay();
+}
+
 // ---- move engine ----------------------------------------------------
 
 //%
@@ -827,12 +866,6 @@ int nudgeMeasuredRotation() {  // [cdeg]
 // what it checks, and tickDrive()'s own comment below for why).
 static bool commandLooksActive(const Rig& r);
 
-// Forward declaration: otosRef() (the OTOS lazy singleton) is defined
-// further down, alongside the other OTOS shim entry points -- see its
-// own comment there. tickDrive() below needs it too now, to perform
-// the deferred pendingOtosZero write after busGuard.release() -- see
-// that section of tickDrive()'s own comment.
-static OtosPort& otosRef();
 
 // ---- tick engine --------------------------------------------------------
 // tickDrive(): the caller-driven replacement for the kernel's own
@@ -943,20 +976,21 @@ bool tickDrive() {
   }
   r.busGuard.release();
 
-  // Deferred OTOS zero: SET rebase
-  // (cfgSetRebase()) only ARMS pendingOtosZero -- the actual
-  // I2C write happens HERE, on whichever fiber is ticking, exactly like
-  // kernel.rebasePosition()'s own deferred-request shape. Consumed
-  // AFTER busGuard.release() (so this tick's own kernel.step() is not
-  // held up by an extra I2C round trip) but the write itself still
-  // acquires/releases the SAME guard around its own body -- with no
-  // yield between this release() and that reacquire(), no other fiber
-  // can interleave here (see BusGuard's own comment), so this is safe
-  // even though the guard is briefly unheld in between.
+  // Deferred OTOS zero: SET rebase (cfgSetRebase()) only ARMS
+  // pendingOtosZero; the I2C write happens here, on the ticking fiber, after
+  // busGuard.release() so this tick's step() is not held up by it.
   if (r.pendingOtosZero) {
-    r.pendingOtosZero = false;
     r.busGuard.acquire(r.sleeper);
-    otosRef().setPose(0.0f, 0.0f, 0.0f);
+    applyPendingOtosZero(r);
+    r.busGuard.release();
+  }
+
+  // Sensor sample every 4th tick (96 ms); the estimator is a no-op on I2C
+  // when the boot probe found no OTOS.
+  if (++r.otosSampleTick >= 4) {
+    r.otosSampleTick = 0;
+    r.busGuard.acquire(r.sleeper);
+    odomUpdate(r, true);
     r.busGuard.release();
   }
 
@@ -1316,6 +1350,33 @@ int diagValue(int what) {
     // 41: the last-started move went down the position path and is still
     // live (STATUS `posmove=`).
     case 41: return ensure().engine.isPositionMoveActive() ? 1 : 0;
+    // 42-46: the pose estimator -- gyro bias [cdeg/min], rejected
+    // samples, optical steps taken, sensor configuration (SensorConfig),
+    // bumps and lifts seen at rest.
+    case 42:
+      return static_cast<int>(
+          std::lround(ensure().estimator.biasRate() * kRadToCdeg * 60.0f));
+    case 43: return static_cast<int>(ensure().estimator.rejectedCount());
+    case 44: return static_cast<int>(ensure().estimator.stepCount());
+    case 45: return static_cast<int>(ensure().estimator.config());
+    case 46: return static_cast<int>(ensure().estimator.disturbCount());
+    case 47: return ensure().engine.isLegLive() ? 1 : 0;
+    // 48-51: the micro:bit accelerometer [mg] (accelSense()), then the
+    // largest per-axis jump between reads since 51 was last read.
+    case 48: return ensure().accel[0];
+    case 49: return ensure().accel[1];
+    case 50: return ensure().accel[2];
+    case 51: {
+      Rig& r = ensure();
+      const int peak = r.accelPeak;
+      r.accelPeak = 0;
+      return peak;
+    }
+    // 52-54: why i2cf cycles happened -- NAK'd encoder transfers, acked
+    // reads that did not move while driven, glitch rejects and re-anchors.
+    case 52: return boardDiagValue(what);
+    case 53: return boardDiagValue(what);
+    case 54: return boardDiagValue(what);
     default: return 0;
   }
 }
@@ -1325,29 +1386,29 @@ int diagValue(int what) {
 //%
 int poseX() {  // [mm]
   Rig& r = ensure();
-  odomUpdate(r);  // a pose read ADVANCES odometry -- see odometry.h
-  return static_cast<int>(std::lround(r.odometry.x()));
+  odomUpdate(r);  // a pose read ADVANCES the estimate -- see odometry.h
+  return static_cast<int>(std::lround(r.estimator.x()));
 }
 
 //%
 int poseY() {  // [mm]
   Rig& r = ensure();
   odomUpdate(r);
-  return static_cast<int>(std::lround(r.odometry.y()));
+  return static_cast<int>(std::lround(r.estimator.y()));
 }
 
 //%
 int poseHeading() {  // [cdeg]
   Rig& r = ensure();
   odomUpdate(r);
-  return static_cast<int>(std::lround(r.odometry.heading() * kRadToCdeg));
+  return static_cast<int>(std::lround(r.estimator.heading() * kRadToCdeg));
 }
 
 //%
 void resetPose() {
   Rig& r = ensure();
   odomUpdate(r);  // consume any pending deltas first
-  r.odometry.reset();
+  r.estimator.reset();
 }
 
 // ---- configuration --------------------------------------------------
@@ -1610,9 +1671,9 @@ void cfgSetStallClear(Rig& r, float v) {
 // (seedPose()'s own "write both" contract): the encoder-integrated pose
 // this file tracks AND the OTOS position register, so the two stay
 // agreed at the new zero instead of OTOS keeping its old absolute
-// reading. Only Odometry::reset() happens synchronously -- the other
+// reading. Only PoseEstimator::reset() happens synchronously -- the other
 // two are DEFERRED requests. kernel.rebasePosition() re-anchors at the
-// NEXT step(), and Odometry's position-epoch guard keeps that
+// NEXT step(), and Odometry's position-epoch guard (inside the estimator) keeps that
 // legitimate discontinuity from reading as a spurious jump; the OTOS
 // zero arms pendingOtosZero for tickDrive() to service after
 // busGuard.release(), so the write lands on a fiber that owns the bus.
@@ -1624,7 +1685,7 @@ void cfgSetRebase(Rig& r, float v) {
   if (v == 0.0f) return;
   odomUpdate(r);  // consume pending deltas before the zero
   r.kernel.rebasePosition();
-  r.odometry.reset();
+  r.estimator.reset();
   r.pendingOtosZero = true;
 }
 
@@ -1984,59 +2045,22 @@ void engineGoToRArmed(float x, float y, float speed, float arrive) {
   engineGoToR(x, y, cruise, arrive, r.goToDeadline);
 }
 
-// GO_TO_W's own PoseSource selection: the ONE place this project
-// decides which PoseSource serves a GO_TO_W call, via
-// selectPoseSource() (motion/odometry.h) -- this file's
-// `gOtos`/otosRef() lazy singleton when `connected()` (initialized AND
-// actually talking to the chip), the Rig-owned `odometry`
-// (dead-reckoned, drifting, but always available) otherwise. A robot
-// with no OTOS fitted, or one whose OTOS was never begun/matched, now
-// drives on encoder odometry instead of refusing the call outright --
-// GO_TO_W is no longer a no-op on the fleet's OTOS-less robots (tovez,
-// gopiv, zeguz).
-//
-// This always dispatches onto MotionEngine::goToW() now, so the bool
-// return is unconditionally true; kept (rather than void) only because
-// wire_adapter.cpp's contract for this entry point ("was a live pose
-// actually available") is otherwise unchanged. The return value still
-// does NOT distinguish "served by OTOS" (accurate) from "served by
-// encoder odometry" (drifts, no correction) -- a caller that needs to
-// know reads STATUS's `otos=` flag.
-//
-// Mid-move OTOS disconnection is not a race to guard against: goToW()
-// reads its PoseSource exactly ONCE, at call time, before ever
-// delegating to goToR() -- nothing re-reads or re-selects a pose source
-// while a move is in flight.
+// GO_TO_W plans from the Rig's PoseEstimator: encoders always, the OTOS
+// gyro for heading and the OTOS position when the boot probe found them
+// (motion/pose_estimator.h). With no OTOS this is plain encoder odometry.
+// goToW() reads the pose once, at call time.
 bool engineGoToW(float x, float y, float speed, float arrive,
                 uint32_t timeout) {  // [ms]
-  OtosPort& otos = otosRef();
   Rig& r = ensure();
-  PoseSource& pose = selectPoseSource(otos.connected(), otos, r.odometry);
-  r.engine.goToW(pose, x, y, speed, arrive, timeout);
+  r.engine.goToW(r.estimator, x, y, speed, arrive, timeout);
   return true;
 }
 
-// SUC-003: GO_TO_W's own D input for
-// engineDefaultCruiseForDistance() above -- the TRUE body-frame
-// chord from the robot's CURRENT pose to this call's WORLD-frame
-// (worldX, worldY) target, not the target's distance from the world
-// origin (hypot(worldX, worldY) alone, which is wrong whenever the
-// robot is not sitting at the origin). Reuses the exact SAME
-// PoseSource selection engineGoToW() above applies -- OtosPort when
-// connected(), the Rig-owned odometry otherwise -- so this resolves
-// against the pose the move will actually run from. Both PoseSource
-// implementations' reads are plain accessors over already-cached state
-// (otos_port.h / motion/odometry.h -- Odometry::x()/y() read the
-// current frame and do not themselves integrate; only update() does,
-// and this function does not call it) -- reading x()/y() here, a
-// second time before engineGoToW() reads them again for the real
-// dispatch, mutates nothing and cannot observe a different value than
-// that dispatch will.
+// GO_TO_W's own D input for engineDefaultCruiseForDistance(): the chord
+// from the pose the move will plan from to the world target.
 float engineGoToWChord(float worldX, float worldY) {
-  OtosPort& otos = otosRef();
   Rig& r = ensure();
-  PoseSource& pose = selectPoseSource(otos.connected(), otos, r.odometry);
-  return std::hypot(worldX - pose.x(), worldY - pose.y());
+  return std::hypot(worldX - r.estimator.x(), worldY - r.estimator.y());
 }
 
 // RETIRED (sprint 029 ticket 003/004, design motion-profile-
@@ -2161,6 +2185,7 @@ int otosBegin() {  // -> raw product id, for diagnostics only; readiness
   OtosPort& o = otosRef();
   r.busGuard.acquire(r.sleeper);
   o.begin();
+  attachSensors(r);
   r.busGuard.release();
   return o.productId();
 }
@@ -2169,9 +2194,10 @@ int otosBegin() {  // -> raw product id, for diagnostics only; readiness
 bool otosRead() {
   Rig& r = ensure();
   r.busGuard.acquire(r.sleeper);
-  const bool ok = otosRef().read();
+  applyPendingOtosZero(r);
+  odomUpdate(r, true);
   r.busGuard.release();
-  return ok;
+  return otosRef().connected();
 }
 
 //%
@@ -2373,6 +2399,45 @@ bool runDispatch() {
 // called from TS, so deliberately NOT `//%`-annotated.
 void registerTickServiceHook(void (*hook)()) { ensure().serviceHook = hook; }
 
+// Idle sensor read. With nothing ticking the kernel the OTOS is otherwise
+// never read, so bias tracking and the at-rest pose go blind. Called from
+// the protocol fiber's idle pass, which owns no motion. Reads at 10 Hz,
+// the same cadence as while driving (96 ms): about one 12-byte burst per
+// 100 ms, and a ZARU window of 2 s still sees ~20 samples. Skips when no
+// OTOS was found at boot, when any fiber ticked recently, or when the bus
+// is held, so it never blocks and never lands inside a step().
+void idleSense() {
+  Rig& r = ensure();
+  if (r.estimator.config() == SensorConfig::kEncodersOnly) return;
+  if (r.busGuard.held() || commandLooksActive(r)) return;
+  const uint64_t now = r.clock.nowMicros();  // [us]
+  if (r.lastTick != 0 && now - r.lastTick < kIdleTickQuiet) return;
+  if (now - r.idleSenseStamp < kIdleSensePeriod) return;
+  r.idleSenseStamp = now;
+  r.busGuard.acquire(r.sleeper);
+  applyPendingOtosZero(r);
+  odomUpdate(r, true);
+  r.busGuard.release();
+}
+
+// Accelerometer read at 50 Hz from every protocol pass, moving or not. It
+// sits on the board's internal I2C bus, not the edge bus the guard owns.
+// Integer only: the caller is the protocol loop's FPU-sensitive site.
+void accelSense() {
+  Rig& r = ensure();
+  const uint64_t now = r.clock.nowMicros();  // [us]
+  if (r.accelStamp != 0 && now - r.accelStamp < kAccelSensePeriod) return;
+  const bool first = r.accelStamp == 0;
+  r.accelStamp = now;
+  const int a[3] = {uBit.accelerometer.getX(), uBit.accelerometer.getY(),
+                    uBit.accelerometer.getZ()};
+  for (int i = 0; i < 3; ++i) {
+    const int jump = a[i] > r.accel[i] ? a[i] - r.accel[i] : r.accel[i] - a[i];
+    if (!first && jump > r.accelPeak) r.accelPeak = jump;
+    r.accel[i] = a[i];
+  }
+}
+
 //%
 void otosSetOffset(int x, int y, int yaw) {  // [0.1 mm] [0.1 mm] [cdeg]
   Rig& r = ensure();
@@ -2392,9 +2457,10 @@ void seedPose(int x, int y, int heading) {  // [mm] [mm] [cdeg]
   Rig& r = ensure();
   odomUpdate(r);  // consume pending deltas before overwriting
   const float h = static_cast<float>(heading) * kCdegToRad;
-  r.odometry.seed(static_cast<float>(x), static_cast<float>(y), h);
+  r.estimator.seed(static_cast<float>(x), static_cast<float>(y), h);
   r.busGuard.acquire(r.sleeper);
   otosRef().setPose(static_cast<float>(x), static_cast<float>(y), h);
+  r.estimator.reprime();
   r.busGuard.release();
 }
 

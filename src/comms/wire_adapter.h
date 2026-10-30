@@ -202,7 +202,7 @@ class WireAdapter : public Wire::Adapter {
   // units. Advances and wraps `seq_` ((seq_+1) & 0x7F, protocol.md
   // S6.2) -- WireHandler only prints what this hands it. POSE's 12
   // columns (`seq now flags x y h ox oy oh vl vr i2cf`) are always
-  // present; FULL's 8 more (`cyc posl posr dutl dutr lexc wrng cycovr`)
+  // present; FULL's 12 more (`cyc posl posr dutl dutr lexc wrng cycovr bias rej step dist`)
   // only when `mode_ == Wire::TlmMode::kFull`. kPose and kAuto (its
   // alias) stop at the 12; kOff never reaches this call
   // (telemetryEnabled() gates it) and kBuffer can never reach mode_.
@@ -417,9 +417,9 @@ class WireAdapter : public Wire::Adapter {
   // not 0. `columns_`/`snapshot_` are members, not locals, so
   // buildSnapshot() can return a reference into them that stays valid
   // until the NEXT call -- sized for the widest documented set (POSE's
-  // 12 plus FULL's 8 more).
+  // 12 plus FULL's 19 more; no spare slot remains).
   uint8_t seq_ = 0;
-  static constexpr size_t kMaxSnapshotColumns = 20;
+  static constexpr size_t kMaxSnapshotColumns = 31;
   Wire::Column columns_[kMaxSnapshotColumns];
   Wire::Snapshot snapshot_;
 };

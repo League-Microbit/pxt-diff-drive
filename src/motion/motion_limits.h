@@ -7,8 +7,8 @@
 namespace diffDrive {
 
 struct MotionLimits {
-  float accel = 400.0f;       // [mm/s^2] dominant-wheel accel ceiling
-  float decel = 400.0f;       // [mm/s^2] dominant-wheel decel ceiling
+  float accel = 200.0f;       // [mm/s^2] dominant-wheel accel ceiling
+  float decel = 200.0f;       // [mm/s^2] dominant-wheel decel ceiling
   float jerk = 0.0f;          // [mm/s^3] 0 = no jerk rounding
   float vMax = 250.0f;        // [mm/s] dominant-wheel cruise ceiling
   float omegaMax = 0.0f;      // [deg/s] pure-turn rate ceiling; 0 = none

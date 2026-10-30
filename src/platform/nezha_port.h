@@ -202,6 +202,11 @@ class NezhaMotorPort final : public DiffDrive::Motor,
   // Two-strike counter-restart events, not integrated as motion.
   // Exposed via diagValue() ordinal 27; normally zero.
   uint32_t rebaselineCount_ = 0;
+  // The other two reasons a collect leaves the sample unadvanced (each
+  // one i2cf cycle): a NAK'd encoder select or read, and an acked read
+  // whose counts have not moved while the wheel is driven. Ordinals 52, 53.
+  uint32_t busFailCount_ = 0;
+  uint32_t staleCount_ = 0;
  private:
   // Two-strike raw-counts plausibility gate; owns the
   // lastGoodRaw_/lastRejectedRaw_/rejectPending_/primed_ state. Lives in

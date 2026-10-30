@@ -2,6 +2,7 @@
 #include "wire_adapter.h"
 
 #include "config_fields.h"
+#include "../platform/sensor_config.h"
 #include "run_bridge.h"
 #include "run_registry.h"
 #include "wifi_credential_store.h"
@@ -147,6 +148,7 @@ int protocolRadioGroup();
 // whenever STATUS/ack traffic happens to poll late). Same "no stored
 // engine reference" contract as engineMoveActive().
 bool engineMoveEndedByDeadline();
+bool engineMoveEndedByWrongWay();
 
 namespace {
 
@@ -209,6 +211,19 @@ constexpr int kDiagCycleCount = 16;        // -> `cyc`
 constexpr int kDiagCycleOverrunCount = 19; // -> `cycovr`
 constexpr int kDiagWrongWayCount = 25;     // -> `wrng`
 constexpr int kDiagPositionMoveLive = 41;  // -> STATUS `posmove=`
+constexpr int kDiagGyroBias = 42;          // -> `bias`  [cdeg/min]
+constexpr int kDiagRejectCount = 43;       // -> `rej`
+constexpr int kDiagStepCount = 44;         // -> `step`
+constexpr int kDiagSensorConfig = 45;      // -> STATUS `sens=`
+constexpr int kDiagDisturbCount = 46;      // -> `dist`
+constexpr int kDiagLegLive = 47;           // -> STATUS `active`
+constexpr int kDiagAccelX = 48;            // -> `ax`  [mg]
+constexpr int kDiagAccelY = 49;            // -> `ay`  [mg]
+constexpr int kDiagAccelZ = 50;            // -> `az`  [mg]
+constexpr int kDiagAccelPeak = 51;         // -> `apk` [mg], cleared by the read
+constexpr int kDiagBusFailCount = 52;      // -> `busf`
+constexpr int kDiagStaleCount = 53;        // -> `stl`
+constexpr int kDiagGlitchCount = 54;       // -> `glt`
 
 // LOCAL flags layout's own free function, extracted (unchanged bit
 // layout) so STATUS's `flags=` and the telemetry `flags` column read
@@ -305,9 +320,10 @@ uint32_t WireAdapter::now() const {
 
 // `i2cf=<n>` rides STATUS via the SAME diagValue(kDiagI2cFault) call the
 // telemetry `i2cf` column reads, so the two can never disagree. FULL's
-// other seven numeric columns (posl/posr/dutl/dutr/lexc/wrng/cycovr)
+// other numeric columns (posl/posr/dutl/dutr/lexc/cycovr/bias/rej/step)
 // have no STATUS-level equivalent on purpose -- they are telemetry, not
-// status; only `i2cf` is genuinely status-shaped.
+// status. `wrng` rides STATUS too (diagValue(kDiagWrongWayCount), the same
+// call as the column), and `sens` names the pose-sensor configuration.
 void WireAdapter::status(Wire::StatusFields& out) const {
   out.ready = diagValue(kDiagReady) != 0;
   const bool estopped = diagValue(kDiagEstopped) != 0;
@@ -324,10 +340,12 @@ void WireAdapter::status(Wire::StatusFields& out) const {
   // block for why that distinction is load-bearing).
   out.otos = otosGet(kOtosConnected) != 0;
   out.wedge = diagValue(kDiagWedgeLeft) != 0 || diagValue(kDiagWedgeRight) != 0;
-  // "active": ready, not halted, and a wheel is measurably moving.
+  // "active": ready, not halted, and a wheel is measurably moving or a
+  // GO_TO_W command is between its segments.
   out.active = out.ready && !estopped && !leaseExpired && !stallHalted &&
                (diagValue(kDiagVelocityLeft) != 0 ||
-                diagValue(kDiagVelocityRight) != 0);
+                diagValue(kDiagVelocityRight) != 0 ||
+                diagValue(kDiagLegLive) != 0);
 
   out.flags = computeFlags();
   out.i2cf = diagValue(kDiagI2cFault);
@@ -342,6 +360,10 @@ void WireAdapter::status(Wire::StatusFields& out) const {
   // (cyc > 0, connL/connR possibly still 0) are distinguishable from
   // STATUS alone.
   out.cyc = static_cast<uint32_t>(diagValue(kDiagCycleCount));
+
+  out.wrng = static_cast<uint32_t>(diagValue(kDiagWrongWayCount));
+  out.sens = sensorConfigName(
+      static_cast<SensorConfig>(diagValue(kDiagSensorConfig)));
 
   out.tlm = tlmModeWireName(mode_);
 }
@@ -692,6 +714,7 @@ Wire::DoneReason WireAdapter::resolvePendingReason() const {
     // this file's own forward declaration of it above and
     // MotionEngine::lastSegmentEndedByDeadline()'s doc comment
     // (motion_engine.h) for the full fix.
+    if (engineMoveEndedByWrongWay()) return Wire::DoneReason::kWrongWay;
     return engineMoveEndedByDeadline() ? Wire::DoneReason::kTimeout
                                         : Wire::DoneReason::kStop;
   }
@@ -921,7 +944,7 @@ const Wire::Snapshot& WireAdapter::buildSnapshot() {
   columns_[i++] = {"vr", vr, false};
   columns_[i++] = {"i2cf", i2cf, false};
 
-  // FULL adds these 8; every other mode reachable here is kPose or
+  // FULL adds these 19; every other mode reachable here is kPose or
   // kAuto (a documented ALIAS for kPose -- same 12 columns, same
   // cadence, no separate branch needed). kOff never reaches this call
   // (telemetryEnabled() gates it) and kBuffer can never reach mode_ at
@@ -949,6 +972,25 @@ const Wire::Snapshot& WireAdapter::buildSnapshot() {
                      false};
     columns_[i++] = {"cycovr",
                      static_cast<int32_t>(diagValue(kDiagCycleOverrunCount)),
+                     false};
+    columns_[i++] = {"bias", static_cast<int32_t>(diagValue(kDiagGyroBias)),
+                     false};
+    columns_[i++] = {"rej", static_cast<int32_t>(diagValue(kDiagRejectCount)),
+                     false};
+    columns_[i++] = {"step", static_cast<int32_t>(diagValue(kDiagStepCount)),
+                     false};
+    columns_[i++] = {"dist", static_cast<int32_t>(diagValue(kDiagDisturbCount)),
+                     false};
+    columns_[i++] = {"ax", static_cast<int32_t>(diagValue(kDiagAccelX)), false};
+    columns_[i++] = {"ay", static_cast<int32_t>(diagValue(kDiagAccelY)), false};
+    columns_[i++] = {"az", static_cast<int32_t>(diagValue(kDiagAccelZ)), false};
+    columns_[i++] = {"apk", static_cast<int32_t>(diagValue(kDiagAccelPeak)),
+                     false};
+    columns_[i++] = {"busf", static_cast<int32_t>(diagValue(kDiagBusFailCount)),
+                     false};
+    columns_[i++] = {"stl", static_cast<int32_t>(diagValue(kDiagStaleCount)),
+                     false};
+    columns_[i++] = {"glt", static_cast<int32_t>(diagValue(kDiagGlitchCount)),
                      false};
   }
 
