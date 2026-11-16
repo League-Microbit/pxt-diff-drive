@@ -1,6 +1,6 @@
 {
     "name": "nezha-diffdrive",
-    "version": "1.20261029.1",
+    "version": "1.20261115.1",
     "description": "Closed-loop differential drive for the Nezha brick: encoder-servoed wheel speeds, twist and distance moves, curved go-to, and pose from odometry. The wheel controller runs in its own fiber.",
     "license": "MIT",
     "public": true,
@@ -88,6 +88,7 @@
         "src/blocks/motion.ts",
         "src/blocks/report.ts",
         "src/blocks/calibration.ts",
+        "src/blocks/radiostore.ts",
         "src/blocks/program.ts"
     ],
     "testFiles": [

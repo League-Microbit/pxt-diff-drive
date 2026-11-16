@@ -280,9 +280,9 @@ namespace diffDrive {
     }
 
     /**
-     * Bring the v6 radio link up on the channel this firmware was built
-     * for -- the per-robot value tools/make_deploy.py injects at deploy
-     * time -- and group 10.
+     * Bring the v6 radio link up on the channel and group this firmware
+     * was built for -- the per-robot values tools/make_deploy.py injects
+     * at deploy time.
      *
      * For the on-robot test program and advanced JavaScript users. It is
      * deliberately NOT a block and takes no channel: naming a channel

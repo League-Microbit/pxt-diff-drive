@@ -7,6 +7,7 @@ namespace diffDrive {
     let programBusy: boolean
     let programCancel: boolean
     let robotSetUp: boolean
+    let radioSource: string
 
     function beginProgram(): void {
         programBusy = true
@@ -189,7 +190,9 @@ namespace diffDrive {
         report("reboot.ok").str("why", "asked").send()
         flushReports()
         stop()
-        basic.pause(120)
+        // The reply leaves only when the protocol fiber drains its queue,
+        // and a handler running on that fiber drains it from the tick.
+        for (let i = 0; i < 6; i++) _tickDrive()
         control.reset()
     }
 
@@ -251,13 +254,41 @@ namespace diffDrive {
         reportWifiAddress()
     }
 
+    /** Report the radio address the next boot uses and where this boot's came from. */
+    function reportRadioAddress(): void {
+        const stored = storedRadioAddress()
+        const byName = radioAddressForName(control.deviceName())
+        const next = stored.length == 2 ? stored : byName
+        report("radiostore.values")
+            .num("ch", next.length == 2 ? next[0] : -1, 0)
+            .num("grp", next.length == 2 ? next[1] : -1, 0)
+            .num("stored", stored.length == 2 ? 1 : 0, 0)
+            .str("source", radioSource)
+            .num("default_ch", byName.length == 2 ? byName[0] : -1, 0)
+            .num("default_grp", byName.length == 2 ? byName[1] : -1, 0)
+            .send()
+        flushReports()
+    }
+
+    function saveRadioAddress(channel: number, group: number): void {
+        const why = radioPairError(channel, group)
+        if (why != "") {
+            report("radiostore.fail").str("why", why).send()
+            flushReports()
+            return
+        }
+        writeRadioAddress(channel, group)
+        reportRadioAddress()
+    }
+
     /**
      * Bring a fleet robot up: the radio link and WiFi on the addresses
      * this micro:bit's name derives, unless the program has already set
      * them up itself, WiFi credentials from the robot's own store, the
      * calibration stored in flash, and the console's own run commands
      * (`_calshow`, `_calclear`, `_calsave`, `_calscale`, `_calports`,
-     * `_netshow`, `_netset`, `_netclear`, `_reboot`). The leading `_`
+     * `_netshow`, `_netset`, `_netclear`, `_radioshow`, `_radioset`,
+     * `_radioclear`, `_reboot`). The leading `_`
      * marks a command the console drives itself; the console keeps
      * those out of the student's function list. Call it once, after any setTrackWidth() or
      * setWheelCalibration() the stored calibration should override.
@@ -272,10 +303,12 @@ namespace diffDrive {
         if (robotSetUp) return
         robotSetUp = true
         const name = control.deviceName()
-        if (radioAddressInUse().length != 2) {
-            const byName = radioAddressForName(name)
-            if (byName.length == 2) setupRadio(byName[0], byName[1])
-        }
+        const storedRadio = storedRadioAddress()
+        const byName = radioAddressForName(name)
+        radioSource = radioSourceFor(radioAddressInUse().length == 2,
+            storedRadio.length == 2, byName.length == 2)
+        if (radioSource == "stored") setupRadio(storedRadio[0], storedRadio[1])
+        else if (radioSource == "name") setupRadio(byName[0], byName[1])
         const address = radioAddressInUse()
         if (!wifiLinkEnabled()) {
             const net = storedWifiAddress()
@@ -315,11 +348,23 @@ namespace diffDrive {
             reportWifiAddress()
         })
         runSignature("_netclear", "()")
+        onRun("_radioshow", function (arg: number) { reportRadioAddress() })
+        runSignature("_radioshow", "()")
+        onRun("_radioset", function (arg: number) {
+            saveRadioAddress(runArg(0), runArg(1))
+        })
+        runSignature("_radioset", "(channel:number=0, group:number=0)")
+        onRun("_radioclear", function (arg: number) {
+            removeRadioAddress()
+            reportRadioAddress()
+        })
+        runSignature("_radioclear", "()")
         onRun("_reboot", function (arg: number) { reboot() })
         runSignature("_reboot", "()")
 
         emitLine(address.length == 2
             ? "boot radio " + name + " ch " + address[0] + " grp " + address[1]
+                + " " + radioSource
             : "boot radio off: " + name + " has no derived address")
         emitLine(storedCalibrationLine())
         const net = wifiAddressInUse()
