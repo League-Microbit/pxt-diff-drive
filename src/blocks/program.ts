@@ -254,30 +254,28 @@ namespace diffDrive {
         reportWifiAddress()
     }
 
-    /** Report the radio address the next boot uses and where this boot's came from. */
+    /** Report the stored radio address and the one in use this boot. */
     function reportRadioAddress(): void {
         const stored = storedRadioAddress()
-        const byName = radioAddressForName(control.deviceName())
-        const next = stored.length == 2 ? stored : byName
-        report("radiostore.values")
-            .num("ch", next.length == 2 ? next[0] : -1, 0)
-            .num("grp", next.length == 2 ? next[1] : -1, 0)
-            .num("stored", stored.length == 2 ? 1 : 0, 0)
-            .str("source", radioSource)
-            .num("default_ch", byName.length == 2 ? byName[0] : -1, 0)
-            .num("default_grp", byName.length == 2 ? byName[1] : -1, 0)
+        const inUse = radioAddressInUse()
+        const values = report("radiostore.values")
+        if (stored.length == 2) values.num("ch", stored[0], 0).num("grp", stored[1], 0)
+        values.num("stored", stored.length == 2 ? 1 : 0, 0)
+            .num("use_ch", inUse.length == 2 ? inUse[0] : -1, 0)
+            .num("use_grp", inUse.length == 2 ? inUse[1] : -1, 0)
+            .str("src", radioSource)
             .send()
         flushReports()
     }
 
-    function saveRadioAddress(channel: number, group: number): void {
-        const why = radioPairError(channel, group)
+    function saveRadioAddress(): void {
+        const why = radioSetError(runArgCount(), runArgText(0), runArgText(1))
         if (why != "") {
             report("radiostore.fail").str("why", why).send()
             flushReports()
             return
         }
-        writeRadioAddress(channel, group)
+        writeRadioAddress(parseInt(runArgText(0)), parseInt(runArgText(1)))
         reportRadioAddress()
     }
 
@@ -351,7 +349,7 @@ namespace diffDrive {
         onRun("_radioshow", function (arg: number) { reportRadioAddress() })
         runSignature("_radioshow", "()")
         onRun("_radioset", function (arg: number) {
-            saveRadioAddress(runArg(0), runArg(1))
+            saveRadioAddress()
         })
         runSignature("_radioset", "(channel:number=0, group:number=0)")
         onRun("_radioclear", function (arg: number) {
